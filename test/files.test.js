@@ -153,7 +153,8 @@ test('tools: show_file puts the file in the viewer and describes it; confinement
   const { tools, ui, memory } = makeAgent(root);
 
   const md = await tools.show_file.run({ path: 'notes.md' });
-  assert.deepEqual(ui.at(-1), { type: 'show_file', path: path.join(root, 'notes.md') });
+  assert.deepEqual(ui.at(-2), { type: 'show_file', path: path.join(root, 'notes.md') });
+  assert.deepEqual([ui.at(-1).type, ui.at(-1).map, ui.at(-1).id, ui.at(-1).quiet], ['point', 'files', path.join(root, 'notes.md'), true], 'the Files map behind the viewer goes to it');
   assert.match(md, /^On screen: notes\.md \(markdown, 5 KB\)/);
   assert.match(md, /It begins:\n# Notes/);
   assert.match(md, /5,008 characters in all/);
@@ -171,7 +172,8 @@ test('tools: show_file puts the file in the viewer and describes it; confinement
   const { file } = memory.saveDocument(null, 'Plan', '# Plan\n\nWin.');
   assert.match(await tools.read_file.run({ path: file }), /# Plan/);
   assert.match(await tools.open_document.run({ title: 'Plan' }), /on screen in the viewer/);
-  assert.deepEqual(ui.at(-1), { type: 'show_file', path: file });
+  assert.deepEqual(ui.at(-2), { type: 'show_file', path: file });
+  assert.deepEqual([ui.at(-1).type, ui.at(-1).map, ui.at(-1).label], ['point', 'mind', 'Plan'], 'and the Mind map behind it to its node');
 });
 
 test('tools: read_file reads documents in parts and hands images over as pictures', async () => {

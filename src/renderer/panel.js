@@ -16,6 +16,9 @@ export function h(tag, props = {}, ...children) {
   return el;
 }
 
+const TTS_ENGINES = [['tiny', 'Fast voice (tiny-voca)'], ['kokoro', 'Neural voice (Kokoro)'], ['system', 'System voice'], ['off', 'Silent — captions only']];
+const TINY_VOICES = [['M2', 'Male (M2)'], ['F2', 'Female (F2)']];
+const TINY_SPEEDS = [['0.9', 'Unhurried'], ['1', 'Normal speed'], ['1.15', 'Brisk']];
 const KOKORO_VOICES = [
   ['bm_george', 'George — British, male'], ['bm_lewis', 'Lewis — British, male'], ['bm_daniel', 'Daniel — British, male'], ['bm_fable', 'Fable — British, male'],
   ['bf_emma', 'Emma — British, female'], ['bf_isabella', 'Isabella — British, female'],
@@ -187,7 +190,11 @@ export class Panel {
     return h('section', {},
       h('h3', {}, 'Voice'),
       h('label', {}, 'Speaking voice'),
-      this.select(v.tts, [['kokoro', 'Neural voice (local)'], ['system', 'System voice'], ['off', 'Silent — captions only']], (x) => setV({ tts: x })),
+      this.select(v.tts, TTS_ENGINES, (x) => { setV({ tts: x, ttsChosen: true }); if (x === 'tiny' || x === 'kokoro') api.invoke('speech:warm', x).catch(() => {}); }),
+      v.tts === 'tiny' && h('div', { class: 'row' },
+        Object.assign(this.select(v.tinyVoice, TINY_VOICES, (x) => setV({ tinyVoice: x })), { style: 'flex:1;min-width:0' }),
+        Object.assign(this.select(String(v.tinySpeed || 1), TINY_SPEEDS, (x) => setV({ tinySpeed: Number(x) })), { style: 'flex:1;min-width:0' })),
+      v.tts === 'tiny' && h('p', { class: 'note' }, 'American English. Much faster; Kokoro sounds more natural.'),
       v.tts === 'kokoro' && this.select(v.kokoroVoice, KOKORO_VOICES, (x) => setV({ kokoroVoice: x })),
       v.tts === 'system' && this.select(v.systemVoice, [['', 'Best British voice available'], ...sysVoices.map((x) => [x.name, x.name])], (x) => setV({ systemVoice: x })),
       h('label', {}, 'Microphone'),
@@ -198,7 +205,7 @@ export class Panel {
       h('div', { class: 'row' },
         this.deviceSelect('audiooutput', v.outputDevice, (x) => setV({ outputDevice: x })),
         h('button', { class: 'btn', title: 'Play a short tone through this speaker', onclick: () => this.app.voice().testTone() }, 'Test')),
-      v.tts === 'system' && h('p', { class: 'note' }, 'The system voice always plays through the system default speaker. Only the neural voice follows this choice.'),
+      v.tts === 'system' && h('p', { class: 'note' }, 'The system voice always plays through the system default speaker. The fast and neural voices follow this choice.'),
       h('div', { style: 'margin-top:8px' },
         this.toggleRow('Hands-free: always listening', v.handsFree, (x) => setV({ handsFree: x })),
         this.toggleRow('Let me interrupt while it is talking', v.bargeIn, (x) => setV({ bargeIn: x }))),

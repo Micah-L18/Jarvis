@@ -6,6 +6,7 @@ import { scan, isInside } from './fsscan.js';
 import { NODE_TYPES } from './memory.js';
 import { kindOf } from './filekind.js';
 import { extractText, canExtract, loadImage, imageSize, describeModel, stripHtml } from './extract.js';
+import { locate, describeHit, pointEvent } from './pointer.js';
 
 const str = (description) => ({ type: 'string', description });
 const obj = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
@@ -122,6 +123,19 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
     return res;
   };
   const words = (text) => (text.match(/\S+/g) || []).length;
+  // Showing where things are. `soft`: only move a map that is already on screen (memory bookkeeping
+  // never switches the view by itself). `quiet`: mark it without the card (the file is in the viewer).
+  const point = (hit, extra) => {
+    const event = pointEvent(hit, extra);
+    if (event) ctx.ui(event);
+    return Boolean(event);
+  };
+  const pointAtNode = (node, extra = { soft: true }) => node && point({ map: 'mind', node }, extra);
+  // The map location of a file just put in the viewer: its place on the Files map, or its node on the Mind map for a saved document.
+  const pointBehind = async (file) => {
+    const hit = await locate(file, { memory, root: ctx.fsRoot() }).catch(() => null);
+    if (hit?.map && (hit.map === 'mind' || hit.path === file)) point(hit, { quiet: true });
+  };
 
   const tools = [
     {
@@ -136,6 +150,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
       }, ['label', 'summary']),
       run: async ({ label, type, summary, project, related_to }) => {
         const node = memory.upsert({ label, type, summary, project, relatedTo: related_to || [] });
+        pointAtNode(node);
         return `Remembered "${node.label}".`;
       },
     },
@@ -146,6 +161,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
       run: async ({ query }) => {
         const hits = memory.search(query);
         if (!hits.length) return 'Nothing in memory matches.';
+        if (hits.length === 1) pointAtNode(hits[0]);
         return hits.map((n) => {
           const links = memory.neighbors(n.id).filter((x) => x.node.type !== 'core').map((x) => x.node.label).slice(0, 6);
           return `[${n.type}] ${n.label}: ${n.summary || '(no detail)'}${links.length ? ` (linked to: ${links.join(', ')})` : ''}`;
@@ -167,6 +183,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
       schema: obj({ name: str('Project name'), description: str('One sentence on what it is for') }, ['name']),
       run: async ({ name, description }) => {
         const p = memory.createProject(name, description);
+        pointAtNode(p);
         return `Project "${p.label}" is active.`;
       },
     },
@@ -176,6 +193,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
       schema: obj({ name: str('Project name') }, ['name']),
       run: async ({ name }) => {
         const p = memory.setActiveProject(name);
+        pointAtNode(p);
         return p ? `Switched to "${p.label}".` : `No project called "${name}". Existing: ${memory.projects().map((x) => x.label).join(', ')}`;
       },
     },
@@ -223,6 +241,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
           return `Opened "${res.doc.label}" in its default app.`;
         }
         ctx.ui({ type: 'show_file', path: res.doc.file });
+        pointAtNode(res.doc, { quiet: true });
         return `"${res.doc.label}" is on screen in the viewer.`;
       },
     },
@@ -238,11 +257,30 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
     },
     {
       name: 'show_view',
-      description: 'Change what is on screen: "core" (just you), "mind" (the 3D map of what you know), or "files" (the 3D map of the user\'s folders). Optionally fly to one item by name.',
-      schema: obj({ view: { type: 'string', enum: ['core', 'mind', 'files'] }, focus: str('Name of a memory, project, file or folder to fly to') }, ['view']),
+      description: 'Change what is on screen: "core" (just you), "mind" (the 3D map of what you know), or "files" (the 3D map of the user\'s folders). To show where one thing is, use point_to instead.',
+      schema: obj({ view: { type: 'string', enum: ['core', 'mind', 'files'] }, focus: str('Name of a memory, project, file or folder on that map to fly to') }, ['view']),
       run: async ({ view, focus }) => {
-        ctx.ui({ type: 'view', view, focus });
-        return `Showing ${view}${focus ? `, focused on ${focus}` : ''}.`;
+        if (focus && view !== 'core') {
+          const hit = await locate(focus, { map: view, memory, root: ctx.fsRoot() });
+          if (point(hit)) return describeHit(hit, ctx.fsRoot());
+          ctx.ui({ type: 'view', view });
+          return `Showing ${view}. ${describeHit(hit, ctx.fsRoot())}`;
+        }
+        ctx.ui({ type: 'view', view });
+        return `Showing ${view}.`;
+      },
+    },
+    {
+      name: 'point_to',
+      description: 'Show the user where something is: switches to the map it is on, flies there and marks it. The Mind map holds what you know (projects, people, topics, facts, tasks, saved documents); the Files map holds their files and folders. Leave map out and the target decides: a path or a file goes to Files, a memory to Mind. It looks names up itself, so there is no need to search first. Use it once when the talk turns to a specific thing on a map, or when they ask where something is. If it is not on the map, the result says so and gives the closest matches.',
+      schema: obj({
+        target: str('A memory\'s name (project, person, topic, document…), or a file or folder name or path'),
+        map: { type: 'string', enum: ['mind', 'files'], description: 'Which map. Omit to let the target decide.' },
+      }, ['target']),
+      run: async ({ target, map }) => {
+        const hit = await locate(target, { map, memory, root: ctx.fsRoot() });
+        point(hit);
+        return describeHit(hit, ctx.fsRoot());
       },
     },
     {
@@ -275,6 +313,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
         const f = await fileIn(p);
         notFolder(f);
         ctx.ui({ type: 'show_file', path: f.file });
+        await pointBehind(f.file);
         const lines = [`On screen: ${f.name} (${f.kind}, ${bytes(f.stat.size)}) at ${f.file}.`];
         try {
           if (f.kind === 'image' || f.kind === 'svg') {

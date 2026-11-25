@@ -1,10 +1,12 @@
 // Runs in an Electron utility process so model inference never stalls the window.
-// Speech-to-text: Whisper. Text-to-speech: Kokoro. Both run fully on this machine;
-// the model files are downloaded once on first use and cached.
+// Speech-to-text: Whisper. Text-to-speech: tiny-voca (fast, the default) or Kokoro (neural).
+// All run fully on this machine; the model files are downloaded once on first use and cached.
 import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline, env } from '@huggingface/transformers';
 import { KokoroTTS } from 'kokoro-js';
+import { loadTiny } from './tts-tiny.js';
+import { Voices } from './voices.js';
 
 const port = process.parentPort;
 const cacheDir = process.argv[2];
@@ -36,12 +38,13 @@ function getTiny() {
   return null;
 }
 
-// The voice comes in two sizes. The full-precision one speaks about 2.5 times faster on a CPU
+// Kokoro comes in two sizes. The full-precision one speaks about 2.5 times faster on a CPU
 // (the small one is built from integer operations that run slowly), but it is a 325 MB download
 // against 92 MB. So: start on whichever is already here, fetch the fast one in the background
-// the first time, and switch to it the moment it is ready.
+// the first time (only when Kokoro is the chosen voice), and switch to it the moment it is ready.
 const KOKORO = 'onnx-community/Kokoro-82M-v1.0-ONNX';
 const FAST = path.join(cacheDir || '', KOKORO, 'onnx', 'model.onnx');
+const SMALL = path.join(cacheDir || '', KOKORO, 'onnx', 'model_quantized.onnx');
 const loadTts = (dtype, what) => KokoroTTS.from_pretrained(KOKORO, { dtype, device: 'cpu', progress_callback: progress(what) });
 let tts;
 let fetching = false;
@@ -55,45 +58,57 @@ function fetchFast() {
     })
     .catch(() => post({ type: 'status', what: 'faster voice', failed: true })); // the small voice carries on; the window stops showing a download
 }
-function getTts() {
-  if (tts) return tts;
-  if (cacheDir && fs.existsSync(FAST)) {
-    tts = loadTts('fp32', 'voice').catch(() => {
-      fs.rmSync(FAST, { force: true }); // a download that was cut short: fetch it again later
-      const small = loadTts('q8', 'voice');
-      small.then(fetchFast, () => {});
-      return small;
-    });
-  } else {
-    tts = loadTts('q8', 'voice');
-    tts.then(fetchFast, () => {});
+function getTts(upgrade = true) {
+  if (tts) {
+    if (upgrade) tts.then((model) => { if (model.dtype !== 'fp32') fetchFast(); }, () => {});
+    return tts;
   }
+  const small = () => {
+    const model = loadTts('q8', 'voice').then((m) => Object.assign(m, { dtype: 'q8' }));
+    if (upgrade) model.then(fetchFast, () => {});
+    return model;
+  };
+  if (cacheDir && fs.existsSync(FAST)) {
+    tts = loadTts('fp32', 'voice').then((m) => Object.assign(m, { dtype: 'fp32' }), () => {
+      fs.rmSync(FAST, { force: true }); // a download that was cut short: fetch it again later
+      return small();
+    });
+  } else tts = small();
   return tts;
 }
 
+// The fast voice is fetched as one 29 MB download, reported like the other models.
+const voices = new Voices({
+  loadTiny: () => loadTiny(cacheDir, ({ loaded, total }) => post({ type: 'status', what: 'voice', loaded, total })),
+  loadKokoro: getTts,
+  kokoroCached: () => Boolean(cacheDir) && (fs.existsSync(FAST) || fs.existsSync(SMALL)),
+  post,
+});
+
 const JUNK = /^[\s.\-–—!?,]*$|^\s*[[(].*[\])]\s*$/; // "[BLANK_AUDIO]", "(silence)", bare punctuation
 
+// Warming up loads models without queueing behind work (loading is not inference): the recognizer
+// and the chosen voice side by side. `voice` is the engine ('tiny' | 'kokoro'; true meant Kokoro).
+async function warm(id, { voice }) {
+  try {
+    await Promise.all([
+      getAsr().then(() => post({ type: 'status', what: 'listening', done: true })),
+      voices.warm(voice), // says "voice ready" itself, as it does when a voice is first chosen later
+    ]);
+    post({ type: 'result', id, value: true });
+  } catch (err) {
+    post({ type: 'result', id, error: err?.message || String(err) });
+  }
+}
+
 const handlers = {
-  async warm({ voice }) {
-    await getAsr();
-    post({ type: 'status', what: 'listening', done: true });
-    if (voice) {
-      await getTts();
-      post({ type: 'status', what: 'voice', done: true });
-    }
-    return true;
-  },
   async transcribe({ audio }) {
     const model = await getAsr();
     const out = await model(audio instanceof Float32Array ? audio : new Float32Array(audio));
     const text = (out.text || '').trim();
     return JUNK.test(text) ? '' : text;
   },
-  async synthesize({ text, voice }) {
-    const model = await getTts();
-    const out = await model.generate(text, { voice: voice || 'bm_george' });
-    return { audio: out.audio, rate: out.sampling_rate };
-  },
+  synthesize: (args) => voices.synthesize(args),
 };
 
 // Long recordings go through in slices of up to 28 seconds — one Whisper window each — and each
@@ -157,7 +172,7 @@ let partials = 0;
 function partial(id, { audio }) {
   const mine = ++partials;
   const model = getTiny();
-  const skip = () => mine !== partials || waiting > 0;
+  const skip = () => mine !== partials || waiting > 0 || talking > 0;
   if (!model || skip()) return void post({ type: 'result', id, value: null });
   chain = chain.then(async () => {
     let value = null;
@@ -182,8 +197,33 @@ let chain = Promise.resolve();
 let epoch = 0;
 let hunch = 0;
 let waiting = 0; // jobs queued behind the one running, live captions aside
+
+// The fast voice has a line of its own: a sentence takes it tens of milliseconds, so it would only
+// lose by waiting behind a transcription slice (seconds) — and a live caption stands aside for it.
+// Sentences still go one at a time and in order, and `cancel` voids those not yet started. Kokoro,
+// whose sentences take seconds of CPU, keeps to the shared line so it does not slow the recognizer
+// (unless it is standing in for a fast voice that failed to start: then it speaks from this line).
+let mouth = Promise.resolve();
+let talking = 0; // fast-voice sentences queued or being made
+function speak(id, args, mine) {
+  talking++;
+  mouth = mouth.then(async () => {
+    try {
+      if (mine !== epoch) return void post({ type: 'result', id, value: null });
+      post({ type: 'result', id, value: await handlers.synthesize(args) });
+    } catch (err) {
+      post({ type: 'result', id, error: err?.message || String(err) });
+    } finally {
+      talking--;
+    }
+  });
+}
+const fastVoice = (args) => args?.voice && typeof args.voice === 'object' && args.voice.engine !== 'kokoro';
+
 port.on('message', ({ data }) => {
   const { id, op, args } = data;
+  if (op === 'warm') return void warm(id, args || {});
+  if (op === 'synthesize' && fastVoice(args)) return void speak(id, args, epoch);
   if (op === 'partial') return void partial(id, args || {});
   if (op === 'transcribe_long') return void transcribeLong(id, args || {});
   if (op === 'abort_long') {

@@ -16,7 +16,7 @@ npm start
 
 `npm run dev` opens it in a window instead of full screen. F11 (or `F`) toggles full screen.
 
-Requires Node 20+. The first launch downloads the speech models (about 170 MB, once) — you'll see progress in the top-left corner. It then fetches a larger, faster copy of the voice in the background (about 325 MB, once) and switches to it when ready. `npm install` also brings the Claude Agent SDK with its own copy of Claude Code (about 400 MB); Jarvis prefers the `claude` you already have and falls back to that copy.
+Requires Node 20+. The first launch downloads the speech models (about 105 MB, once: Whisper to hear you, tiny-voca to speak) — you'll see progress in the top-left corner. `npm install` also brings the Claude Agent SDK with its own copy of Claude Code (about 400 MB); Jarvis prefers the `claude` you already have and falls back to that copy.
 
 ### Give it a brain
 
@@ -62,7 +62,11 @@ Ask for a file and it opens in the app's viewer, then Jarvis answers about it:
 
 The viewer's **Summarize** and **Transcribe** buttons ask the same thing.
 
-Speech recognition (Whisper) and the voice (Kokoro, a British male voice by default) both run locally. If you use open speakers and it keeps interrupting itself, turn off "Let me interrupt while it is talking" under Voice, or use headphones.
+Speech recognition (Whisper) and the voice both run locally. The voice is [tiny-voca](https://github.com/n4ze3m/tiny-voca) by default: a small model (29 MB) that has a sentence ready in a few hundred milliseconds or less, so replies start almost at once. It speaks American English only, male (M2) or female (F2), at a speed you choose. For a more natural voice, British by default, choose **Neural voice (Kokoro)** under Voice: each sentence takes a second or more to prepare, and it downloads 92 MB the first time, then a larger, faster copy (325 MB) in the background. If the fast voice cannot be downloaded or started, Jarvis says so and uses Kokoro (if it is already downloaded) or the system voice until the next launch. Coming from an earlier Jarvis, you move to the fast voice unless you had picked a Kokoro voice other than George.
+
+tiny-voca is by n4ze3m, under the Apache-2.0 licence; its phonemizer is included in `src/main/vendor/tiny-voca`, and the model is downloaded from Hugging Face.
+
+If you use open speakers and it keeps interrupting itself, turn off "Let me interrupt while it is talking" under Voice, or use headphones.
 
 The microphone and the speaker are chosen separately under **Voice** in the controls — a headset microphone with desk speakers, say. The meter beside the microphone shows what it hears and **Test** plays a tone through the speaker. If a chosen device is unplugged, Jarvis uses the system default until it comes back.
 
@@ -78,6 +82,8 @@ The microphone and the speaker are chosen separately under **Voice** in the cont
 ![The Files view](docs/files.png)
 
 You can also ask for these by voice: "show me my files", "pull up the volleyball project", "show me roster.csv".
+
+Ask where something is — "where's the roster?", "where did I put the serve ladder?" — and Jarvis flies to it on whichever map it lives on, opening folders down to it if need be, and marks it. It also points on its own, once, when the talk turns to a project, person, document or file that is on a map; a file it opens is marked on the Files map behind the viewer. It never moves the view while you have hold of it or the controls are open.
 
 ## Memory and projects
 

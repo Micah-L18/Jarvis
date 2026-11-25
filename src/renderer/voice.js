@@ -47,10 +47,22 @@ function resample(input, fromRate, toRate) {
  * progress line, or it stays on screen for a download that is no longer happening.
  */
 export function speechStatus(msg) {
+  // Said once, as a notice of its own: the status line is busy with other models loading at that moment.
+  if (msg.fallback) return { text: `The fast voice could not start — using the ${msg.fallback === 'kokoro' ? 'neural' : 'system'} voice for now.`, ttl: 6000, notice: true };
   const what = msg.what === 'voice' ? 'voice' : msg.what === 'faster voice' ? 'faster voice' : msg.what === 'captions' ? 'live captions' : 'speech recognition';
   if (msg.failed) return { text: `The ${what} could not be downloaded — I will try again next time`, ttl: 6000 };
   if (msg.done) return { text: `${what} ready`, ttl: 2500 };
   if (msg.total) return { text: `Downloading ${what} model (one time) — ${Math.round((msg.loaded / msg.total) * 100)}%`, ttl: 0 };
+  return null;
+}
+
+/**
+ * What to ask the speech process to say a sentence with, for these voice settings: the fast voice's
+ * options, a Kokoro voice name, or null when the system voice (or silence) is chosen.
+ */
+export function synthVoice(s) {
+  if (s.tts === 'tiny') return { engine: 'tiny', voice: s.tinyVoice || 'M2', speed: s.tinySpeed || 1, kokoro: s.kokoroVoice };
+  if (s.tts === 'kokoro') return s.kokoroVoice || 'bm_george';
   return null;
 }
 
@@ -450,7 +462,8 @@ export class Voice {
     this.pendingSpeech++;
     this.cb.onState('speaking');
     // Start synthesis now so audio is ready by the time the previous sentence ends.
-    const audio = s.tts === 'kokoro' ? window.jarvis.invoke('speech:synthesize', text, s.kokoroVoice).catch(() => null) : null;
+    const how = synthVoice(s);
+    const audio = how ? window.jarvis.invoke('speech:synthesize', text, how).catch(() => null) : null;
     this.queue = this.queue.then(async () => {
       try {
         if (epoch !== this.epoch) return;
@@ -462,8 +475,8 @@ export class Voice {
           if (epoch !== this.epoch) return;
           this.heard += (this.heard ? ' ' : '') + text;
           this.cb.onSpoken?.(upTo);
-          if (clip?.audio) await this._play(clip, epoch);
-          else await this._systemSpeak(text, s, epoch);
+          if (clip?.audio?.length) await this._play(clip, epoch);
+          else if (!clip?.audio) await this._systemSpeak(text, s, epoch); // an empty clip: nothing to pronounce
         }
       } finally {
         if (epoch !== this.epoch) return; // hushed: the counter was already reset

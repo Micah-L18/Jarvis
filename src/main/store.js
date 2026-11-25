@@ -14,7 +14,10 @@ export const DEFAULT_SETTINGS = {
   userName: '',
   address: 'sir',
   voice: {
-    tts: 'kokoro', // 'kokoro' (local neural voice) | 'system' (OS voices) | 'off'
+    tts: 'tiny', // 'tiny' (tiny-voca, local and fast) | 'kokoro' (local neural voice) | 'system' (OS voices) | 'off'
+    ttsChosen: false, // true once the user has picked the engine themselves (see migrateSettings)
+    tinyVoice: 'M2', // 'M2' (male) | 'F2' (female), both American English
+    tinySpeed: 1,
     kokoroVoice: 'bm_george',
     systemVoice: '',
     inputDevice: '', // microphone and speaker device ids; '' follows the system default
@@ -54,10 +57,23 @@ function merge(base, patch) {
   return out;
 }
 
+/**
+ * Bring settings saved by an earlier Jarvis up to date. Kokoro used to be the default voice and every
+ * save wrote the whole voice section out, so a saved 'kokoro' only counts as a choice when it was
+ * marked as one (`ttsChosen`) or a Kokoro voice other than the default was picked. Otherwise the
+ * new default, the fast voice, takes over.
+ */
+export function migrateSettings(saved) {
+  const v = saved?.voice;
+  if (!v || typeof v !== 'object' || v.ttsChosen || v.tts !== 'kokoro') return saved;
+  const picked = v.kokoroVoice && v.kokoroVoice !== DEFAULT_SETTINGS.voice.kokoroVoice;
+  return { ...saved, voice: picked ? { ...v, ttsChosen: true } : { ...v, tts: 'tiny' } };
+}
+
 export class Settings {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'settings.json');
-    this.value = merge(DEFAULT_SETTINGS, readJson(this.file, {}));
+    this.value = merge(DEFAULT_SETTINGS, migrateSettings(readJson(this.file, {})));
   }
   get() {
     return this.value;

@@ -12,6 +12,7 @@ import { Panel, h } from './panel.js';
 import { claudeLogin, brainChip } from './brain.js';
 import { wireMedia } from './media.js';
 import { Viewer } from './viewer.js';
+import { InteractionGuard, pickMention, expandToPath } from './focus.js';
 import { kindLabel } from '../main/filekind.js';
 
 const api = window.jarvis;
@@ -203,12 +204,41 @@ async function expandFolder(node) {
 let view = 'core';
 let flight = null;
 let follow = null; // the map being kept in frame while its layout settles (until the user takes the camera)
+let hold = null; // {graph, id}: a node flown to, kept centred while the layout around it settles (until the user takes the camera)
 
 function flyTo(target, distance, seconds = 1.4) {
   const dir = camera.position.clone().sub(controls.target);
   if (dir.lengthSq() < 1) dir.set(0, 0.2, 1);
   dir.normalize();
+  hold = null;
   flight = { t: 0, seconds, dir, framing: false, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), toTarget: target.clone(), toPos: target.clone().add(dir.clone().multiplyScalar(distance)) };
+}
+
+/** Fly to a node and stay on it: a node that is still drifting into place is followed, not left behind. */
+function flyToNode(node, graph, distance, seconds = 1.1) {
+  flyTo(new THREE.Vector3(node.x, node.y, node.z), distance, seconds);
+  Object.assign(flight, { node: node.id, graph, distance });
+  hold = { graph, id: node.id };
+}
+
+/** Per frame: aim the flight at where its node is now, and once landed keep the node centred while its map settles. */
+function trackNode(dt) {
+  if (flight?.node) {
+    const n = flight.graph.byId.get(flight.node);
+    if (n) {
+      flight.toTarget.set(n.x, n.y, n.z);
+      flight.toPos.copy(flight.dir).multiplyScalar(flight.distance).add(flight.toTarget);
+    }
+    return;
+  }
+  if (!hold || flight) return;
+  const n = hold.graph.byId.get(hold.id);
+  if (!n) { hold = null; return; }
+  const k = 1 - Math.exp(-dt * 3);
+  const dx = (n.x - controls.target.x) * k, dy = (n.y - controls.target.y) * k, dz = (n.z - controls.target.z) * k;
+  controls.target.x += dx; controls.target.y += dy; controls.target.z += dz;
+  camera.position.x += dx; camera.position.y += dy; camera.position.z += dz;
+  if (!hold.graph.settling && Math.abs(dx) + Math.abs(dy) + Math.abs(dz) < 0.01) hold = null;
 }
 
 // The projection table. Under a map it sits clear below the map's keel and is sized to the map;
@@ -309,6 +339,7 @@ function setView(next, focusText) {
   mind.setHover(null); // the map is about to move away from under the pointer
   files.setHover(null);
   follow = null;
+  hold = null;
   controls.autoRotateSpeed = next === 'core' ? 0.25 : 0.12;
   if (next === 'files') loadFiles().then(() => focusText && focusByName(files, focusText));
   const graph = next === 'files' ? files : mind;
@@ -359,7 +390,7 @@ function select(node, graph) {
   }
   follow = null;
   graph.setFocus(node.id);
-  flyTo(new THREE.Vector3(node.x, node.y, node.z), graph === files ? 150 : 170, 1.1);
+  flyToNode(node, graph, graph === files ? 150 : 170);
   const d = node.data;
   if (graph === mind) {
     const links = (graph.neighbors.get(node.id) ? [...graph.neighbors.get(node.id)] : []).map((id) => graph.byId.get(id)).filter((n) => n && n.data.type !== 'core');
@@ -444,9 +475,9 @@ function trackSelection(w, hgt) {
 const activeGraph = () => (view === 'files' ? files : view === 'mind' ? mind : null);
 let downAt = null;
 const inHand = (on) => { mind.inHand = files.inHand = on; }; // labels hold their places while the view is turned by hand
-canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; controls.autoRotate = false; follow = null; inHand(true); });
-canvas.addEventListener('pointercancel', () => inHand(false));
-canvas.addEventListener('wheel', () => { follow = null; }, { passive: true });
+canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; controls.autoRotate = false; follow = null; hold = null; inHand(true); guard.down(); });
+canvas.addEventListener('pointercancel', () => { inHand(false); guard.up(); });
+canvas.addEventListener('wheel', () => { follow = null; hold = null; guard.touch(); }, { passive: true });
 canvas.addEventListener('pointermove', (e) => {
   const g = activeGraph();
   if (!g || e.buttons) return;
@@ -457,6 +488,7 @@ canvas.addEventListener('pointermove', (e) => {
 canvas.addEventListener('pointerleave', () => { mind.setHover(null); files.setHover(null); canvas.style.cursor = 'default'; });
 canvas.addEventListener('pointerup', (e) => {
   inHand(false);
+  guard.up();
   setTimeout(() => { controls.autoRotate = true; }, 4000);
   if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return;
   const g = activeGraph();
@@ -470,6 +502,69 @@ canvas.addEventListener('pointerup', (e) => {
   }
   select(node, g);
 });
+
+// ---------------------------------------------------------------------------
+// Pointing: Jarvis shows where something is on one of the maps
+// ---------------------------------------------------------------------------
+
+// The camera is never taken from the user: while they hold or have just turned the view, or have
+// the controls open, a move waits (the latest one only) and is dropped if the moment passes.
+const guard = new InteractionGuard({ blocked: () => (panel.open ? 'controls open' : '') });
+let pointSeq = 0;
+let pointedIn = null; // the turn in which Jarvis last pointed (or put a file on screen)
+let lastPoint = { key: '', at: -Infinity }; // what was last pointed at, and when
+
+/**
+ * A request from main: {map: 'mind'|'files', id, label, chain? (files: the folders down to it),
+ * soft? (only if that map is already up), quiet? (mark it without the card: it is in the viewer)}.
+ */
+function pointAt(req) {
+  if (generating) pointedIn = turn;
+  if (req.soft && view !== req.map) return 'skipped';
+  return guard.run(() => applyPoint(req));
+}
+
+async function applyPoint({ map, id, chain, quiet }) {
+  const seq = ++pointSeq;
+  const graph = map === 'files' ? files : mind;
+  if (view !== map) setView(map);
+  if (map === 'files') {
+    await loadFiles();
+    if (chain?.length && (await expandToPath(fileNodes, chain, (dir, depth) => api.invoke('fs:expand', dir, depth)))) buildFiles();
+  }
+  let node = graph.byId.get(id);
+  for (let i = 0; !node && map === 'mind' && i < 10; i++) { // a memory made this turn may still be on its way to the window
+    await new Promise((r) => setTimeout(r, 100));
+    node = mind.byId.get(id);
+  }
+  if (seq !== pointSeq || view !== map || !node || guard.busy()) return; // overtaken, or the user has the view now
+  lastPoint = { key: id, at: performance.now() };
+  if (quiet || viewer.isOpen) { // behind the viewer: marked and centred, no card
+    select(null);
+    follow = null;
+    graph.setFocus(node.id);
+    flyToNode(node, graph, graph === files ? 150 : 170);
+  } else if (selected?.node.id !== node.id) {
+    select(node, graph);
+  }
+}
+
+/**
+ * After a reply in which Jarvis did not point anywhere: if the user's own words named exactly one
+ * thing on the maps, show it — when the view is free, nothing is open over it, and not more than
+ * once every few seconds or twice running for the same thing.
+ */
+function assistPoint(userText) {
+  if (pointedIn === turn || viewer.isOpen || guard.busy() || voiceState === 'hearing') return null;
+  if (performance.now() - lastPoint.at < 6000) return null;
+  const candidates = [];
+  for (const n of state.memory.nodes) if (n.type !== 'core' && n.id !== 'project:general') candidates.push({ key: n.id, label: n.label, map: 'mind' });
+  for (const n of fileNodes) if (n.parent) candidates.push({ key: n.id, label: n.name, map: 'files' });
+  const hit = pickMention(userText, candidates);
+  if (!hit || hit.key === lastPoint.key || selected?.node.id === hit.key) return null;
+  guard.run(() => applyPoint({ map: hit.map, id: hit.key }));
+  return hit;
+}
 
 // ---------------------------------------------------------------------------
 // HUD
@@ -666,11 +761,14 @@ api.on('chat', (e) => {
     $('tool-line').textContent = '';
     voice.flush();
     if (!voice.speaking) { allSpoken(); restCaptions(); }
+    if (!e.aborted) assistPoint(lastSaid);
   }
 });
 
 api.on('ui', (e) => {
-  if (e.type === 'view') setView(e.view, e.focus);
+  if (e.type === 'view') { if (generating) pointedIn = turn; guard.run(() => setView(e.view, e.focus)); }
+  else if (e.type === 'point') pointAt(e);
+  else if (e.type === 'show_file') { if (generating) pointedIn = turn; }
   else if (e.type === 'document') toast(`Saved to ${e.project}: ${e.title}`);
   else if (e.type === 'learned') toast(`Filed in memory: ${e.labels.join(', ')}`);
 });
@@ -685,7 +783,8 @@ api.on('settings', (next) => { state = next; renderChips(); panel.render(); voic
 api.on('mcp', (status) => { state.mcp = status; panel.render(); });
 api.on('speech', (msg) => {
   const line = speechStatus(msg);
-  if (line) setStatus(line.text, line.ttl);
+  if (line?.notice) toast(line.text);
+  else if (line) setStatus(line.text, line.ttl);
 });
 
 // ---------------------------------------------------------------------------
@@ -741,6 +840,7 @@ function frame(now = performance.now()) {
     controls.target.lerpVectors(flight.fromTarget, flight.toTarget, k);
     if (flight.t >= 1) flight = null;
   }
+  trackNode(dt);
   if (follow) keepFramed(dt);
   controls.update();
   // controls.update() turns the camera but leaves its world matrices a frame behind; bring them up
@@ -781,7 +881,7 @@ buildMind();
 renderChips();
 setView('core');
 requestAnimationFrame(frame);
-window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, panel, loadFiles, state: () => state, viewer: { open: (p, o) => viewer.open(p, o), close: () => viewer.close(), state: () => viewer.state(), showText: (...a) => viewer.showText(...a) } };
+window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, panel, loadFiles, state: () => state, pointAt, guard, view: () => view, fileNodes: () => fileNodes, selected: () => selected && { id: selected.node.id, map: selected.graph === files ? 'files' : 'mind' }, viewer: { open: (p, o) => viewer.open(p, o), close: () => viewer.close(), state: () => viewer.state(), showText: (...a) => viewer.showText(...a) } };
 
 (async () => {
   const s = state.settings;
@@ -799,7 +899,7 @@ window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, pane
   if (!micOk) { muted = true; renderChips(); }
   try {
     setStatus('Waking speech systems…');
-    await api.invoke('speech:warm', s.voice.tts === 'kokoro');
+    await api.invoke('speech:warm', s.voice.tts);
     setStatus('');
     const hour = new Date().getHours();
     const greeting = `Good ${hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening'}, ${s.address}. Systems are online.`;
