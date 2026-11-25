@@ -621,7 +621,7 @@ api.on('memory', (snapshot) => {
 api.on('settings', (next) => { state = next; renderChips(); panel.render(); voice.syncDevices(); });
 api.on('mcp', (status) => { state.mcp = status; panel.render(); });
 api.on('speech', (msg) => {
-  const what = msg.what === 'voice' ? 'voice' : 'speech recognition';
+  const what = msg.what === 'voice' ? 'voice' : msg.what === 'faster voice' ? 'faster voice' : 'speech recognition';
   if (msg.done) setStatus(`${what} ready`, 2500);
   else if (msg.total) setStatus(`Downloading ${what} model (one time) — ${Math.round((msg.loaded / msg.total) * 100)}%`);
 });

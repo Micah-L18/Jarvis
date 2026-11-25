@@ -16,7 +16,7 @@ npm start
 
 `npm run dev` opens it in a window instead of full screen. F11 (or `F`) toggles full screen.
 
-Requires Node 20+. The first launch downloads the speech models (about 170 MB, once) — you'll see progress in the top-left corner. `npm install` also brings the Claude Agent SDK with its own copy of Claude Code (about 400 MB); Jarvis prefers the `claude` you already have and falls back to that copy.
+Requires Node 20+. The first launch downloads the speech models (about 170 MB, once) — you'll see progress in the top-left corner. It then fetches a larger, faster copy of the voice in the background (about 325 MB, once) and switches to it when ready. `npm install` also brings the Claude Agent SDK with its own copy of Claude Code (about 400 MB); Jarvis prefers the `claude` you already have and falls back to that copy.
 
 ### Give it a brain
 

@@ -179,7 +179,8 @@ function registerIpc() {
   });
 
   handle('speech:warm', (voice) => speechCall('warm', { voice }));
-  handle('speech:transcribe', (audio) => speechCall('transcribe', { audio }));
+  handle('speech:transcribe', (audio, guess) => speechCall('transcribe', { audio, guess: Boolean(guess) }));
+  handle('speech:stale', () => (speech ? speechCall('stale') : true));
   handle('speech:synthesize', (text, voice) => speechCall('synthesize', { text, voice }));
   handle('speech:cancel', () => (speech ? speechCall('cancel') : true));
 

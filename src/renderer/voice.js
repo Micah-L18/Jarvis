@@ -14,6 +14,12 @@ class Tap extends AudioWorkletProcessor {
 registerProcessor('tap', Tap);`;
 
 const FRAME_MS = 20;
+// How long a silence ends a remark, in frames: a short remark, and a longer thought that earns more room.
+const PAUSE = 32;
+const PAUSE_LONG = 45;
+// Transcription starts this far into the silence, on the hunch that the user has finished, so the
+// words are usually ready by the time the pause is long enough to be sure.
+const GUESS_AFTER = 12;
 const MIC = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
 
 function resample(input, fromRate, toRate) {
@@ -264,7 +270,7 @@ export class Voice {
     if (this.muted && !this.ptt) return;
     if (this.ptt) {
       this.capture?.frames.push(frame);
-      if (this.capture) this.capture.voiced++;
+      if (this.capture) { this.capture.voiced++; this._unguess(this.capture); }
       return;
     }
     if (!s.handsFree) return;
@@ -286,10 +292,28 @@ export class Voice {
     }
     const cap = this.capture;
     cap.frames.push(frame);
-    if (rms > threshold * 0.6) { cap.voiced++; cap.silence = 0; } else cap.silence++;
+    if (rms > threshold * 0.6) { cap.voiced++; cap.silence = 0; this._unguess(cap); } else cap.silence++;
+    if (cap.silence === GUESS_AFTER && cap.voiced >= 12 && !cap.guess) {
+      cap.guess = window.jarvis.invoke('speech:transcribe', this._pcm(cap.frames), true).catch(() => null);
+    }
     // A shorter pause ends a short remark; give longer thoughts a little more room.
-    const patience = cap.voiced > 150 ? 55 : 40;
+    const patience = cap.voiced > 150 ? PAUSE_LONG : PAUSE;
     if (cap.silence >= patience || cap.frames.length > 1500) this._finish();
+  }
+
+  /** The user went on talking: the transcription started on a hunch is of half a remark. */
+  _unguess(cap) {
+    if (!cap.guess) return;
+    cap.guess = null;
+    window.jarvis.invoke('speech:stale').catch(() => {});
+  }
+
+  /** The captured frames as one 16 kHz clip, which is what the recognizer takes. */
+  _pcm(frames) {
+    const pcm = new Float32Array(frames.reduce((n, f) => n + f.length, 0));
+    let o = 0;
+    for (const f of frames) { pcm.set(f, o); o += f.length; }
+    return resample(pcm, this.ctx.sampleRate, 16000);
   }
 
   _begin(pre = []) {
@@ -300,6 +324,7 @@ export class Voice {
   }
 
   _drop() {
+    if (this.capture) this._unguess(this.capture);
     this.capture = null;
     this.onset = 0;
   }
@@ -309,16 +334,15 @@ export class Voice {
     this.capture = null;
     if (!cap) return;
     if (cap.voiced < 12) { // under ~a quarter second of actual voice: a cough, a click
+      this._unguess(cap);
       this.cb.onState('idle');
       return;
     }
-    const total = cap.frames.reduce((n, f) => n + f.length, 0);
-    const pcm = new Float32Array(total);
-    let o = 0;
-    for (const f of cap.frames) { pcm.set(f, o); o += f.length; }
     this.cb.onState('transcribing');
     try {
-      const text = await window.jarvis.invoke('speech:transcribe', resample(pcm, this.ctx.sampleRate, 16000));
+      // Nothing but silence has arrived since the hunch, so its transcript is the whole remark.
+      let text = cap.guess ? await cap.guess : null;
+      if (text == null) text = await window.jarvis.invoke('speech:transcribe', this._pcm(cap.frames));
       if (text) this.cb.onUtterance(text);
       else this.cb.onState('idle');
     } catch (err) {
@@ -339,9 +363,9 @@ export class Voice {
       for (let m; (m = re.exec(this.textBuf)); ) {
         if (m.index + m[0].length >= 14) { cut = m.index + m[0].length; break; }
       }
-      // Get the first words out fast: break the opening at a comma if the sentence is running long.
-      if (cut < 0 && this.firstChunk && this.textBuf.length > 60) {
-        const m = /^[\s\S]{25,}?[,;:—]\s+/.exec(this.textBuf);
+      // Get the first words out fast: the opening is spoken as soon as it reaches a comma.
+      if (cut < 0 && this.firstChunk) {
+        const m = /^[\s\S]{18,}?[,;:—]\s+/.exec(this.textBuf);
         if (m) cut = m[0].length;
       }
       if (cut < 0) break;
