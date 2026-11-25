@@ -2,27 +2,14 @@
 // so pointing it at a home directory stays fast; folders can be expanded on demand.
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { kindOf } from './filekind.js';
 
 const SKIP = new Set([
   'node_modules', 'Library', 'AppData', 'Application Data', '$RECYCLE.BIN', 'System Volume Information',
   '__pycache__', 'venv', '.venv', 'proc', 'sys', 'dev', 'snap', 'Applications', 'target', 'dist', 'build',
 ]);
 
-const KINDS = {
-  code: ['js', 'ts', 'tsx', 'jsx', 'py', 'rb', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'cs', 'php', 'swift', 'kt', 'sh', 'html', 'css', 'json', 'yaml', 'yml', 'toml', 'sql'],
-  doc: ['md', 'txt', 'pdf', 'doc', 'docx', 'rtf', 'pages', 'odt', 'tex'],
-  data: ['csv', 'xls', 'xlsx', 'numbers', 'db', 'sqlite', 'parquet', 'xml'],
-  image: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'heic', 'bmp', 'psd', 'ai'],
-  media: ['mp3', 'wav', 'flac', 'm4a', 'mp4', 'mov', 'mkv', 'avi', 'webm'],
-  archive: ['zip', 'tar', 'gz', 'rar', '7z', 'dmg', 'iso'],
-  slides: ['ppt', 'pptx', 'key'],
-};
-const KIND_OF = new Map(Object.entries(KINDS).flatMap(([kind, exts]) => exts.map((e) => [e, kind])));
-
-export function kindOf(name) {
-  const ext = path.extname(name).slice(1).toLowerCase();
-  return KIND_OF.get(ext) || 'other';
-}
+export { kindOf };
 
 async function readChildren(dir) {
   let entries;

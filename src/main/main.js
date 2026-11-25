@@ -94,7 +94,8 @@ function speechCall(op, args) {
 let onScreen = null; // what the viewer shows: {path, kind, name}
 let transcribeSpeed = 0; // seconds of audio per second, measured on the last long transcription
 
-// Recordings are decoded in the window (Web Audio reads every format Chromium plays) and come back as 16 kHz mono.
+// Recordings and pictures are decoded in the window (Chromium reads every format it plays or shows):
+// sound comes back as 16 kHz mono, a picture sized for the model.
 let mediaSeq = 0;
 const mediaPending = new Map();
 function mediaCall(type, file, { signal, timeout = 10 * 60_000 } = {}) {
@@ -110,12 +111,13 @@ function mediaCall(type, file, { signal, timeout = 10 * 60_000 } = {}) {
     const timer = setTimeout(() => done(reject, new Error('The window took too long to decode that file.')), timeout);
     signal?.addEventListener('abort', onAbort);
     mediaPending.set(id, (value) => (value?.error ? done(reject, new Error(value.error)) : done(resolve, value)));
-    send('ui', { type: 'decode_audio', id, path: file, probe: type === 'probe' });
+    send('ui', type === 'picture' ? { type: 'decode_image', id, path: file } : { type: 'decode_audio', id, path: file, probe: type === 'probe' });
   });
 }
 const media = {
   probe: (file) => mediaCall('probe', file, { timeout: 15_000 }),
   decode: (file, { signal } = {}) => mediaCall('decode', file, { signal }),
+  picture: (file) => mediaCall('picture', file, { timeout: 30_000 }),
 };
 
 /** A long recording through Whisper in slices; stops at the end of the current slice when `signal` fires. */

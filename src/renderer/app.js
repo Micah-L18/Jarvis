@@ -12,6 +12,7 @@ import { Panel, h } from './panel.js';
 import { claudeLogin, brainChip } from './brain.js';
 import { wireMedia } from './media.js';
 import { Viewer } from './viewer.js';
+import { kindLabel } from '../main/filekind.js';
 
 const api = window.jarvis;
 const $ = (id) => document.getElementById(id);
@@ -136,8 +137,8 @@ function buildMind() {
 // ---------------------------------------------------------------------------
 
 const KIND_COLOR = {
-  dir: '#38b6ff', code: '#5dffb5', doc: '#ffc76b', data: '#b48cff', image: '#ff7eb6', media: '#ff6a4d',
-  archive: '#8e9aa8', slides: '#ffa23a', other: '#6f8fb0',
+  dir: '#38b6ff', code: '#5dffb5', html: '#5dffb5', json: '#b48cff', csv: '#b48cff', markdown: '#ffc76b', text: '#ffc76b',
+  pdf: '#ffc76b', office: '#ffa23a', image: '#ff7eb6', svg: '#ff7eb6', audio: '#ff6a4d', video: '#ff6a4d', model: '#58d6ff', other: '#6f8fb0',
 };
 let fileNodes = [];
 let filesLoaded = false;
@@ -377,7 +378,7 @@ function select(node, graph) {
     ].filter(Boolean));
   } else {
     card.replaceChildren(...[
-      h('div', { class: 'kind' }, d.dir ? 'folder' : `${d.kind} file`),
+      h('div', { class: 'kind' }, d.dir ? 'folder' : kindLabel(d.kind)),
       h('h2', {}, d.name),
       h('div', { class: 'path' }, d.id),
       d.dir && d.more > 0 && h('p', {}, `${d.more} more item${d.more === 1 ? '' : 's'} inside not shown yet.`),
@@ -561,7 +562,7 @@ function showJarvis(text) {
 }
 function renderJarvis() {
   const follow = line.spoken != null && state.settings.voice.tts !== 'off';
-  const p = captionParts(line.text, follow ? line.spoken : null, line.from);
+  const p = captionParts(line.text, follow ? line.spoken : null, line.from, viewer.isOpen ? 150 : 260); // two lines under the viewer
   const el = $('said-jarvis');
   el.replaceChildren(p.lead + p.lit);
   if (p.dim || p.trail) el.append(h('span', { class: 'ahead' }, p.dim + p.trail));

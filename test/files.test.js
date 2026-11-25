@@ -7,7 +7,7 @@ import http from 'node:http';
 import JSZip from 'jszip';
 import sharp from 'sharp';
 import { kindOf, isTextual, mimeOf } from '../src/main/filekind.js';
-import { extractText, canExtract, describeModel } from '../src/main/extract.js';
+import { extractText, canExtract, describeModel, imageSize } from '../src/main/extract.js';
 import { toolResult, transcriptText } from '../src/main/tools.js';
 import { resultContent } from '../src/main/llm/anthropic.js';
 import { mcpContent } from '../src/main/llm/claudecli.js';
@@ -360,4 +360,16 @@ test('agent on an API key: a picture read by a tool goes back as an image block 
     if (saved === undefined) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = saved;
     server.close();
   }
+});
+
+test('extract: picture sizes come from the header, without an image library', async () => {
+  const dir = tmp();
+  const write = async (name, buf) => { fs.writeFileSync(path.join(dir, name), await buf); return imageSize(path.join(dir, name)); };
+  const base = () => sharp({ create: { width: 321, height: 123, channels: 3, background: '#08f' } });
+  for (const [name, buf] of [['a.png', base().png().toBuffer()], ['a.jpg', base().jpeg().toBuffer()], ['a.webp', base().webp().toBuffer()], ['a.gif', base().gif().toBuffer()]]) {
+    const s = await write(name, buf);
+    assert.deepEqual([s.width, s.height], [321, 123], name);
+  }
+  assert.deepEqual(await write('a.svg', '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 48"></svg>'), { width: 64, height: 48, format: 'svg' });
+  assert.deepEqual(await write('a.bin', Buffer.from('not a picture')), { width: 0, height: 0 });
 });

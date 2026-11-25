@@ -1,5 +1,6 @@
-// The sound inside recordings, for transcription. The main process asks; the window decodes,
-// because Web Audio reads every format Chromium can play, and hands back 16 kHz mono samples.
+// The sound inside recordings, for transcription, and pictures for the model to look at. The main
+// process asks; the window decodes, because Chromium reads every format it can show or play, and
+// hands back 16 kHz mono samples or a picture sized for the model.
 import { kindOf } from '../main/filekind.js';
 
 const RATE = 16000;
@@ -46,14 +47,57 @@ export async function decode(path) {
   return downmix(channels, audio.length);
 }
 
+const MAX_SIDE = 1568; // the long side the vision models work at; bigger only costs time
+const AS_IS = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const base64 = (blob) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(String(r.result).slice(String(r.result).indexOf(',') + 1));
+  r.onerror = () => reject(new Error('Could not read that picture.'));
+  r.readAsDataURL(blob);
+});
+
+/**
+ * A picture ready for a model: {mediaType, data (base64), width, height, scaled, sentWidth?, sentHeight?}.
+ * Small PNG/JPEG/GIF/WebP files go as they are; anything bigger or in another format (SVG, BMP,
+ * AVIF…) is redrawn as a JPEG no bigger than MAX_SIDE on its long side. Chromium does the decoding,
+ * which keeps image libraries out of the main process.
+ */
+export async function picture(path, { maxSide = MAX_SIDE, maxBytes = 1_000_000 } = {}) {
+  const res = await fetch(url(path));
+  if (!res.ok) throw new Error(res.status === 403 ? 'That file is outside the folders I may read.' : `Could not load that file (${res.status}).`);
+  const blob = await res.blob();
+  const src = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    img.src = src;
+    await img.decode().catch(() => { throw new Error('I could not read that picture.'); });
+    const width = img.naturalWidth;
+    const height = img.naturalHeight;
+    if (AS_IS.has(blob.type) && Math.max(width, height) <= maxSide && blob.size <= maxBytes) {
+      return { mediaType: blob.type, data: await base64(blob), width, height, scaled: false };
+    }
+    const svg = blob.type === 'image/svg+xml';
+    const scale = Math.min(svg ? 2 : 1, maxSide / Math.max(width || 1, height || 1));
+    const canvas = new OffscreenCanvas(Math.max(1, Math.round((width || 300) * scale)), Math.max(1, Math.round((height || 150) * scale)));
+    const g = canvas.getContext('2d');
+    g.fillStyle = '#ffffff';
+    g.fillRect(0, 0, canvas.width, canvas.height);
+    g.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const out = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
+    return { mediaType: 'image/jpeg', data: await base64(out), width, height, scaled: true, sentWidth: canvas.width, sentHeight: canvas.height };
+  } finally {
+    URL.revokeObjectURL(src);
+  }
+}
+
 /** Answer the main process's decode requests, and show transcription progress in the status line. */
 export function wireMedia(api, { setStatus }) {
   api.on('ui', async (e) => {
     if (e.type === 'status') return setStatus(e.text, e.ttl || 0);
-    if (e.type !== 'decode_audio') return;
+    if (e.type !== 'decode_audio' && e.type !== 'decode_image') return;
     let value;
     try {
-      value = e.probe ? await probe(e.path) : await decode(e.path);
+      value = e.type === 'decode_image' ? await picture(e.path) : e.probe ? await probe(e.path) : await decode(e.path);
     } catch (err) {
       value = { error: err?.message || String(err) };
     }

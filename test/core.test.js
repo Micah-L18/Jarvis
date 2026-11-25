@@ -90,7 +90,7 @@ test('fsscan: bounded breadth-first scan, expansion, and root confinement', asyn
   assert.equal(names.includes('node_modules') || names.includes('.hidden') || names.includes('c'), false);
   const b = res.nodes.find((n) => n.name === 'b');
   assert.equal(b.more, 1, 'folder at the depth limit reports unseen children');
-  assert.equal(res.nodes.find((n) => n.name === 'notes.md').kind, 'doc');
+  assert.equal(res.nodes.find((n) => n.name === 'notes.md').kind, 'markdown');
   const more = await expand(b.id, b.depth);
   assert.deepEqual(more.map((n) => [n.name, n.depth]), [['c', 3]]);
   assert.equal(isInside(dir, path.join(dir, 'a')), true);

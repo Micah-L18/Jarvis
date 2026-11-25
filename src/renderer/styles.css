@@ -135,7 +135,7 @@ button { cursor: pointer; background: none; border: 0; }
 
 /* ---- file viewer ---- */
 #viewer-dim { position: fixed; inset: 0; z-index: 3; pointer-events: none; background: radial-gradient(ellipse at center, rgba(0, 0, 0, 0.62), rgba(0, 0, 0, 0.38) 75%); animation: v-fade 0.25s ease-out; }
-#viewer { position: fixed; top: 112px; bottom: 176px; left: 50%; transform: translateX(-50%); width: min(1240px, calc(100vw - 128px)); display: flex; flex-direction: column; z-index: 4;
+#viewer { position: fixed; top: 112px; bottom: 182px; left: 50%; transform: translateX(-50%); width: min(1240px, calc(100vw - 128px)); display: flex; flex-direction: column; z-index: 4;
   color-scheme: dark; background: rgba(10, 8, 6, 0.86); border: 1px solid var(--line); backdrop-filter: blur(10px); box-shadow: 0 0 40px rgba(255, 130, 20, 0.08), inset 0 0 60px rgba(255, 140, 20, 0.03); user-select: text; animation: v-in 0.25s ease-out; }
 #viewer::before, #viewer::after { content: ""; position: absolute; width: 16px; height: 16px; border: 0 solid var(--amber); pointer-events: none; }
 #viewer::before { left: -6px; top: -6px; border-width: 1px 0 0 1px; }

@@ -39,6 +39,10 @@ export function kindOf(p) {
   return BARE.has(name) ? 'text' : 'other';
 }
 
+// What each kind is called on screen.
+const LABEL = { svg: 'svg image', model: '3d model', pdf: 'pdf', markdown: 'markdown', code: 'code', text: 'text', csv: 'table', json: 'json', audio: 'audio', video: 'video', office: 'document', html: 'html source', image: 'image', other: 'file' };
+export const kindLabel = (kind) => LABEL[kind] || kind || 'file';
+
 // Kinds whose bytes are readable as text.
 export const TEXTUAL = new Set(['markdown', 'code', 'text', 'csv', 'json', 'html', 'svg']);
 

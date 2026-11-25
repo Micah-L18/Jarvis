@@ -162,11 +162,50 @@ export async function loadImage(file, { maxSide = MAX_SIDE, maxBytes = 1_000_000
   return { mediaType: 'image/jpeg', data: out.data.toString('base64'), width, height, scaled: true, sentWidth: out.info.width, sentHeight: out.info.height };
 }
 
-/** Dimensions without decoding the whole image. */
+/** Dimensions from the file's header alone ({width: 0, height: 0} when it cannot tell). */
 export async function imageSize(file) {
-  const { default: sharp } = await import('sharp');
-  const meta = await sharp(file).metadata();
-  return { width: meta.width || 0, height: meta.height || 0, format: meta.format };
+  const fh = await fs.open(file, 'r');
+  try {
+    const buf = Buffer.alloc(256 * 1024);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    return sizeFromHeader(buf.subarray(0, bytesRead));
+  } finally {
+    await fh.close();
+  }
+}
+
+export function sizeFromHeader(b) {
+  const none = { width: 0, height: 0 };
+  const ascii = (at, n) => b.toString('latin1', at, at + n);
+  if (b.length >= 24 && b.readUInt32BE(0) === 0x89504e47) return { width: b.readUInt32BE(16), height: b.readUInt32BE(20), format: 'png' };
+  if (b.length >= 10 && ascii(0, 3) === 'GIF') return { width: b.readUInt16LE(6), height: b.readUInt16LE(8), format: 'gif' };
+  if (b.length >= 26 && ascii(0, 2) === 'BM') return { width: b.readInt32LE(18), height: Math.abs(b.readInt32LE(22)), format: 'bmp' };
+  if (b.length >= 30 && ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') {
+    const chunk = ascii(12, 4);
+    if (chunk === 'VP8 ') return { width: b.readUInt16LE(26) & 0x3fff, height: b.readUInt16LE(28) & 0x3fff, format: 'webp' };
+    if (chunk === 'VP8L') { const v = b.readUInt32LE(21); return { width: (v & 0x3fff) + 1, height: ((v >> 14) & 0x3fff) + 1, format: 'webp' }; }
+    if (chunk === 'VP8X') return { width: b.readUIntLE(24, 3) + 1, height: b.readUIntLE(27, 3) + 1, format: 'webp' };
+  }
+  if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {
+    for (let i = 2; i + 9 < b.length;) {
+      if (b[i] !== 0xff) return none;
+      const marker = b[i + 1];
+      if (marker === 0xff) { i++; continue; }
+      if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) return { width: b.readUInt16BE(i + 7), height: b.readUInt16BE(i + 5), format: 'jpeg' };
+      i += 2 + b.readUInt16BE(i + 2);
+    }
+    return none;
+  }
+  const text = ascii(0, Math.min(b.length, 4096));
+  const svg = /<svg\b[^>]*>/i.exec(text)?.[0];
+  if (svg) {
+    const attr = (name) => Number.parseFloat((new RegExp(`\\s${name}\\s*=\\s*["']([\\d.]+)(px)?["']`, 'i').exec(svg) || [])[1]);
+    const box = /viewBox\s*=\s*["'][\d.\s,-]*?([\d.]+)[\s,]+([\d.]+)\s*["']/i.exec(svg);
+    const width = attr('width') || Number(box?.[1]) || 0;
+    const height = attr('height') || Number(box?.[2]) || 0;
+    return { width: Math.round(width), height: Math.round(height), format: 'svg' };
+  }
+  return none;
 }
 
 /** A line about a 3D model file: its format and, where cheap, what is in it. */

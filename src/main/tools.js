@@ -85,7 +85,7 @@ export function validateInput(schema, input) {
 
 /**
  * @param ctx {memory, skills, settings, ui(event), fsRoot(), openPath(p),
- *   media?: {probe(path) -> {duration}, decode(path, {signal}) -> Float32Array (16 kHz mono)},
+ *   media?: {probe(path) -> {duration}, decode(path, {signal}) -> Float32Array (16 kHz mono), picture?(path) -> image as loadImage gives it},
  *   transcribe?(audio, {signal}) -> {text, chunks}, transcribeSpeed?() -> seconds of audio per second, signal?() -> AbortSignal}
  * @param opts {localWeb: boolean} — add client-side web tools (used when the model has no hosted search)
  */
@@ -310,7 +310,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
         const f = await fileIn(p);
         if (f.kind === 'folder') throw new Error('That is a folder; use list_folder.');
         if (f.kind === 'image' || f.kind === 'svg') {
-          const img = await loadImage(f.file);
+          const img = ctx.media?.picture ? await ctx.media.picture(f.file) : await loadImage(f.file); // in the app the window decodes it
           const note = `${f.file}: ${f.kind === 'svg' ? 'SVG drawing' : 'image'}, ${img.width} by ${img.height} pixels, ${bytes(f.stat.size)}${img.scaled && img.sentWidth !== img.width ? ` (shown to you at ${img.sentWidth} by ${img.sentHeight})` : ''}.`;
           let source = '';
           if (f.kind === 'svg') {

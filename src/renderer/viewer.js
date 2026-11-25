@@ -2,7 +2,7 @@
 // PDFs, markdown, code and text, tables, audio and video — and a Text tab for what Jarvis reads
 // out of a file (a transcription). Everything is loaded through jarvis-file://, which only serves
 // files inside the folders Jarvis may see.
-import { kindOf, extOf } from '../main/filekind.js';
+import { kindOf, extOf, kindLabel } from '../main/filekind.js';
 import { h } from './panel.js';
 import { fileUrl, nameOf, dirOf, formatBytes, middle, looksBinary, parseCsv } from './viewkit.js';
 
@@ -14,7 +14,6 @@ const BIG_MODEL = 150 * 1024 * 1024;
 const CSV_ROWS = 1000;
 const READABLE = new Set(['pdf', 'markdown', 'code', 'text', 'csv', 'json', 'office', 'html', 'image', 'svg']);
 const HEARABLE = new Set(['audio', 'video']);
-const KIND_NAME = { svg: 'svg image', model: '3d model', pdf: 'pdf', markdown: 'markdown', code: 'code', text: 'text', csv: 'table', json: 'json', audio: 'audio', video: 'video', office: 'document', html: 'html source', image: 'image', other: 'file' };
 
 export class Viewer {
   /** @param app {api, root, dim, voice() -> Voice, send(text), toast(text, error?), onClose()} */
@@ -182,7 +181,7 @@ export class Viewer {
   _header() {
     const c = this.current;
     const e = this.els;
-    e.kind.textContent = [KIND_NAME[c.kind] || c.kind, formatBytes(c.size)].filter(Boolean).join(' · ');
+    e.kind.textContent = [kindLabel(c.kind), formatBytes(c.size)].filter(Boolean).join(' · ');
     e.name.textContent = c.name;
     e.name.title = c.name;
     e.path.textContent = middle(c.path);
