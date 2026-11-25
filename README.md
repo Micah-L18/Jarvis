@@ -45,12 +45,22 @@ Just talk. It listens continuously, works out when you've finished a thought, an
 |---|---|
 | Hold **Space** | Push-to-talk (works even with hands-free off or the mic muted) |
 | **/** or **Enter** | Type instead |
-| **Esc** | Interrupt / close whatever is open |
+| **Esc** | Close whatever is open (the type box, the controls, the file viewer, a card), otherwise interrupt |
 | **M** | Mute the microphone |
 | **1 2 3** | Core / Mind / Files view |
 | **Tab** | Controls |
 
 While you talk, the words it has caught so far appear under the hologram and settle into the final transcript when you stop (live captions use a small extra model, about 124 MB, fetched the first time you speak). Its own reply is captioned as it speaks: the part already said is bright, the rest dim.
+
+### Files, by voice
+
+Ask for a file and it opens in the app's viewer, then Jarvis answers about it:
+
+- "Show me the cottage picture." · "Pull up the floor plan model." · "Open last week's minutes."
+- "What's in this?" or "Summarize this." — *this* is whatever the viewer is showing. You get three to five sentences aloud; for anything long, a fuller summary is also saved as a document next to the file's Text tab.
+- "Transcribe this." — for a recording or video, Jarvis's own speech recognizer writes out what is said, with times; for a PDF, Word file, slides, spreadsheet or web page it pulls out the full text; for a picture it reads the text in it. The transcript appears in the viewer's **Text** tab and is saved as a project document. It is not read out. A long recording gets an estimate first ("forty minutes long, about seven minutes to transcribe") and goes ahead when you say so; Esc stops it.
+
+The viewer's **Summarize** and **Transcribe** buttons ask the same thing.
 
 Speech recognition (Whisper) and the voice (Kokoro, a British male voice by default) both run locally. If you use open speakers and it keeps interrupting itself, turn off "Let me interrupt while it is talking" under Voice, or use headphones.
 
@@ -60,13 +70,14 @@ The microphone and the speaker are chosen separately under **Voice** in the cont
 
 - **Core** — the hologram. It breathes when idle, tightens its rings when it hears you, spins up while thinking, and its surface follows the voice when it speaks.
 - **Mind** — a 3D map of what it knows. Projects are the double-ringed gold hubs; people, topics, facts, tasks and documents hang off them. Click any marker to see it, and **Forget** to delete it.
-- **Files** — a 3D map of your folders (your home folder by default; change it under Files in the controls). Folders are diamonds, files are dots. Click a folder to open it further; click a file to see it in the app — pictures, 3D models (as a hologram or solid), PDFs, markdown, code, tables, audio and video — with buttons to have Jarvis summarize or transcribe it, or open it in its own app. Esc closes it.
+- **Files** — a 3D map of your folders (your home folder by default; change it under Files in the controls). Folders are diamonds, files are dots, coloured by kind. Click a folder to open it further; click a file to open it in the viewer.
+- **Viewer** — a framed pane over the scene that shows a file without leaving Jarvis: pictures (scroll to zoom, drag to pan), 3D models (glTF/GLB, OBJ, STL, PLY, FBX, 3MF, DAE — turning slowly as an amber hologram, or **Solid** in their own materials; drag to spin), PDFs, markdown, code and text with line numbers, CSV tables, audio and video. Word, Excel and PowerPoint files get an info card — Jarvis can still read them. Along the bottom: **Summarize**, **Transcribe**, **Open in default app**, **Show in folder**. A transcript or extracted text shows in the **Text** tab, with **Copy**. Esc closes it. While a video or recording plays, hands-free listening pauses so Jarvis does not take the soundtrack for you (push-to-talk still works).
 
 ![The Mind view](docs/mind.png)
 
 ![The Files view](docs/files.png)
 
-You can also ask for these by voice: "show me my files", "pull up the volleyball project".
+You can also ask for these by voice: "show me my files", "pull up the volleyball project", "show me roster.csv".
 
 ## Memory and projects
 
@@ -89,7 +100,9 @@ Long work — a practice plan, research notes, a dataset — is written as a mar
 - Cloud mode: what you say, the memory summary, and tool results (including any file contents Jarvis reads at your request) are sent to Anthropic — through your Claude login or your API key, whichever is chosen.
 - With the Claude login, the Claude Code program adds a little of its own to each request: the account's email address, and a note of the operating system, the date and the (empty) folder inside Jarvis's data folder that it runs in. Pages are fetched from this computer rather than by Anthropic. It keeps no transcript, and nothing is remembered between one reply and the next except what Jarvis's own memory puts in front of it — so what you delete is gone there too.
 - With the Claude login on a computer whose Claude Code is managed by an organisation, that organisation's policy still applies: hooks it sets receive what you say together with the memory summary sent along, the inputs of the tools Jarvis uses, and the reply, and its settings can turn on its own logging. Jarvis shows this under Brain and when it starts; it cannot switch it off. An API key or Local is not subject to it.
-- File tools are confined to the folder you choose; they can read and open, never write or delete. Jarvis only writes inside its own project folders.
+- Files are read only when you ask to see them or ask about them. In cloud mode, the text Jarvis reads out of a file, and a picture it looks at (scaled down to at most 1568 pixels on its long side), go to Anthropic with that request. Nothing is uploaded just because it is in the Files map or open in the viewer; while the viewer is open, only the file's name and location go along with what you say, so "this" works. In local mode a picture goes only to an Ollama model that can see images; others are told they cannot.
+- Transcribing a recording or video happens on this computer, with the same speech recognizer that hears you; the sound is never sent anywhere. Only the transcript's opening lines go to the model, so it can tell you it is done — more only if you then ask about what was said.
+- The viewer and file tools are confined to the folder you choose and Jarvis's own project documents (links pointing elsewhere are refused too); they can read and open, never write or delete. Files are shown, never run: web pages are shown as source, and markdown and SVG are drawn without scripts or remote content. Jarvis only writes inside its own project folders.
 - All data lives in the app's data folder (shown under System in the controls).
 
 ## Development
