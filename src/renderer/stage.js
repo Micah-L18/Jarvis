@@ -14,12 +14,37 @@ const TAU = Math.PI * 2;
 // ---------------------------------------------------------------------------
 
 // Where the caption and the hint sit (bottom centre of the window): the table's light is faded out
-// behind them, so the words stand on clean dark background. uRes is the drawing buffer's size.
-const CAPTION_MASK = /* glsl */ `
-  float captionMask(vec2 res){
-    vec2 sc = gl_FragCoord.xy / res;
-    return 1.0 - 0.96 * (1.0 - smoothstep(0.135, 0.19, sc.y)) * (1.0 - smoothstep(0.3, 0.4, abs(sc.x - 0.5)));
+// behind them, so the words stand on clean dark background. The band is a fixed size in CSS pixels,
+// like the caption itself; every material that fades behind it shares these two uniforms.
+// uCaption: half-width where the fade is complete / where it ends, then the height above the
+// window's foot where it is complete / where it ends — all in drawing-buffer pixels.
+export const CAPTION = { uRes: { value: new THREE.Vector2(1, 1) }, uCaption: { value: new THREE.Vector4(-2, -1, -2, -1) } };
+export const CAPTION_MASK = /* glsl */ `
+  uniform vec2 uRes; uniform vec4 uCaption;
+  float captionMask(){
+    return 1.0 - 0.96 * (1.0 - smoothstep(uCaption.z, uCaption.w, gl_FragCoord.y)) * (1.0 - smoothstep(uCaption.x, uCaption.y, abs(gl_FragCoord.x - 0.5 * uRes.x)));
   }`;
+
+const BAND = { ramp: 144, full: 122, end: 171 }; // CSS pixels: the fade's width at each side, and its two heights above the foot
+const band = { mid: 0, height: 1e9, half: 0 }; // the band as last set, in CSS pixels (for captionFade)
+
+/** Call when the window or its pixel ratio changes. width and height are CSS pixels. */
+export function setCaptionBand(width, height, pixelRatio) {
+  const half = Math.min(432, width * 0.36);
+  band.mid = width / 2; band.height = height; band.half = half;
+  CAPTION.uRes.value.set(width * pixelRatio, height * pixelRatio);
+  CAPTION.uCaption.value.set(half, half + BAND.ramp, BAND.full, BAND.end).multiplyScalar(pixelRatio);
+}
+
+/**
+ * The same fade, for things placed from JavaScript (labels, picking): how much of something that
+ * spans x0..x1 at height y (CSS pixels from the window's top left) is left behind the caption.
+ */
+export function captionFade(x0, x1, y) {
+  const dx = Math.max(0, x0 - band.mid, band.mid - x1);
+  const low = 1 - THREE.MathUtils.smoothstep(band.height - y, BAND.full, BAND.end);
+  return 1 - 0.96 * low * (1 - THREE.MathUtils.smoothstep(dx, band.half, band.half + BAND.ramp));
+}
 
 const FLOOR_VERT = /* glsl */ `
   attribute float aSpin; attribute float aAlpha; attribute float aRise; attribute float aDetail;
@@ -43,7 +68,7 @@ const FLOOR_VERT = /* glsl */ `
     gl_Position = projectionMatrix * modelViewMatrix * vec4(q, 1.0);
   }`;
 const FLOOR_FRAG = /* glsl */ `
-  uniform vec3 uColor; uniform float uOpacity; uniform float uTime; uniform float uFar; uniform vec2 uRes;
+  uniform vec3 uColor; uniform float uOpacity; uniform float uTime; uniform float uFar;
   varying float vA; varying float vR;
   ${CAPTION_MASK}
   void main(){
@@ -52,7 +77,7 @@ const FLOOR_FRAG = /* glsl */ `
     float pulse = smoothstep(0.16, 0.0, abs(vR - wave)) * (1.0 - wave / 1.5);
     float a = vA * uOpacity * (1.0 + pulse * 1.1);
     a *= mix(1.0, uFar, smoothstep(0.1, 0.3, vR));          // the big arcs step back when the viewer is in among them
-    a *= captionMask(uRes);
+    a *= captionMask();
     vec3 col = mix(uColor, mix(uColor, vec3(1.0), 0.65), clamp(vA, 0.0, 1.0) * 0.55);
     gl_FragColor = vec4(col, a);
   }`;
@@ -140,10 +165,11 @@ function emitterLines() {
   s.arc(0.5, 0, 0.3);
   s.arc(1.0, 0.035, 0.6);
   s.ticks(1.0, 0.018, 180, 0.035, 0.6, 5);
-  s.ticks(1.0, 0.07, 12, 0.035, 0.75, 1);
+  s.ticks(1.0, 0.022, 12, 0.035, 0.75, 1);
 
   // Everything below is instrument detail, drawn under the orb only.
   s.detail = 1;
+  s.ticks(1.0484, 0.048, 12, 0.035, 0.75, 1); // the twelve long gauge marks
   s.arc(0.085, 0.5, 0.7, 0.02, 0.3); s.arc(0.085, 0.5, 0.7, 0.36, 0.63); s.arc(0.085, 0.5, 0.7, 0.69, 0.97);
   s.arc(0.13, 0, 0.5);
   s.ticks(0.13, 0.012, 24, 0, 0.6, 3);
@@ -199,7 +225,7 @@ const CONE_VERT = /* glsl */ `
     gl_Position = projectionMatrix * mv;
   }`;
 const CONE_FRAG = /* glsl */ `
-  uniform vec3 uColor; uniform float uOpacity; uniform float uTime; uniform vec2 uRes;
+  uniform vec3 uColor; uniform float uOpacity; uniform float uTime;
   varying vec3 vN; varying vec3 vV; varying float vH; varying vec2 vXZ;
   ${CAPTION_MASK}
   void main(){
@@ -208,19 +234,20 @@ const CONE_FRAG = /* glsl */ `
     float h = pow(1.0 - vH, 1.7);
     float ang = atan(vXZ.y, vXZ.x);
     float rays = 0.72 + 0.28 * sin(ang * 18.0 + uTime * 0.12) * sin(ang * 7.0 - uTime * 0.07);
-    gl_FragColor = vec4(uColor, body * h * rays * uOpacity * captionMask(uRes));
+    gl_FragColor = vec4(uColor, body * h * rays * uOpacity * captionMask());
   }`;
 
 /**
  * An open, upward-widening cone of faint light. Unit height, base at y = 0.
- * Returns the mesh; drive `material.uniforms.uOpacity / uTime / uColor`. uRes (the drawing buffer's
- * size) switches on the fade behind the caption; left at its default the cone is drawn everywhere.
+ * Returns the mesh; drive `material.uniforms.uOpacity / uTime / uColor`. `masked` makes it fade
+ * behind the caption; otherwise it is drawn everywhere.
  */
-export function lightCone({ bottom = 0.2, top = 0.78, color = '#ff9a2e', opacity = 0.2 } = {}) {
+export function lightCone({ bottom = 0.2, top = 0.78, color = '#ff9a2e', opacity = 0.2, masked = false } = {}) {
   const geo = new THREE.CylinderGeometry(top, bottom, 1, 48, 1, true);
   geo.translate(0, 0.5, 0);
+  const band = masked ? CAPTION : { uRes: { value: new THREE.Vector2(1, 1) }, uCaption: { value: new THREE.Vector4(-2, -1, -2, -1) } };
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uColor: { value: new THREE.Color(color) }, uOpacity: { value: opacity }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) } },
+    uniforms: { uColor: { value: new THREE.Color(color) }, uOpacity: { value: opacity }, uTime: { value: 0 }, uRes: band.uRes, uCaption: band.uCaption },
     vertexShader: CONE_VERT, fragmentShader: CONE_FRAG,
     transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, side: THREE.DoubleSide,
   });
@@ -244,24 +271,18 @@ export class Stage {
     this.color = new THREE.Color('#ff9a2e');
     this.cur = null; // {y, radius, height, opacity, cone, detail}
     this.floorMat = new THREE.ShaderMaterial({
-      uniforms: { uColor: { value: this.color }, uOpacity: { value: 0 }, uTime: { value: 0 }, uDetail: { value: 1 }, uFar: { value: 1 }, uRes: { value: new THREE.Vector2(1, 1) } },
+      uniforms: { uColor: { value: this.color }, uOpacity: { value: 0 }, uTime: { value: 0 }, uDetail: { value: 1 }, uFar: { value: 1 }, uRes: CAPTION.uRes, uCaption: CAPTION.uCaption },
       vertexShader: FLOOR_VERT, fragmentShader: FLOOR_FRAG,
       transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, side: THREE.DoubleSide,
     });
     this.lines = new THREE.LineSegments(emitterLines(), this.floorMat);
     this.fills = new THREE.Mesh(emitterFills(), this.floorMat);
-    this.cone = lightCone({ bottom: CONE_BOTTOM, top: CONE_TOP });
+    this.cone = lightCone({ bottom: CONE_BOTTOM, top: CONE_TOP, masked: true });
     this.cone.material.uniforms.uColor.value = this.color;
-    this.cone.material.uniforms.uRes.value = this.floorMat.uniforms.uRes.value;
     for (const o of [this.fills, this.cone, this.lines]) {
       o.frustumCulled = false;
       this.group.add(o);
     }
-  }
-
-  /** The drawing buffer's size in pixels (for the fade behind the caption). */
-  setSize(width, height) {
-    this.floorMat.uniforms.uRes.value.set(width, height);
   }
 
   /**
@@ -285,7 +306,7 @@ export class Stage {
     const up = eye.y - c.y;
     const out = Math.hypot(eye.x, eye.z);
     const coneR = c.radius * (CONE_BOTTOM + (CONE_TOP - CONE_BOTTOM) * THREE.MathUtils.clamp(up / c.height, 0, 1));
-    const clear = Math.min(smooth(out / coneR, 1.15, 2.6), smooth(Math.hypot(out, up) / c.radius, 1.6, 3.4));
+    const clear = Math.min(smooth(out / coneR, 1.15, 2.6), smooth(Math.hypot(out, up) / c.radius, 1.6, 5));
 
     this.floorMat.uniforms.uTime.value = this.time;
     this.floorMat.uniforms.uOpacity.value = c.opacity;
@@ -305,7 +326,8 @@ const SCREEN = {
   uniforms: {
     tDiffuse: { value: null },
     uRes: { value: new THREE.Vector2(1, 1) },
-    uPixel: { value: 1 },
+    uPixel: { value: 1 }, // scan-line pitch in drawing-buffer pixels (whole)
+    uDpr: { value: 1 }, // drawing-buffer pixels per CSS pixel
     uTime: { value: 0 },
     uTint: { value: new THREE.Color('#ff9a2e') },
   },
@@ -313,7 +335,7 @@ const SCREEN = {
     varying vec2 vUv;
     void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: /* glsl */ `
-    uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uPixel; uniform float uTime; uniform vec3 uTint;
+    uniform sampler2D tDiffuse; uniform vec2 uRes; uniform float uPixel; uniform float uDpr; uniform float uTime; uniform vec3 uTint;
     varying vec2 vUv;
     float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
     vec3 toSRGB(vec3 c){ c = max(c, 0.0); return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
@@ -337,9 +359,12 @@ const SCREEN = {
       vec2 q = (vUv - vec2(0.5, 0.30)) * vec2(aspect * 0.8, 1.5);
       float spill = smoothstep(0.75, 0.0, length(q));
       room += uTint * 0.0022 * spill * spill;
-      // The hologram is held back a little behind the captions and the top bar, so the words always win.
-      float strip = (1.0 - smoothstep(0.04, 0.2, vUv.y)) * smoothstep(0.42, 0.26, abs(vUv.x - 0.5));
-      float bar = smoothstep(0.87, 0.96, vUv.y);
+      // The hologram is held back a little behind the captions and the top bar, so the words always
+      // win. Both bands are sized in CSS pixels, like the HUD itself.
+      vec2 css = gl_FragCoord.xy / uDpr, win = uRes / uDpr;
+      float capHalf = min(375.0, win.x * 0.26);
+      float strip = (1.0 - smoothstep(36.0, 180.0, css.y)) * smoothstep(capHalf * 1.6, capHalf, abs(css.x - 0.5 * win.x));
+      float bar = 1.0 - smoothstep(36.0, 117.0, win.y - css.y);
       c = c * (0.72 + 0.28 * fall) * (1.0 - 0.6 * strip) * (1.0 - 0.42 * bar) + room;
 
       c = toSRGB(c);

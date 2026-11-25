@@ -4,7 +4,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { Orb } from './orb.js';
-import { Stage, screenPass } from './stage.js';
+import { Stage, screenPass, setCaptionBand } from './stage.js';
 import { Graph3D } from './graph.js';
 import { Voice } from './voice.js';
 import { Panel, h } from './panel.js';
@@ -54,8 +54,10 @@ camera.add(orb.group); // the hologram lives in front of the camera, like a HUD 
 const orbPose = { pos: new THREE.Vector3(0, 0.25, -10), scale: 1.2 };
 orb.group.position.copy(orbPose.pos);
 
-const mind = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.5, charge: -90, beamWidth: 1.2, flatten: 0.07 });
-const files = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.34, charge: -34, maxLabels: 70, beamWidth: 0.9, flatten: 0.04 });
+// Labels keep out from under the top bar (px from the top); behind the caption they fade with their markers.
+const HUD_CLEAR = { top: 88 };
+const mind = new Graph3D({ labelLayer: $('labels'), hud: HUD_CLEAR, linkOpacity: 0.5, charge: -90, beamWidth: 1.2, flatten: 0.025 });
+const files = new Graph3D({ labelLayer: $('labels'), hud: HUD_CLEAR, linkOpacity: 0.34, charge: -34, maxLabels: 70, beamWidth: 0.9, flatten: 0.02 });
 scene.add(mind.group, files.group);
 
 function resize() {
@@ -70,7 +72,8 @@ function resize() {
   composer.setSize(w, hgt);
   screen.uniforms.uRes.value.set(w * pr, hgt * pr);
   screen.uniforms.uPixel.value = Math.max(1, Math.round(pr));
-  stage.setSize(w * pr, hgt * pr);
+  screen.uniforms.uDpr.value = pr;
+  setCaptionBand(w, hgt, pr);
   camera.aspect = w / hgt;
   camera.updateProjectionMatrix();
   placeCallout();
@@ -194,15 +197,18 @@ function flyTo(target, distance, seconds = 1.4) {
   flight = { t: 0, seconds, dir, framing: false, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), toTarget: target.clone(), toPos: target.clone().add(dir.clone().multiplyScalar(distance)) };
 }
 
-// The projection table. Under a map it sits clear below the lowest node and is sized to the map;
+// The projection table. Under a map it sits clear below the map's keel and is sized to the map;
 // in Core it is sized to the orb, which lives in front of the camera, so it follows the camera's
 // distance from the centre.
-const FLOOR = { gap: 0.16, radius: 0.5, glow: 0.5, cone: 0.1, coreDrop: 0.25, coreRadius: 0.17, coreCone: 0.22 };
-const tableY = (graph) => graph.bottom - Math.max(14, graph.radius * FLOOR.gap);
+const FLOOR = { gap: 0.32, radius: 0.42, glow: 0.5, cone: 0.12, coreDrop: 0.25, coreRadius: 0.17, coreCone: 0.22 };
+const tableY = (graph) => graph.keel - Math.max(14, tableRadius(graph) * FLOOR.gap);
 const tableRadius = (graph) => Math.max(50, graph.spread * FLOOR.radius);
 
-// Framing a map: the band of the window it must sit in (NDC: clear of the top bar, the caption and
-// the edges), with the table's near rim just above the caption.
+// Framing a map: the band of the window it must sit in (clear of the top bar, the caption and the
+// edges), with the table's near rim just above the caption. The HUD is a fixed size in CSS pixels,
+// so the band is worked out from the window's height: FRAME is px from the top for the highest
+// node, px from the foot for the lowest node and for the table's rim.
+const FRAME = { top: 117, bottom: 171, rim: 153 };
 const framing = { sinE: 0.28, tanFov: 1, aspect: 1, top: 0.74, bottom: -0.62, side: 0.74, floorY: 0, floorR: 1, floorLimit: -0.66, minDist: 240 };
 const framed = { y: 0, dist: 0 };
 
@@ -211,6 +217,10 @@ function solveFraming(graph, rounds) {
   framing.sinE = flight ? flight.dir.y : dy / (camera.position.distanceTo(controls.target) || 1);
   framing.tanFov = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   framing.aspect = camera.aspect;
+  const hgt = window.innerHeight;
+  framing.top = Math.max(0.25, 1 - (2 * FRAME.top) / hgt);
+  framing.bottom = Math.min(-0.15, (2 * FRAME.bottom) / hgt - 1);
+  framing.floorLimit = Math.min(framing.bottom - 0.02, (2 * FRAME.rim) / hgt - 1);
   framing.floorY = tableY(graph);
   framing.floorR = tableRadius(graph) * 1.08;
   return graph.frame(framing, framed, rounds);
@@ -281,6 +291,8 @@ function setView(next, focusText) {
   mind.labelsOn = next === 'mind';
   files.labelsOn = next === 'files';
   select(null);
+  mind.setHover(null); // the map is about to move away from under the pointer
+  files.setHover(null);
   follow = null;
   controls.autoRotateSpeed = next === 'core' ? 0.25 : 0.12;
   if (next === 'files') loadFiles().then(() => focusText && focusByName(files, focusText));
@@ -370,7 +382,7 @@ const aim = $('aim');
 const aimMark = $('aim-mark');
 const aimLine = $('aim-line');
 const aimAt = { x: 0, y: 0, r: 0, visible: false };
-const callout = { x: 0, y: 0, half: -1 }; // where the line leaves the card; the bracket size last drawn
+const callout = { x: 0, y: 0, half: -1, ax: NaN, ay: NaN }; // where the line leaves the card; the brackets as last drawn
 
 /** Measured when the card or the window changes, not per frame. */
 function placeCallout() {
@@ -378,6 +390,7 @@ function placeCallout() {
   const box = $('card').getBoundingClientRect();
   callout.x = box.right + 5;
   callout.y = box.top - 5;
+  callout.ax = NaN; // redraw the line
 }
 
 function trackSelection(w, hgt) {
@@ -394,15 +407,19 @@ function trackSelection(w, hgt) {
   const half = Math.round(at.r + 7);
   if (half !== callout.half) { // four corners, redrawn only when the marker changes size
     callout.half = half;
+    callout.ax = NaN;
     const leg = Math.max(5, Math.round(half * 0.36));
     aimMark.setAttribute('d', `M${-half},${leg - half}V${-half}H${leg - half}M${half - leg},${-half}H${half}V${leg - half}M${half},${half - leg}V${half}H${half - leg}M${leg - half},${half}H${-half}V${half - leg}`);
   }
-  aimMark.setAttribute('transform', `translate(${at.x.toFixed(1)},${at.y.toFixed(1)})`);
+  const ax = Math.round(at.x * 4) / 4, ay = Math.round(at.y * 4) / 4;
+  if (ax === callout.ax && ay === callout.ay) return; // nothing moved
+  callout.ax = ax; callout.ay = ay;
+  aimMark.setAttribute('transform', `translate(${ax},${ay})`);
   // from the card's corner bracket, a short level run, then straight to the nearest corner of the brackets
   const elbow = callout.x + 16;
-  const ex = at.x - half, ey = at.y + (callout.y < at.y ? -half : half);
+  const ex = ax - half, ey = ay + (callout.y < ay ? -half : half);
   if (ex < elbow + 12) aimLine.setAttribute('points', '');
-  else aimLine.setAttribute('points', `${callout.x},${callout.y} ${elbow},${callout.y} ${ex.toFixed(1)},${ey.toFixed(1)}`);
+  else aimLine.setAttribute('points', `${callout.x},${callout.y} ${elbow},${callout.y} ${ex},${ey}`);
 }
 
 const activeGraph = () => (view === 'files' ? files : view === 'mind' ? mind : null);
@@ -416,6 +433,7 @@ canvas.addEventListener('pointermove', (e) => {
   g.setHover(node?.id || null);
   canvas.style.cursor = node ? 'pointer' : 'default';
 });
+canvas.addEventListener('pointerleave', () => { mind.setHover(null); files.setHover(null); canvas.style.cursor = 'default'; });
 canvas.addEventListener('pointerup', (e) => {
   setTimeout(() => { controls.autoRotate = true; }, 4000);
   if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return;
@@ -645,7 +663,8 @@ function frame(now = performance.now()) {
   const ease = 1 - Math.exp(-dt * 4);
   orb.group.position.lerp(target.pos, ease);
   orbPose.scale += (target.scale - orbPose.scale) * ease;
-  orb.update(dt, (hgt / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * orbPose.scale);
+  const pr = renderer.getPixelRatio();
+  orb.update(dt, (hgt / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * orbPose.scale * pr); // in drawing-buffer pixels
   orb.group.scale.setScalar(orbPose.scale * (orb.pulse || 1));
 
   stage.update(dt, stageTarget(), camera.position);
@@ -653,7 +672,6 @@ function frame(now = performance.now()) {
   files.floorY = view === 'files' ? stage.cur.y : null;
   screen.uniforms.uTime.value = stage.time;
   screen.uniforms.uTint.value.copy(stage.color);
-  const pr = renderer.getPixelRatio();
   mind.update(dt, camera, w, hgt, pr);
   files.update(dt, camera, w, hgt, pr);
   trackSelection(w, hgt);

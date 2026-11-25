@@ -3,10 +3,11 @@
 // the file system.
 import * as THREE from 'three';
 import { forceSimulation, forceLink, forceManyBody, forceCenter, forceY } from 'd3-force-3d';
+import { CAPTION, CAPTION_MASK, captionFade } from './stage.js';
 
 // Marker size on screen, in CSS pixels = node size * viewport height * MARK_SCALE / distance. Past the
 // knee a marker grows more slowly and it never exceeds MARK_MAX, so a close-up hub cannot take over.
-const MARK_SCALE = 1.1;
+const MARK_SCALE = 1.45;
 const MARK_MIN = 2.6;
 const MARK_KNEE = 30;
 const MARK_MAX = 48;
@@ -14,6 +15,7 @@ const MARK_DETAIL = 12; // from about this size a marker has room for its rings
 const FOCUS_GROW = 1.5;
 const HOVER_GROW = 1.25;
 const DIAMOND = 0.72; // a diamond's flats sit this much closer in than a circle of the same marker
+const KEEL = 0.4; // slope of the upturned cone the map is taken to sit in (see Graph3D.keel)
 
 function markPx(size, height, dist) {
   let px = (size * height * MARK_SCALE) / dist;
@@ -23,8 +25,10 @@ function markPx(size, height, dist) {
 
 // Nodes are markers, not stars: a bright core inside a thin halo ring; hubs carry a second, outer
 // ring; the selected node's outer ring is broken and turns slowly. aShape 1 draws the same thing as
-// a diamond (folders). aRing: 0 plain, 1 hub or hovered, 2 selected. All sizes are CSS pixels (uPr
-// is the renderer's pixel ratio), so strokes stay thin and identical on any display.
+// a diamond (folders). aRing: -1 a bare dot (dimmed while something else is selected), 0 plain,
+// 1 hub or hovered, 2 selected. All sizes are CSS pixels (uPr is the renderer's pixel ratio), so
+// strokes stay thin and identical on any display. Like everything else the table projects, markers
+// and beams fade out where they would run behind the caption.
 const VERT = /* glsl */ `
   attribute vec3 aColor; attribute float aSize; attribute float aAlpha; attribute float aShape; attribute float aRing;
   uniform float uScale; uniform float uPr;
@@ -41,12 +45,14 @@ const VERT = /* glsl */ `
 const FRAG = /* glsl */ `
   uniform float uOpacity; uniform float uSpin;
   varying vec3 vColor; varying float vAlpha; varying float vPx; varying float vShape; varying float vRing;
+  ${CAPTION_MASK}
   void main(){
     vec2 p = gl_PointCoord - 0.5;
     float R = 0.5 * vPx;                                   // everything below is in CSS pixels
     float k = mix(1.0, ${DIAMOND.toFixed(2)}, vShape);
     float d = mix(length(p), (abs(p.x) + abs(p.y)) * 0.7071, vShape) * vPx; // distance from the centre / from a diamond's edge
-    float detail = smoothstep(${(MARK_DETAIL - 3).toFixed(1)}, ${(MARK_DETAIL + 3).toFixed(1)}, vPx);
+    // rings need room, a node that is not dimmed, and a map that is up (behind the orb in Core it is only dots)
+    float detail = smoothstep(${(MARK_DETAIL - 3).toFixed(1)}, ${(MARK_DETAIL + 3).toFixed(1)}, vPx) * step(-0.5, vRing) * smoothstep(0.35, 0.8, uOpacity);
     float coreR = max(min(R * mix(0.5, 0.2, detail), 1.9 + R * 0.06), 1.0) * k; // the core stays a point, however close
     float core = 1.0 - smoothstep(coreR - 0.7, coreR + 0.7, d);
     float w = 0.3 + vPx * 0.007;                            // half a stroke
@@ -58,7 +64,7 @@ const FRAG = /* glsl */ `
     ring2 *= mix(1.0, smoothstep(0.2, 0.36, abs(sin((atan(p.y, p.x) + uSpin) * 1.5))), sel);
     float fill = (1.0 - smoothstep(r1 - 1.0, r1, d)) * detail;
     float glow = 1.0 - smoothstep(0.0, mix(R * k, r1, detail), d);
-    float a = (core + ring1 * 0.8 + ring2 * mix(0.55, 1.0, sel) + fill * 0.05 + glow * glow * mix(0.3, 0.14, detail)) * vAlpha * uOpacity;
+    float a = (core + ring1 * 0.8 + ring2 * mix(0.55, 1.0, sel) + fill * 0.05 + glow * glow * mix(0.3, 0.14, detail)) * vAlpha * uOpacity * captionMask();
     if (a < 0.004) discard;
     gl_FragColor = vec4(mix(vColor, vec3(1.0), core * mix(0.3, 0.6, detail)), a); // small markers keep their type colour
   }`;
@@ -69,7 +75,7 @@ const FRAG = /* glsl */ `
 const BEAM_PAD = 1.5;
 const BEAM_VERT = /* glsl */ `
   attribute vec3 aStart; attribute vec3 aEnd; attribute vec3 aColStart; attribute vec3 aColEnd;
-  uniform vec2 uRes; uniform float uWidth;
+  uniform vec2 uView; uniform float uWidth;                 // uView: the viewport in CSS pixels
   varying vec3 vColor; varying float vD;
   void main(){
     vColor = mix(aColStart, aColEnd, position.y);
@@ -83,21 +89,22 @@ const BEAM_VERT = /* glsl */ `
     else if (e.z > near) e = mix(s, e, (near - s.z) / (e.z - s.z));
     vec4 cs = projectionMatrix * s;
     vec4 ce = projectionMatrix * e;
-    vec2 dir = (ce.xy / ce.w - cs.xy / cs.w) * uRes;
+    vec2 dir = (ce.xy / ce.w - cs.xy / cs.w) * uView;
     float len = length(dir);
     dir = len > 1e-4 ? dir / len : vec2(1.0, 0.0);
     vec4 c = mix(cs, ce, position.y);
-    c.xy += vec2(-dir.y, dir.x) * position.x * halfW * 2.0 / uRes * c.w;
+    c.xy += vec2(-dir.y, dir.x) * position.x * halfW * 2.0 / uView * c.w;
     gl_Position = c;
   }`;
 const BEAM_FRAG = /* glsl */ `
   uniform float uOpacity; uniform float uWidth;
   varying vec3 vColor; varying float vD;
+  ${CAPTION_MASK}
   void main(){
     float x = abs(vD);                                      // CSS pixels from the centre of the beam
     float core = 1.0 - smoothstep(uWidth * 0.5 - 0.5, uWidth * 0.5 + 0.5, x);
     float glow = max(0.0, 1.0 - x / (uWidth * 0.5 + ${BEAM_PAD.toFixed(1)}));
-    gl_FragColor = vec4(vColor, (core + glow * glow * 0.22) * uOpacity);
+    gl_FragColor = vec4(vColor, (core + glow * glow * 0.22) * uOpacity * captionMask());
   }`;
 
 function beamGeometry(count) {
@@ -126,13 +133,49 @@ for (let j = 0; j <= FOOT; j++) {
   CIRCLE[j * 2 + 1] = Math.sin((j / FOOT) * Math.PI * 2);
 }
 
+// Labels that would print over one another (or over the selected marker) step aside: each tries
+// its own line to the right of its marker, then one line below, one above, then the left of its
+// marker; if all are taken by more important labels it fades out until there is room again.
+const LABEL_LINE = 12;
+const LABEL_DY = [0, LABEL_LINE, -LABEL_LINE, 0];
+const LABEL_LEFT = 3; // the slot that puts the text to the left of its marker
+const LABEL_STICK = 4; // a label only moves when the other place is clear by this much (no dithering)
+
+// A plumb line fades behind the caption too.
+const STEM_VERT = /* glsl */ `
+  attribute vec3 aColor;
+  varying vec3 vColor;
+  void main(){ vColor = aColor; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
+const STEM_FRAG = /* glsl */ `
+  uniform float uOpacity;
+  varying vec3 vColor;
+  ${CAPTION_MASK}
+  void main(){ gl_FragColor = vec4(vColor, uOpacity * captionMask()); }`;
+
+// How wide a label will be drawn, in CSS pixels, at the sizes and letter spacings styles.css gives
+// .node-label: measured on a canvas that is never shown, so wide glyphs (CJK, emoji) count in full.
+let ruler = null, rulerFace = 'monospace';
+function textWidth(text, px, spacingEm) {
+  if (!ruler) {
+    ruler = document.createElement('canvas').getContext('2d');
+    rulerFace = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim() || rulerFace;
+  }
+  ruler.font = `${px}px ${rulerFace}`;
+  let glyphs = 0;
+  for (const _ of text) glyphs++; // letter spacing is added once per character, not per UTF-16 unit
+  return ruler.measureText(text).width + glyphs * px * spacingEm;
+}
+
 const tmp = new THREE.Vector3();
 const WHITE = new THREE.Color('#ffffff');
 
 export class Graph3D {
-  /** @param opts {labelLayer: HTMLElement, linkOpacity, charge, maxLabels, beamWidth (CSS px), flatten} */
+  /**
+   * @param opts {labelLayer: HTMLElement, linkOpacity, charge, maxLabels, beamWidth (CSS px), flatten,
+   *   hud: {top} — labels fade out within `top` px of the window's top, where the HUD's own words are}
+   */
   constructor(opts) {
-    this.opts = { linkOpacity: 0.3, charge: -60, maxLabels: 60, beamWidth: 1.1, flatten: 0, ...opts };
+    this.opts = { linkOpacity: 0.3, charge: -60, maxLabels: 60, beamWidth: 1.1, flatten: 0, hud: null, ...opts };
     this.group = new THREE.Group();
     this.nodes = [];
     this.links = [];
@@ -143,23 +186,28 @@ export class Graph3D {
     this.focusId = null;
     this.hoverId = null;
     this.labelsOn = true;
+    this.labelsShown = false;
     this.time = 0;
     // Extent of the layout, refreshed whenever it moves: furthest node from the centre, furthest
-    // from the vertical axis, and the lowest and highest node.
+    // from the vertical axis, the lowest and highest node, and the keel — the tip of the upturned
+    // cone that just holds every node. Seen from a little above, a node far out from the axis reads
+    // as lower than it is, so a table set below the keel (not merely below the lowest node) is one
+    // that no node appears to sink into, whichever way the map is turned.
     this.radius = 100;
     this.spread = 100;
     this.bottom = -60;
     this.top = 60;
+    this.keel = -60;
 
     const light = { transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false };
     this.pointsMat = new THREE.ShaderMaterial({
-      uniforms: { uScale: { value: 600 }, uPr: { value: 1 }, uOpacity: { value: 0 }, uSpin: { value: 0 } },
+      uniforms: { uScale: { value: 600 }, uPr: { value: 1 }, uOpacity: { value: 0 }, uSpin: { value: 0 }, uRes: CAPTION.uRes, uCaption: CAPTION.uCaption },
       vertexShader: VERT, fragmentShader: FRAG, ...light,
     });
     this.points = new THREE.Points(new THREE.BufferGeometry(), this.pointsMat);
     this.points.frustumCulled = false;
     this.lineMat = new THREE.ShaderMaterial({
-      uniforms: { uRes: { value: new THREE.Vector2(1, 1) }, uWidth: { value: this.opts.beamWidth }, uOpacity: { value: 0 } },
+      uniforms: { uView: { value: new THREE.Vector2(1, 1) }, uWidth: { value: this.opts.beamWidth }, uOpacity: { value: 0 }, uRes: CAPTION.uRes, uCaption: CAPTION.uCaption },
       vertexShader: BEAM_VERT, fragmentShader: BEAM_FRAG, side: THREE.DoubleSide, ...light,
     });
     this.lines = new THREE.Mesh(beamGeometry(0), this.lineMat);
@@ -170,8 +218,11 @@ export class Graph3D {
     this.stemSlots = Array.from({ length: STEM_SLOTS }, () => ({ id: null, a: 0, paintedA: -1, x: NaN, y: NaN, z: NaN, floor: 0, pf: NaN, foot: 0, r: 1, g: 1, b: 1 }));
     const sgeo = new THREE.BufferGeometry();
     sgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(STEM_SLOTS * STEM_VERTS * 3), 3));
-    sgeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(STEM_SLOTS * STEM_VERTS * 3), 3));
-    this.stemMat = new THREE.LineBasicMaterial({ vertexColors: true, opacity: 0, ...light });
+    sgeo.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(STEM_SLOTS * STEM_VERTS * 3), 3));
+    this.stemMat = new THREE.ShaderMaterial({
+      uniforms: { uOpacity: { value: 0 }, uRes: CAPTION.uRes, uCaption: CAPTION.uCaption },
+      vertexShader: STEM_VERT, fragmentShader: STEM_FRAG, ...light,
+    });
     this.stems = new THREE.LineSegments(sgeo, this.stemMat);
     this.stems.frustumCulled = false;
     this.stems.visible = false;
@@ -187,7 +238,10 @@ export class Graph3D {
     // A gentle pull toward the horizontal plane: the map settles wider than tall, like an object
     // hovering over the table, while staying a volume.
     if (this.opts.flatten) this.sim.force('flatten', forceY(0).strength(this.opts.flatten));
-    this.labelEls = new Map();
+    this.labels = new Map(); // id -> {id, el, w, rank, slot, dx, dy, fade, fresh, x0, x1, y, h, op, tx, ty}
+    this.labelOrder = []; // the same records, most important first
+    this.labelKept = []; // scratch: what has been placed so far this frame
+    this.labelBlock = { x0: 0, x1: 0, y: 0, h: 0 }; // the selected marker and its brackets: nothing prints over them
   }
 
   /** True while the layout is still moving. */
@@ -213,10 +267,11 @@ export class Graph3D {
     });
     // New nodes appear next to whatever they hang off, then drift into place.
     for (const node of this.nodes) {
+      // the pinned node (the core, the root folder) stands on the map's axis, over the lens — after every rebuild
+      if (node.pinned) { Object.assign(node, { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 0 }); continue; }
       if (node.x !== undefined) continue;
       const anchor = this.byId.get(node.near);
-      if (node.pinned) Object.assign(node, { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 0 });
-      else if (anchor && anchor.x !== undefined) {
+      if (anchor && anchor.x !== undefined) {
         const r = node.spread || 30;
         tmp.randomDirection().multiplyScalar(r);
         Object.assign(node, { x: anchor.x + tmp.x, y: anchor.y + tmp.y, z: anchor.z + tmp.z });
@@ -280,7 +335,7 @@ export class Graph3D {
       node.index = i;
       col[i * 3] = node.color.r; col[i * 3 + 1] = node.color.g; col[i * 3 + 2] = node.color.b;
       size[i] = node.size * (node.id === focus ? FOCUS_GROW : node.id === hover ? HOVER_GROW : 1);
-      ring[i] = node.id === focus ? 2 : node.id === hover || node.hub ? 1 : 0;
+      ring[i] = !lit ? -1 : node.id === focus ? 2 : node.id === hover || node.hub ? 1 : 0;
       alpha[i] = lit ? 1 : 0.16;
     }
     geo.attributes.aColor.needsUpdate = geo.attributes.aSize.needsUpdate = geo.attributes.aAlpha.needsUpdate = geo.attributes.aRing.needsUpdate = true;
@@ -292,7 +347,7 @@ export class Graph3D {
       const a = typeof l.source === 'object' ? l.source : this.byId.get(l.source);
       const b = typeof l.target === 'object' ? l.target : this.byId.get(l.target);
       const hot = focus && (a.id === focus || b.id === focus);
-      const k = focus ? (hot ? 1.6 : 0.12) : 1;
+      const k = focus ? (hot ? 1.4 : 0.12) : 1;
       const o = i * 6;
       lcol[o] = a.color.r * k; lcol[o + 1] = a.color.g * k; lcol[o + 2] = a.color.b * k;
       lcol[o + 3] = b.color.r * k; lcol[o + 4] = b.color.g * k; lcol[o + 5] = b.color.b * k;
@@ -302,7 +357,7 @@ export class Graph3D {
 
   _writePositions() {
     const pos = this.points.geometry.attributes.position.array;
-    let r2 = 0, s2 = 0, low = 0, high = 0;
+    let r2 = 0, s2 = 0, low = 0, high = 0, keel = 0;
     for (let i = 0; i < this.nodes.length; i++) {
       const n = this.nodes[i];
       pos[i * 3] = n.x; pos[i * 3 + 1] = n.y; pos[i * 3 + 2] = n.z;
@@ -311,11 +366,14 @@ export class Graph3D {
       if (h2 + n.y * n.y > r2) r2 = h2 + n.y * n.y;
       if (n.y < low) low = n.y;
       if (n.y > high) high = n.y;
+      const k = n.y - Math.sqrt(h2) * KEEL;
+      if (k < keel) keel = k;
     }
     this.radius = Math.max(60, Math.sqrt(r2));
     this.spread = Math.max(40, Math.sqrt(s2));
     this.bottom = low;
     this.top = high;
+    this.keel = keel;
     this.points.geometry.attributes.position.needsUpdate = true;
     const ends = this.lines.geometry.userData.ends;
     const lp = ends.array;
@@ -356,7 +414,7 @@ export class Graph3D {
     }
 
     const pos = this.stems.geometry.attributes.position;
-    const col = this.stems.geometry.attributes.color;
+    const col = this.stems.geometry.attributes.aColor;
     const P = pos.array, C = col.array;
     const k = 1 - Math.exp(-dt * 9);
     let any = false, moved = false, painted = false;
@@ -401,7 +459,7 @@ export class Graph3D {
     if (moved) pos.needsUpdate = true;
     if (painted) col.needsUpdate = true;
     this.stems.visible = any;
-    this.stemMat.opacity = 0.7 * this.opacity;
+    this.stemMat.uniforms.uOpacity.value = 0.7 * this.opacity;
   }
 
   show(opacity = 1) {
@@ -485,18 +543,18 @@ export class Graph3D {
   _markRadius(node, dist, height) {
     const focus = node.id === this.focusId, hover = node.id === this.hoverId;
     const px = markPx(node.size * (focus ? FOCUS_GROW : hover ? HOVER_GROW : 1), height, dist);
-    if (px < MARK_DETAIL) return px * 0.3;
+    if (px < MARK_DETAIL || (this.focusId && !node.lit)) return px * 0.3;
     const corner = node.shape ? DIAMOND * 1.4142 : 1; // a diamond reaches furthest at its points
     return px * 0.5 * (focus || hover || node.hub ? 0.92 : 0.56) * corner;
   }
 
-  /** Where a node is on screen (CSS pixels) and how large its marker is drawn. Writes into out {x, y, r, visible}. */
+  /** Where a node is on screen (CSS pixels), how large its marker is drawn, and whether it can be seen (not faded out behind the caption). Writes into out {x, y, r, visible}. */
   screenOf(node, camera, width, height, out) {
     const dist = camera.position.distanceTo(tmp.set(node.x, node.y, node.z));
     tmp.project(camera);
-    out.visible = this.opacity > 0.5 && tmp.z > -1 && tmp.z < 1;
     out.x = (tmp.x * 0.5 + 0.5) * width;
     out.y = (-tmp.y * 0.5 + 0.5) * height;
+    out.visible = this.opacity > 0.5 && tmp.z > -1 && tmp.z < 1 && captionFade(out.x, out.x, out.y) > 0.3;
     out.r = this._markRadius(node, dist, height);
     return out;
   }
@@ -516,53 +574,119 @@ export class Graph3D {
         wanted.add(id);
       }
     }
-    for (const [id, el] of this.labelEls) {
+    for (const [id, rec] of this.labels) {
       if (!wanted.has(id)) {
-        el.remove();
-        this.labelEls.delete(id);
+        rec.el.remove();
+        this.labels.delete(id);
       }
     }
+    const order = this.labelOrder;
+    order.length = 0;
     for (const id of wanted) {
       const node = this.byId.get(id);
       if (!node) continue;
-      let el = this.labelEls.get(id);
-      if (!el) {
-        el = document.createElement('div');
+      let rec = this.labels.get(id);
+      if (!rec) {
+        const el = document.createElement('div');
         el.className = 'node-label';
         this.opts.labelLayer.appendChild(el);
-        this.labelEls.set(id, el);
+        rec = { id, el, text: null, mode: -1, w: 0, rank: 0, slot: 0, dx: 0, dy: 0, fade: 1, fresh: true, x0: 0, x1: 0, y: 0, h: LABEL_LINE / 2, op: 0, tx: NaN, ty: NaN };
+        this.labels.set(id, rec);
       }
-      el.textContent = node.label;
-      el.classList.toggle('major', Boolean(node.showLabel));
-      el.classList.toggle('focus', id === this.focusId || id === this.hoverId);
-      el.style.color = `#${node.color.clone().lerp(WHITE, 0.45).getHexString()}`;
+      const major = Boolean(node.showLabel);
+      const marked = id === this.focusId || id === this.hoverId;
+      rec.el.classList.toggle('major', major);
+      rec.el.classList.toggle('focus', marked);
+      rec.el.style.color = `#${node.color.clone().lerp(WHITE, 0.45).getHexString()}`;
+      // the width is measured off screen (no layout read), and only when the text or its type size changes
+      const mode = (marked ? 2 : 0) + (major ? 1 : 0);
+      if (rec.text !== node.label || rec.mode !== mode) {
+        if (rec.text !== node.label) rec.el.textContent = node.label;
+        rec.text = node.label; rec.mode = mode;
+        rec.w = textWidth(major ? node.label.toUpperCase() : node.label, marked ? 13 : major ? 11 : 10, major ? 0.14 : 0.06);
+      }
+      rec.rank = (id === this.focusId ? 3e6 : id === this.hoverId ? 2e6 : major ? 1e3 : 0) + node.size;
+      order.push(rec);
     }
+    order.sort((a, b) => b.rank - a.rank);
   }
 
-  _placeLabels(camera, width, height) {
+  _placeLabels(camera, width, height, dt) {
     const visible = this.labelsOn && this.opacity > 0.5;
-    for (const [id, el] of this.labelEls) {
-      const node = this.byId.get(id);
+    const order = this.labelOrder;
+    const kept = this.labelKept;
+    kept.length = 0;
+    const ease = 1 - Math.exp(-dt * 10);
+    const hud = this.opts.hud;
+    // labels dim with depth: full strength at the near side of the map, well legible still at the far side
+    const nearest = Math.max(0, camera.position.length() - this.radius);
+    for (let i = 0; i < order.length; i++) {
+      const rec = order[i];
+      const el = rec.el;
+      const node = this.byId.get(rec.id);
       if (!node) { // gone from the data; its label goes at the next sync
-        el.style.opacity = 0;
+        if (rec.op !== 0) el.style.opacity = rec.op = 0;
         continue;
       }
       const dim = this.focusId && !node.lit;
       const dist = camera.position.distanceTo(tmp.set(node.x, node.y, node.z));
       tmp.project(camera);
       if (!visible || tmp.z > 1 || dim) {
-        el.style.opacity = 0;
+        if (rec.op !== 0) el.style.opacity = rec.op = 0;
         continue;
       }
-      const fade = id === this.focusId || id === this.hoverId ? 1 : THREE.MathUtils.clamp(1.5 - dist / (this.radius * 2.4), 0.15, 0.95);
-      el.style.opacity = fade * this.opacity;
-      // the text starts just outside the marker's outermost ring, however large the marker is drawn
-      const clear = this._markRadius(node, dist, height) + 5;
-      el.style.transform = `translate(${((tmp.x * 0.5 + 0.5) * width + clear).toFixed(1)}px, ${((-tmp.y * 0.5 + 0.5) * height).toFixed(1)}px)`;
+      const focus = rec.id === this.focusId;
+      const marked = focus || rec.id === this.hoverId;
+      const sx = (tmp.x * 0.5 + 0.5) * width;
+      const sy = (-tmp.y * 0.5 + 0.5) * height;
+      // the text starts just outside the marker's outermost ring (and outside the selection's
+      // brackets), however large the marker is drawn
+      const ring = this._markRadius(node, dist, height);
+      const clear = ring + (focus ? 14 : 5);
+      let slot = -1, x = 0;
+      for (let t = 0; t < LABEL_DY.length && slot < 0; t++) {
+        const pad = t === rec.slot ? 0 : LABEL_STICK;
+        const xx = t === LABEL_LEFT ? sx - clear - rec.w : sx + clear;
+        const yy = sy + LABEL_DY[t];
+        let free = true;
+        for (let j = 0; j < kept.length; j++) {
+          const o = kept[j];
+          if (xx - pad < o.x1 && xx + rec.w + pad > o.x0 && Math.abs(yy - o.y) < o.h + LABEL_LINE / 2 - 1 + pad * 0.5) { free = false; break; }
+        }
+        if (free) { slot = t; x = xx; }
+      }
+      if (slot >= 0) {
+        rec.slot = slot;
+        rec.x0 = x; rec.x1 = x + rec.w; rec.y = sy + LABEL_DY[slot];
+        kept.push(rec);
+        const dx = slot === LABEL_LEFT ? -(clear * 2 + rec.w) : 0;
+        rec.dx = rec.fresh ? dx : rec.dx + (dx - rec.dx) * ease;
+        rec.dy = rec.fresh ? LABEL_DY[slot] : rec.dy + (LABEL_DY[slot] - rec.dy) * ease;
+      }
+      rec.fade = rec.fresh ? (slot >= 0 ? 1 : 0) : rec.fade + ((slot >= 0 ? 1 : 0) - rec.fade) * ease;
+      rec.fresh = false;
+      if (focus) {
+        const block = this.labelBlock;
+        block.x0 = sx - ring - 9; block.x1 = sx + ring + 9; block.y = sy; block.h = ring + 9;
+        kept.push(block);
+      }
+      let fade = marked ? 1 : 0.95 - 0.55 * THREE.MathUtils.clamp((dist - nearest) / (this.radius * 2), 0, 1);
+      // the HUD's words always win: under the top bar a label fades out; behind the caption it
+      // fades exactly as its marker does (and wherever its own text would reach the caption)
+      if (hud && !marked) fade *= THREE.MathUtils.clamp((sy - hud.top + 30) / 30, 0, 1);
+      fade *= slot >= 0 ? captionFade(Math.min(sx, rec.x0), Math.max(sx, rec.x1), sy) : captionFade(sx, sx, sy);
+      // the DOM is only touched for a label that actually moved or changed strength
+      const op = Math.round(fade * rec.fade * this.opacity * 100) / 100;
+      if (op !== rec.op) el.style.opacity = rec.op = op;
+      const tx = Math.round((sx + clear + rec.dx) * 10) / 10, ty = Math.round((sy + rec.dy) * 10) / 10;
+      if (tx !== rec.tx || ty !== rec.ty) {
+        rec.tx = tx; rec.ty = ty;
+        el.style.transform = `translate(${tx}px, ${ty}px)`;
+      }
     }
   }
 
-  /** Nearest node to a screen point, or null. */
+  /** Nearest node to a screen point, or null. A node that has faded out behind the caption cannot be picked. */
   pick(camera, x, y, width, height) {
     if (this.opacity < 0.5) return null;
     let best = null;
@@ -575,7 +699,7 @@ export class Graph3D {
       const dy = (-tmp.y * 0.5 + 0.5) * height - y;
       const d = dx * dx + dy * dy;
       const reach = 10 + node.size * 1.5;
-      if (d < reach * reach && d < bestD) {
+      if (d < reach * reach && d < bestD && captionFade(x + dx, x + dx, y + dy) > 0.5) {
         bestD = d;
         best = node;
       }
@@ -595,15 +719,17 @@ export class Graph3D {
     }
     this._updateStems(dt);
     if (!this.group.visible) {
-      for (const el of this.labelEls.values()) el.style.opacity = 0;
+      if (this.labelsShown) for (let i = 0; i < this.labelOrder.length; i++) this.labelOrder[i].el.style.opacity = this.labelOrder[i].op = 0;
+      this.labelsShown = false;
       return;
     }
+    this.labelsShown = true;
     this.pointsMat.uniforms.uScale.value = height * MARK_SCALE;
     this.pointsMat.uniforms.uPr.value = pixelRatio;
     this.pointsMat.uniforms.uOpacity.value = this.opacity;
     this.pointsMat.uniforms.uSpin.value = (this.time * 0.4) % (Math.PI * 4); // the selected marker's ring turns slowly
-    this.lineMat.uniforms.uRes.value.set(width, height);
+    this.lineMat.uniforms.uView.value.set(width, height);
     this.lineMat.uniforms.uOpacity.value = this.opts.linkOpacity * this.opacity;
-    this._placeLabels(camera, width, height);
+    this._placeLabels(camera, width, height, dt);
   }
 }
