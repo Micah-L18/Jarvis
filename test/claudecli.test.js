@@ -342,14 +342,16 @@ test('claude cli: an interruption while Claude Code is still being looked for is
     yield calls('mcp__jarvis__forget');
     yield say('Deleting that now. Done.');
     yield done();
-  }, { locate: async () => { await tick(60); return found; } });
+  }, { locate: async () => { await tick(200); return found; } });
   const ac = new AbortController();
   const events = [];
+  const started = Date.now();
   const pending = cli.runTurn(turn({ emit: (e) => events.push(e), signal: ac.signal })).catch((e) => e);
   await tick(20); // the first turn of a session: still finding the binary and reading the sign-in
   ac.abort();
   assert.equal((await pending).name, 'AbortError');
-  await tick(80);
+  assert.equal(Date.now() - started < 150, true, 'at once, not when the search ends');
+  await tick(250);
   assert.deepEqual([sdk.runs.length, sdk.spares.length, events.length], [0, 0, 0], 'no process, no tool call, nothing said');
   assert.equal(await cli.runTurn(turn()), 'Deleting that now. Done.', 'and the next turn works');
   cli.dispose();
@@ -500,6 +502,7 @@ test('claude cli: nothing inherited decides where a turn goes or who pays for it
     'CLAUDE_AGENT_SDK_CLIENT_APP', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'CLAUDE_CODE_DISABLE_CLAUDE_MDS', // Jarvis's own switches
     'CLAUDE_CODE_GIT_BASH_PATH', 'CLAUDE_CONFIG_DIR', // where the login is kept, and where Windows finds its shell
   ], 'no key, token, endpoint, model or provider switch survives');
+  assert.equal(claudeEnv({ CLAUDE_CODE_CLIENT_CERT: '/etc/ssl/me.pem' }).CLAUDE_CODE_CLIENT_CERT, '/etc/ssl/me.pem', 'a company proxy\'s client certificate is how to get out, not where to');
   assert.deepEqual([env.PATH, env.HTTPS_PROXY, env.AWS_REGION, env.CLAUDE_CONFIG_DIR], ['/bin', 'http://proxy:8080', 'us-east-1', '/home/ana/.claude-work']);
 
   // a login that is really Bedrock, Vertex or a gateway (an organisation's settings can still make it so) is not used at all

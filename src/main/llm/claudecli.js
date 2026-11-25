@@ -107,10 +107,11 @@ export function describeCliError(err) {
  * nothing inherited may say otherwise: no key or token, no other endpoint (it would be handed the
  * login's own token), no switch to Bedrock, Vertex or Foundry. Every ANTHROPIC_* and CLAUDE*
  * variable goes — which also covers the markers of a Claude Code terminal Jarvis was started
- * from — except where the login is kept and where Windows finds its shell.
+ * from — except where the login is kept, where Windows finds its shell, and the client
+ * certificate a company proxy may ask for (like HTTPS_PROXY, how to get out, not where to).
  * The switches turn off the parts of Claude Code that reach beyond a single answer.
  */
-const INHERITED = new Set(['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_GIT_BASH_PATH']);
+const INHERITED = new Set(['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_GIT_BASH_PATH', 'CLAUDE_CODE_CLIENT_CERT', 'CLAUDE_CODE_CLIENT_KEY', 'CLAUDE_CODE_CLIENT_KEY_PASSPHRASE']);
 export function claudeEnv(base = process.env) {
   const env = {};
   for (const [k, v] of Object.entries(base)) if (INHERITED.has(k.toUpperCase()) || !/^(ANTHROPIC_|CLAUDE_|CLAUDECODE$)/i.test(k)) env[k] = v;
@@ -600,9 +601,12 @@ export class ClaudeCli {
     if (o.signal?.aborted) throw abortError();
     const since = Date.now();
     const aborted = new Promise((resolve) => o.signal?.addEventListener('abort', () => resolve(ABORTED), { once: true }));
-    const bin = await this.binary();
-    const { query } = await this.load();
-    if (o.signal?.aborted) throw abortError(); // interrupted while Claude Code was being looked for: start nothing
+    // Finding Claude Code can take seconds the first time. An interruption during that must not be lost: nothing is started.
+    const finding = (async () => ({ bin: await this.binary(), sdk: await this.load() }))();
+    finding.catch(() => {}); // if the turn was abandoned meanwhile, nobody is waiting for this
+    const found = await Promise.race([finding, aborted]);
+    if (found === ABORTED) throw abortError();
+    const { bin, sdk: { query } } = found;
     const plan = this.plan(bin, o);
     const prompt = composePrompt({ volatile: o.system.volatile, history: o.history, userText: o.userText });
     const tools = new Map(plan.defs.map((d) => [d.name, d.tool]));

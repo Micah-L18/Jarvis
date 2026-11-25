@@ -31,7 +31,11 @@ Press **Tab** to open the controls to change it. Under **Brain**:
 
 You can flip between cloud and local at any time from the chip in the top-left corner; the conversation and memory carry over. The chip also says when the cloud brain cannot answer yet (`signed out`, `no Claude Code`, `no API key`).
 
-With the Claude login, Jarvis uses Claude Code only as a way to reach the model. The model gets Jarvis's own tools and, with Internet access on, web search and page fetching — never Claude Code's shell, file editing or agents, and nothing from your Claude Code settings, instructions, hooks, skills, plugins or MCP servers. Jarvis's conversations do not appear among your Claude Code sessions. The sign-in is yours and for your own use; Anthropic's terms do not let an app hand a Claude login on to other people.
+With the Claude login, Jarvis uses Claude Code only as a way to reach the model. The model gets Jarvis's own tools and, with Internet access on, web search and page fetching — never Claude Code's shell, file editing or agents, and nothing from your Claude Code settings, instructions, hooks, skills, plugins or MCP servers. Jarvis's conversations do not appear among your Claude Code sessions, and your other Claude Code sessions cannot send it messages. Variables in your shell that would point Claude Code somewhere else (an API key, a gateway address, a Bedrock or Vertex switch) are not passed on: replies go to Anthropic on the Claude login, or not at all.
+
+One thing Jarvis cannot leave out: on a computer where an organisation manages Claude Code, that organisation's policy (its managed settings) applies here too, and any hooks it sets are handed what you say and what Jarvis answers. The sign-in line says so when that is the case — `… signed in · managed by your organisation …` — and an API key or Local avoids it. If the policy requires its own MCP servers, or sends Claude Code to Bedrock, Vertex or a gateway instead of a Claude login, Jarvis does not use Claude Code at all and says to choose an API key or Local.
+
+The sign-in is yours and for your own use; Anthropic's terms do not let an app hand a Claude login on to other people.
 
 ## Talking to it
 
@@ -82,6 +86,7 @@ Long work — a practice plan, research notes, a dataset — is written as a mar
 - Local mode: everything stays on the machine.
 - Cloud mode: what you say, the memory summary, and tool results (including any file contents Jarvis reads at your request) are sent to Anthropic — through your Claude login or your API key, whichever is chosen.
 - With the Claude login, the Claude Code program adds a little of its own to each request: the account's email address, and a note of the operating system, the date and the (empty) folder inside Jarvis's data folder that it runs in. Pages are fetched from this computer rather than by Anthropic. It keeps no transcript, and nothing is remembered between one reply and the next except what Jarvis's own memory puts in front of it — so what you delete is gone there too.
+- With the Claude login on a computer whose Claude Code is managed by an organisation, that organisation's policy still applies: hooks it sets receive what you say together with the memory summary sent along, the inputs of the tools Jarvis uses, and the reply, and its settings can turn on its own logging. Jarvis shows this under Brain and when it starts; it cannot switch it off. An API key or Local is not subject to it.
 - File tools are confined to the folder you choose; they can read and open, never write or delete. Jarvis only writes inside its own project folders.
 - All data lives in the app's data folder (shown under System in the controls).
 
