@@ -437,7 +437,9 @@ function trackSelection(w, hgt) {
 
 const activeGraph = () => (view === 'files' ? files : view === 'mind' ? mind : null);
 let downAt = null;
-canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; controls.autoRotate = false; follow = null; });
+const inHand = (on) => { mind.inHand = files.inHand = on; }; // labels hold their places while the view is turned by hand
+canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; controls.autoRotate = false; follow = null; inHand(true); });
+canvas.addEventListener('pointercancel', () => inHand(false));
 canvas.addEventListener('wheel', () => { follow = null; }, { passive: true });
 canvas.addEventListener('pointermove', (e) => {
   const g = activeGraph();
@@ -448,6 +450,7 @@ canvas.addEventListener('pointermove', (e) => {
 });
 canvas.addEventListener('pointerleave', () => { mind.setHover(null); files.setHover(null); canvas.style.cursor = 'default'; });
 canvas.addEventListener('pointerup', (e) => {
+  inHand(false);
   setTimeout(() => { controls.autoRotate = true; }, 4000);
   if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return;
   const g = activeGraph();

@@ -146,10 +146,19 @@ for (let j = 0; j <= FOOT; j++) {
 // the right of its marker, then one line below, one above, then the same three places to the left
 // of its marker; if all are taken it fades out until there is room again. The node card is kept
 // clear in the same way.
+// A label keeps its place for as long as that is free, and does not chase the map as it turns: it
+// goes back to a better place only once that has been free for LABEL_HOME seconds. While the view
+// is being turned by hand (inHand) it also lets markers swing past under it, and gives way only to
+// one that is still there after LABEL_HOLD seconds (to a more important label, at once). Moving a
+// line up or down it slides; changing sides it fades out where it is and in at the new place.
+// While the layout itself is still settling there is no waiting: the labels keep up with the nodes.
 const LABEL_LINE = 12;
 const LABEL_DY = [0, LABEL_LINE, -LABEL_LINE, 0, LABEL_LINE, -LABEL_LINE];
 const LABEL_LEFT = 3; // from this slot on, the text is to the left of its marker
-const LABEL_STICK = 4; // a label only moves when the other place is clear by this much (no dithering)
+const LABEL_STICK = 4; // a label only moves to a place that is clear by this much (no dithering)
+const LABEL_HOME = 1.2; // seconds a better place must have stayed free before a label goes back to it
+const LABEL_HOLD = 0.8; // seconds a marker must have been under a label, as the view is turned by hand, before the label gives way
+const LABEL_TURN = 0.06; // a label changing sides has faded this far out before it appears at the new place
 
 // A plumb line fades behind the caption too.
 const STEM_VERT = /* glsl */ `
@@ -196,6 +205,7 @@ export class Graph3D {
     this.focusId = null;
     this.hoverId = null;
     this.labelsOn = true;
+    this.inHand = false; // set while the view is being turned by hand: labels then let markers swing past (see LABEL_HOLD)
     this.labelsShown = false;
     this.time = 0;
     // Extent of the layout, refreshed whenever it moves: furthest node from the centre, furthest
@@ -248,7 +258,7 @@ export class Graph3D {
     // A gentle pull toward the horizontal plane: the map settles wider than tall, like an object
     // hovering over the table, while staying a volume.
     if (this.opts.flatten) this.sim.force('flatten', forceY(0).strength(this.opts.flatten));
-    this.labels = new Map(); // id -> {id, el, w, rank, slot, dx, dy, fade, fresh, x0, x1, y, h, op, tx, ty, on, sx, sy, dist, ring, block}
+    this.labels = new Map(); // id -> {id, el, w, rank, slot, put, left, wait, held, dx, dy, fade, fresh, x0, x1, y, h, op, tx, ty, on, sx, sy, dist, ring, block}
     this.labelOrder = []; // the same records, most important first
     this.labelKept = []; // scratch: the boxes no label may print over — markers, then labels as they are placed
     this.cardBox = { x0: 0, x1: 0, y: 0, h: -1 }; // the node card, while it is up (see keepClear)
@@ -601,7 +611,7 @@ export class Graph3D {
         el.className = 'node-label';
         this.opts.labelLayer.appendChild(el);
         rec = {
-          id, el, text: null, mode: -1, w: 0, rank: 0, slot: 0, dx: 0, dy: 0, fade: 1, fresh: true, x0: 0, x1: 0, y: 0, h: LABEL_LINE / 2, op: 0, tx: NaN, ty: NaN,
+          id, el, text: null, mode: -1, w: 0, rank: 0, slot: 0, put: false, left: false, wait: 0, held: 0, dx: 0, dy: 0, fade: 1, fresh: true, x0: 0, x1: 0, y: 0, h: LABEL_LINE / 2, op: 0, tx: NaN, ty: NaN,
           on: false, sx: 0, sy: 0, dist: 0, ring: 0, block: { x0: 0, x1: 0, y: 0, h: 0 }, // where its marker is this frame, and the box that keeps it clear
         };
         this.labels.set(id, rec);
@@ -656,7 +666,9 @@ export class Graph3D {
       box.x0 = rec.sx - reach; box.x1 = rec.sx + reach; box.y = rec.sy; box.h = reach;
       kept.push(box);
     }
-    const ease = 1 - Math.exp(-dt * 10);
+    const fixed = kept.length; // from here on the list holds labels
+    const calm = this.settling ? 0 : 1; // while the layout itself is still moving, the labels keep up with it at once
+    const ease = 1 - Math.exp(-dt * 10), turn = 1 - Math.exp(-dt * 30);
     const hud = this.opts.hud;
     // labels dim with depth: full strength at the near side of the map, well legible still at the far side
     const nearest = Math.max(0, camera.position.length() - this.radius);
@@ -665,6 +677,7 @@ export class Graph3D {
       const el = rec.el;
       if (!rec.on) {
         if (rec.op !== 0) el.style.opacity = rec.op = 0;
+        rec.fresh = true; rec.put = false; rec.slot = 0; rec.wait = rec.held = 0; // when it is seen again it starts from its first place
         continue;
       }
       const focus = rec.id === this.focusId;
@@ -673,32 +686,59 @@ export class Graph3D {
       // the text starts just outside the marker's outermost ring (and outside the selection's
       // brackets), however large the marker is drawn
       const clear = rec.ring + (focus ? 14 : 5);
-      let slot = -1, x = 0;
-      for (let t = 0; t < LABEL_DY.length && slot < 0; t++) {
+      // the first place that is free; whether where it is now still is; and if not, whether a more
+      // important label has taken it (labels are tried first: they are the last in the list)
+      let best = -1, here = false, taken = false;
+      for (let t = 0; t < LABEL_DY.length && (best < 0 || t <= rec.slot); t++) {
         const pad = t === rec.slot ? 0 : LABEL_STICK;
         const xx = t >= LABEL_LEFT ? sx - clear - rec.w : sx + clear;
         const yy = sy + LABEL_DY[t];
         let free = true;
-        for (let j = 0; j < kept.length; j++) {
+        for (let j = kept.length - 1; j >= 0; j--) {
           const o = kept[j];
-          if (o !== rec.block && xx - pad < o.x1 && xx + rec.w + pad > o.x0 && Math.abs(yy - o.y) < o.h + LABEL_LINE / 2 - 1 + pad * 0.5) { free = false; break; }
+          if (o !== rec.block && xx - pad < o.x1 && xx + rec.w + pad > o.x0 && Math.abs(yy - o.y) < o.h + LABEL_LINE / 2 - 1 + pad * 0.5) {
+            free = false;
+            if (t === rec.slot) taken = j >= fixed;
+            break;
+          }
         }
-        if (free) { slot = t; x = xx; }
+        if (free) {
+          if (t === rec.slot) here = true;
+          if (best < 0) best = t;
+        }
       }
-      if (slot < 0 && marked) { slot = 0; x = sx + clear; } // the selected or hovered node is always named
-      // a label changing sides does not slide across its own marker: it fades in at the new place
-      const flip = !rec.fresh && slot >= 0 && (slot >= LABEL_LEFT) !== (rec.slot >= LABEL_LEFT);
-      const jump = rec.fresh || flip;
+      let slot = best;
+      if (here) { // free where it is: it stays, until a better place has been free for a while
+        rec.wait = best < rec.slot ? rec.wait + dt : 0;
+        rec.held = 0;
+        if (rec.wait < LABEL_HOME * calm) slot = rec.slot;
+      } else if (!taken && rec.put && this.inHand) { // the view is being turned and a marker (or the card) has come under it: it stays a moment
+        rec.wait = 0;
+        rec.held += dt;
+        if (rec.held < LABEL_HOLD * calm) slot = rec.slot;
+      }
+      if (slot !== rec.slot) rec.wait = rec.held = 0;
+      if (slot < 0 && marked) slot = rec.slot; // the selected or hovered node is always named
+      const x = slot >= LABEL_LEFT ? sx - clear - rec.w : sx + clear;
+      // a label changing sides does not slide across its own marker: it fades out where it is
+      // (turning), then in at the new place
+      const left = slot >= LABEL_LEFT;
+      const turning = slot >= 0 && !rec.fresh && left !== rec.left && rec.fade > LABEL_TURN;
       if (slot >= 0) {
         rec.slot = slot;
         rec.x0 = x; rec.x1 = x + rec.w; rec.y = sy + LABEL_DY[slot];
         kept.push(rec);
-        const dx = slot >= LABEL_LEFT ? -(clear * 2 + rec.w) : 0;
-        rec.dx = jump ? dx : rec.dx + (dx - rec.dx) * ease;
-        rec.dy = jump ? LABEL_DY[slot] : rec.dy + (LABEL_DY[slot] - rec.dy) * ease;
+        if (!turning) {
+          const jump = rec.fresh || left !== rec.left;
+          const dx = left ? -(clear * 2 + rec.w) : 0;
+          rec.dx = jump ? dx : rec.dx + (dx - rec.dx) * ease;
+          rec.dy = jump ? LABEL_DY[slot] : rec.dy + (LABEL_DY[slot] - rec.dy) * ease;
+          rec.left = left;
+        }
       }
-      const shown = slot >= 0 ? 1 : 0;
-      rec.fade = rec.fresh ? shown : flip ? 0 : rec.fade + (shown - rec.fade) * ease;
+      rec.put = slot >= 0;
+      const shown = slot >= 0 && !turning ? 1 : 0;
+      rec.fade = rec.fresh ? shown : rec.fade + (shown - rec.fade) * (turning ? turn : ease);
       rec.fresh = false;
       let fade = marked ? 1 : 0.95 - 0.55 * THREE.MathUtils.clamp((rec.dist - nearest) / (this.radius * 2), 0, 1);
       // the HUD's words always win: under the top bar a label fades out; behind the caption it

@@ -403,13 +403,19 @@ export function screenPass() {
 // The bloom pass decides what is bright enough to glow at half resolution, from the average of each
 // 2x2 block of pixels. A hairline lies inside one block or is split between two depending on where
 // it falls on the pixel grid, so along a beam at a shallow slope the glow would switch on and off
-// every couple of rows: beads of light that crawl as the view turns. Here a block is also judged by
-// the light in the 6x6 pixels around it — as bright as it would be if the line ran squarely through
-// it, though never brighter than the brightest pixel next to it — so a thin line glows along its
-// whole length or not at all. A broad area of light glows exactly as before, and nothing glows less
-// than it did. Only a block that holds some light, but not enough to glow by itself, takes the
-// wider look (eight more bilinear samples), and the brightest pixel is only searched for where
-// that look finds enough light: the dark room and the bright cores cost what they always did.
+// every couple of rows: beads of light that crawl as the view turns. Here a block that holds some
+// light, but not enough to glow by itself, is also judged by the 6x6 pixels around it, where those
+// hold one line and nothing else: light all the way across (side to side, or top to bottom), with
+// one side of it, or two opposite corners, left dark. Such a block counts as bright as it would be
+// if the line ran squarely through it, though never brighter than the brightest pixel next to it,
+// so a lone thin line near the horizontal or the vertical (where the beads are long enough to see)
+// glows along its whole length or not at all. Everything else is judged exactly as before: a broad
+// area of light, a point, a line well off both axes, and above all a crowd of points and lines
+// such as the orb or the table's rings, which would otherwise glow in every gap. Nothing glows
+// less than it did. The wider look is eight more bilinear samples, and the brightest pixel is only
+// searched for where that look finds a line: the dark room and the bright cores cost what they
+// always did.
+const BLOOM_LONE = 0.2; // a line is alone while the light off it is under this share of its own
 const BLOOM_GATE = /* glsl */ `
   uniform sampler2D tDiffuse; uniform float luminosityThreshold; uniform float smoothWidth;
   varying vec2 vUv;
@@ -419,10 +425,14 @@ const BLOOM_GATE = /* glsl */ `
     vec3 block = textureLod(tDiffuse, vUv, 0.0).rgb;        // this 2x2 block: what goes on to be blurred
     float v = luma(block);
     if (v > 0.002 && v < luminosityThreshold + smoothWidth) {
-      float around = 0.0;                                   // the 6x6 pixels around it, as nine 2x2 averages
-      for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) around += luma(textureLod(tDiffuse, vUv + vec2(float(i), float(j)) * 2.0 * px, 0.0).rgb);
-      float line = around / 3.0;                            // a line's light across its width, as one block would hold it
-      if (line > v && line > luminosityThreshold) {
+      mat3 n;                                               // the 6x6 pixels around it, as nine 2x2 averages
+      for (int j = 0; j < 3; j++) for (int i = 0; i < 3; i++) n[i][j] = luma(textureLod(tDiffuse, vUv + vec2(float(i - 1), float(j - 1)) * 2.0 * px, 0.0).rgb);
+      vec3 cols = vec3(1.0) * n, rows = n[0] + n[1] + n[2]; // their light by column and by row
+      // a line's light across its width, as one block would hold it: what the weakest third of its run through here holds
+      float line = max(min(cols.x, min(cols.y, cols.z)), min(rows.x, min(rows.y, rows.z)));
+      // what lies off the line: the darker side of the neighbourhood, or the darker pair of opposite corners
+      float off = min(min(min(cols.x, cols.z), min(rows.x, rows.z)), min(n[0][0] + n[2][2], n[2][0] + n[0][2]));
+      if (line > v && line > luminosityThreshold && off < ${BLOOM_LONE.toFixed(2)} * line) {
         float peak = 0.0;
         for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) peak = max(peak, luma(textureLod(tDiffuse, vUv + (vec2(float(i), float(j)) - 1.5) * px, 0.0).rgb));
         v = max(v, min(peak, line));
