@@ -38,7 +38,7 @@ const EXTRACT_MODELS = ['claude-sonnet-5-5', 'claude-haiku-5-5'];
 
 // How a turn is laid out for a process that keeps no conversation of its own.
 const LAYOUT = `How messages reach you
-Each message is put together by the app in up to three parts: a context block (the time and what you know), the conversation so far, and what was just said. Only the last part is them speaking now; the rest is your own record. Answer what was just said, in your own voice, without repeating these headings or putting a speaker name in front of your words.`;
+Each message is put together by the app in up to three parts: a context block (the time and what you know), the conversation so far, and what was just said. Only the last part is the person speaking to you now; the rest is your own record. Answer what was just said, in your own voice, without repeating these headings or putting a speaker name in front of your words.`;
 
 // Claude Code's search tool tells the model to finish with a list of links. Read aloud, that is noise.
 const SPOKEN_SOURCES = `Sources
@@ -129,7 +129,7 @@ function run(file, args, { env, timeout = 15000 } = {}) {
     // npm's Windows shims are batch files, which only a shell can start.
     const shim = /\.(cmd|bat)$/i.test(file);
     execFile(shim ? `"${file}"` : file, args, { env, timeout, windowsHide: true, shell: shim }, (err, stdout) => {
-      resolve({ ok: !err, missing: err?.code === 'ENOENT', stdout: String(stdout || '') });
+      resolve({ ok: !err, stdout: String(stdout || '') });
     });
   });
 }
@@ -334,13 +334,16 @@ export class ClaudeCli {
       if (version) old = old || { path: file, source, version };
       return null;
     };
-    for (const file of candidatePaths()) {
+    const own = bundledBinary();
+    // npm's Windows shim is a batch file, which the SDK cannot start; the copy inside the SDK reads the same login.
+    const usable = (file) => !(own && /\.(cmd|bat)$/i.test(file));
+    for (const file of candidatePaths().filter(usable)) {
       const hit = await tryOne(file, 'installed');
       if (hit) return hit;
     }
-    const hit = await tryOne(await askShell().catch(() => ''), 'installed');
+    const asked = await askShell().catch(() => '');
+    const hit = usable(asked) && await tryOne(asked, 'installed');
     if (hit) return hit;
-    const own = bundledBinary();
     if (own) return { path: own, source: 'bundled', version: await this.probe(own) };
     return old;
   }

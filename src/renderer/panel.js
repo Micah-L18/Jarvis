@@ -146,7 +146,7 @@ export class Panel {
               this.app.toast(now.line, !now.ok);
             } }, 'Re-check')),
           h('label', {}, 'Path to claude (optional)'),
-          this.text(s.claudePath, (v) => this.set({ claudePath: v }), { placeholder: st.claude?.path || 'found automatically' }),
+          this.text(s.claudePath, (v) => this.set({ claudePath: v }), { placeholder: st.claude?.path || 'found automatically', 'data-live': '1' }),
           h('p', { class: 'note' }, 'Uses the sign-in of the Claude Code CLI on this computer — no API key. What you say and the tools\' results are sent to Anthropic and count against your Claude plan. Nothing else from your Claude Code setup is used.'),
         ];
     const body = cloud

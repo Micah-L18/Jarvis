@@ -85,6 +85,7 @@ export class Agent {
     };
     this.active = null;
     this.turnId = 0;
+    this.forgotMark = 0; // how much had been forgotten when the latest turn began
   }
 
   /** Which brain a turn runs on: 'local' (Ollama), 'cli' (Claude on the Claude Code login) or 'key' (Claude on an API key). */
@@ -147,8 +148,10 @@ export class Agent {
       this.d.emit({ ...event, turn: id });
     };
 
+    // What was heard of a reply that was cut off — unless that reply was about something it had just been told to forget.
+    if (interrupted && !mentions(interrupted, memory.forgotten.slice(this.forgotMark))) memory.logTurn('assistant', `${interrupted} — (cut off by the user)`);
     const forgotBefore = memory.forgotten.length;
-    if (interrupted) memory.logTurn('assistant', `${interrupted} — (cut off by the user)`);
+    this.forgotMark = forgotBefore;
     const history = normalizeHistory(memory.recentTurns(16));
     // If the last thing on record is the user (an earlier turn was cut off before any reply), fold it into this one.
     let modelText = userText;
