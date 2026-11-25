@@ -1,7 +1,10 @@
 // The hologram: a sketchy orange sphere of rings, arcs, ticks and particles around an inner
 // lattice, all additive light. It breathes when idle, focuses when listening, spins up when
 // thinking, and its surface and core are driven by the voice signal when speaking.
+// A scan plane climbs slowly through it, and when it is docked beside a map it stands on a
+// small emitter of its own (in Core view the projection table underneath does that job).
 import * as THREE from 'three';
+import { lightCone } from './stage.js';
 
 const ORANGE = new THREE.Color('#ff8a1a');
 const AMBER = new THREE.Color('#ffb648');
@@ -65,7 +68,7 @@ function glowTexture() {
 const SHELL_VERT = /* glsl */ `
   uniform float uTime; uniform float uLevel; uniform float uScale; uniform float uAgitation;
   attribute float aSeed;
-  varying float vGlow;
+  varying float vGlow; varying float vY;
   // cheap value noise on the sphere
   float hash(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
   float noise(vec3 p){
@@ -80,15 +83,17 @@ const SHELL_VERT = /* glsl */ `
     vec3 p = position * (1.0 + disp);
     vec4 mv = modelViewMatrix * vec4(p, 1.0);
     vGlow = 0.35 + n * 0.65 + uLevel * 0.6;
+    vY = position.y;
     gl_PointSize = max(1.0, (0.012 + aSeed * 0.02 + uLevel * 0.02) * uScale / -mv.z);
     gl_Position = projectionMatrix * mv;
   }`;
 const SHELL_FRAG = /* glsl */ `
-  uniform vec3 uColor; uniform float uOpacity;
-  varying float vGlow;
+  uniform vec3 uColor; uniform float uOpacity; uniform float uScan;
+  varying float vGlow; varying float vY;
   void main(){
     float d = length(gl_PointCoord - 0.5);
-    float a = smoothstep(0.5, 0.05, d) * vGlow * uOpacity;
+    float scan = smoothstep(0.16, 0.0, abs(vY - uScan));   // the slice the projector is refreshing
+    float a = smoothstep(0.5, 0.05, d) * vGlow * uOpacity * (1.0 + scan * 0.9);
     gl_FragColor = vec4(uColor * (0.7 + vGlow * 0.6), a);
   }`;
 
@@ -99,7 +104,9 @@ export class Orb {
     this.mats = []; // {mat, base}
     this.state = 'idle';
     this.level = 0; // 0..1 audio level, set from outside
-    this.smooth = { level: 0, spin: 0.3, bright: 0.7, focus: 0, agitation: 0 };
+    this.dock = 0; // 0 centre stage, 1 docked beside a map (shows the orb's own emitter); set from outside
+    this.baseMats = []; // {mat, base} for the emitter, faded by dock
+    this.smooth = { level: 0, spin: 0.3, bright: 0.7, focus: 0, agitation: 0, dock: 0 };
     this.time = 0;
     this._build();
   }
@@ -148,7 +155,7 @@ export class Orb {
     shellGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     shellGeo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
     this.shellMat = new THREE.ShaderMaterial({
-      uniforms: { uTime: { value: 0 }, uLevel: { value: 0 }, uScale: { value: 600 }, uAgitation: { value: 0 }, uColor: { value: AMBER.clone() }, uOpacity: { value: 0.8 } },
+      uniforms: { uTime: { value: 0 }, uLevel: { value: 0 }, uScale: { value: 600 }, uAgitation: { value: 0 }, uColor: { value: AMBER.clone() }, uOpacity: { value: 0.8 }, uScan: { value: -2 } },
       vertexShader: SHELL_VERT, fragmentShader: SHELL_FRAG, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
     });
     this.shell = new THREE.Points(shellGeo, this.shellMat);
@@ -209,6 +216,28 @@ export class Orb {
     moteGeo.setAttribute('position', new THREE.BufferAttribute(mp, 3));
     this.motes = new THREE.Points(moteGeo, this._track(new THREE.PointsMaterial({ color: HOT, size: 0.02, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false })));
     g.add(this._spin(this.motes, 0.18, new THREE.Vector3(0, 1, 0)));
+
+    // Its own emitter, for when it is docked: a small disc of rings and ticks with a cone of light up into the sphere.
+    this.base = new THREE.Group();
+    this.base.position.y = -2.0;
+    const disc = new THREE.Group();
+    disc.rotation.x = -Math.PI / 2;
+    const baseLine = (geo, color, o, speed) => {
+      const line = new THREE.LineSegments(geo, lineMat(color, o));
+      this.baseMats.push({ mat: line.material, base: o });
+      disc.add(speed ? this._spin(line, speed) : line);
+    };
+    baseLine(sketchRing(1.0, { gaps: 0, wobble: 0 }), AMBER, 0.7, 0);
+    baseLine(tickRing(1.0, 60, 0.05), HOT, 0.6, 0.35);
+    baseLine(sketchRing(0.66, { gaps: 4, wobble: 0 }), ORANGE, 0.75, -0.5);
+    baseLine(sketchRing(0.3, { gaps: 2, wobble: 0 }), AMBER, 0.8, 0.8);
+    baseLine(sketchRing(0.1, { gaps: 0, wobble: 0 }), HOT, 0.9, 0);
+    this.base.add(disc);
+    this.cone = lightCone({ bottom: 0.12, top: 0.95, color: '#ff8a1a' });
+    this.cone.scale.set(1, 2.0, 1);
+    this.base.add(this.cone);
+    this.base.visible = false;
+    g.add(this.base);
   }
 
   setState(state) {
@@ -227,6 +256,7 @@ export class Orb {
     const s = this.smooth;
     const k = 1 - Math.exp(-dt * 4);
     for (const key of ['spin', 'bright', 'focus', 'agitation']) s[key] += ((target[key] ?? 0) - s[key]) * k;
+    s.dock += (this.dock - s.dock) * k;
     const lk = 1 - Math.exp(-dt * (this.level > s.level ? 28 : 9)); // fast attack, slower release
     s.level += (this.level - s.level) * lk;
 
@@ -250,6 +280,14 @@ export class Orb {
     this.shellMat.uniforms.uAgitation.value = s.agitation;
     this.shellMat.uniforms.uScale.value = pxPerUnit;
     this.shellMat.uniforms.uOpacity.value = 0.38 + bright * 0.3;
+    this.shellMat.uniforms.uScan.value = ((this.time * 0.22) % 1) * 3.4 - 1.5; // bottom to top, then a pause
+
+    this.base.visible = s.dock > 0.02;
+    if (this.base.visible) {
+      for (const { mat, base } of this.baseMats) mat.opacity = Math.min(1, base * bright * s.dock);
+      this.cone.material.uniforms.uOpacity.value = 0.3 * bright * s.dock;
+      this.cone.material.uniforms.uTime.value = this.time;
+    }
 
     this.core.scale.setScalar(0.85 + s.level * 1.3 + breath * 3 + thinkPulse);
     this.core.material.opacity = Math.min(1, 0.45 + s.level * 0.55 + thinkPulse);

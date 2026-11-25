@@ -5,12 +5,13 @@
   --cyan: #58d6ff;
   --dim: rgba(255, 182, 72, 0.45);
   --line: rgba(255, 150, 40, 0.28);
-  --glass: rgba(10, 6, 2, 0.78);
+  --glass: rgba(12, 10, 8, 0.8);
+  --room: #0d0c0b;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: "Avenir Next", "Segoe UI", "Helvetica Neue", system-ui, sans-serif;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; background: #000; color: var(--amber); font-family: var(--sans); overflow: hidden; user-select: none; }
+html, body { margin: 0; height: 100%; background: var(--room); color: var(--amber); font-family: var(--sans); overflow: hidden; user-select: none; }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; background: none; border: 0; }
 [hidden] { display: none !important; }
@@ -31,11 +32,11 @@ button { cursor: pointer; background: none; border: 0; }
 #chips { display: flex; gap: 8px; margin-top: 12px; }
 .chip { font: 10px/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase; padding: 6px 9px; border: 1px solid var(--line); color: var(--amber); background: rgba(255, 140, 20, 0.05); transition: 0.15s; }
 .chip:hover { border-color: var(--amber); background: rgba(255, 140, 20, 0.14); }
-.chip.off { color: rgba(255, 182, 72, 0.4); border-style: dashed; }
+.chip.off { color: rgba(255, 182, 72, 0.5); border-style: dashed; }
 .chip.cool { color: var(--cyan); border-color: rgba(88, 214, 255, 0.4); }
 #status-line { margin-top: 10px; font: 10px/1.4 var(--mono); letter-spacing: 0.1em; color: var(--dim); min-height: 14px; max-width: 420px; }
 
-#views { display: flex; gap: 2px; border: 1px solid var(--line); background: rgba(0, 0, 0, 0.4); }
+#views { display: flex; gap: 2px; border: 1px solid var(--line); background: rgba(8, 7, 6, 0.55); }
 #views button { font: 11px/1 var(--mono); letter-spacing: 0.3em; text-transform: uppercase; padding: 10px 22px 10px 25px; color: var(--dim); transition: 0.15s; }
 #views button:hover { color: var(--hot); }
 #views button.on { color: #000; background: var(--amber); box-shadow: 0 0 18px rgba(255, 150, 30, 0.5); }
@@ -46,15 +47,15 @@ button { cursor: pointer; background: none; border: 0; }
 /* ---- conversation ---- */
 #talk { position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); width: min(860px, 72vw); text-align: center; z-index: 4; pointer-events: none; }
 #talk > * { pointer-events: auto; }
-#said-user { font: 13px/1.5 var(--mono); letter-spacing: 0.04em; color: rgba(255, 226, 168, 0.5); min-height: 20px; transition: opacity 0.6s; }
+#said-user { font: 13px/1.5 var(--mono); letter-spacing: 0.04em; color: rgba(255, 226, 168, 0.55); text-shadow: 0 0 4px #000; min-height: 20px; transition: opacity 0.6s; }
 #said-user.live { color: var(--cyan); }
-#said-jarvis { margin-top: 8px; font: 300 21px/1.45 var(--sans); color: var(--hot); text-shadow: 0 0 18px rgba(255, 130, 10, 0.55), 0 0 3px #000; min-height: 30px; transition: opacity 0.8s; }
+#said-jarvis { margin-top: 8px; font: 300 21px/1.45 var(--sans); color: var(--hot); text-shadow: 0 0 18px rgba(255, 130, 10, 0.5), 0 0 3px #000, 0 1px 12px rgba(0, 0, 0, 0.85); min-height: 30px; transition: opacity 0.8s; }
 #tool-line { margin-top: 8px; font: 10px/1 var(--mono); letter-spacing: 0.2em; text-transform: uppercase; color: var(--orange); min-height: 12px; }
 #tool-line:not(:empty)::before { content: "▸ "; }
 #type-form { margin-top: 12px; }
 #type-input { width: 100%; padding: 11px 14px; background: var(--glass); border: 1px solid var(--line); outline: none; font: 14px var(--mono); color: var(--hot); user-select: text; }
 #type-input:focus { border-color: var(--amber); box-shadow: 0 0 18px rgba(255, 140, 20, 0.2); }
-#hint { margin-top: 12px; font: 9px/1 var(--mono); letter-spacing: 0.22em; text-transform: uppercase; color: rgba(255, 182, 72, 0.25); }
+#hint { margin-top: 12px; font: 9px/1 var(--mono); letter-spacing: 0.22em; text-transform: uppercase; color: rgba(255, 182, 72, 0.34); text-shadow: 0 0 4px #000; }
 .fade { opacity: 0.25; }
 
 /* ---- node card ---- */
@@ -79,7 +80,7 @@ button { cursor: pointer; background: none; border: 0; }
 @keyframes toast-in { from { opacity: 0; transform: translateX(16px); } }
 
 /* ---- control panel ---- */
-#panel { position: fixed; top: 0; right: 0; bottom: 0; width: 400px; padding: 76px 24px 40px; background: rgba(6, 4, 1, 0.92); border-left: 1px solid var(--line); backdrop-filter: blur(14px); overflow-y: auto; z-index: 8; user-select: text; }
+#panel { position: fixed; top: 0; right: 0; bottom: 0; width: 400px; padding: 76px 24px 40px; background: rgba(10, 8, 6, 0.93); border-left: 1px solid var(--line); backdrop-filter: blur(14px); overflow-y: auto; z-index: 8; user-select: text; }
 #panel::-webkit-scrollbar, #card .links::-webkit-scrollbar, .list::-webkit-scrollbar { width: 6px; }
 #panel::-webkit-scrollbar-thumb, #card .links::-webkit-scrollbar-thumb, .list::-webkit-scrollbar-thumb { background: var(--line); }
 #panel section { margin-bottom: 30px; }

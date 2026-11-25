@@ -3,8 +3,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { Orb } from './orb.js';
+import { Stage, screenPass } from './stage.js';
 import { Graph3D } from './graph.js';
 import { Voice } from './voice.js';
 import { Panel, h } from './panel.js';
@@ -20,10 +20,10 @@ let state = await api.invoke('state');
 const canvas = $('space');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setClearColor(0x000000, 1);
+renderer.setClearColor(0x000000, 1); // the room itself is painted by the screen pass
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 20000);
-camera.position.set(0, 40, 420);
+camera.position.set(0, 118, 404); // looking a little down, onto the projection table
 scene.add(camera);
 
 const controls = new OrbitControls(camera, canvas);
@@ -38,36 +38,24 @@ controls.maxDistance = 6000;
 
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.55, 0.55, 0.08);
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.5, 0.45, 0.1);
 composer.addPass(bloom);
-composer.addPass(new OutputPass());
+const screen = screenPass(); // room backdrop + scan lines + sRGB, in place of the stock output pass
+composer.addPass(screen);
 
-// Distant stars and a little dust, so the void has depth.
-{
-  const N = 5000;
-  const pos = new Float32Array(N * 3);
-  const col = new Float32Array(N * 3);
-  const v = new THREE.Vector3();
-  for (let i = 0; i < N; i++) {
-    v.randomDirection().multiplyScalar(2500 + Math.random() * 6000);
-    pos.set([v.x, v.y, v.z], i * 3);
-    const warm = Math.random();
-    const b = 0.15 + Math.random() * 0.4;
-    col.set([b * (0.8 + warm * 0.2), b * (0.75 + warm * 0.1), b * (1 - warm * 0.35)], i * 3);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  scene.add(new THREE.Points(geo, new THREE.PointsMaterial({ size: 1.6, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false })));
-}
+// The projection table everything stands on.
+const stage = new Stage();
+scene.add(stage.group);
+const WARM = new THREE.Color('#ff9a2e');
+const COOL = new THREE.Color('#35c8ff');
 
 const orb = new Orb();
 camera.add(orb.group); // the hologram lives in front of the camera, like a HUD element
 const orbPose = { pos: new THREE.Vector3(0, 0.25, -10), scale: 1.2 };
 orb.group.position.copy(orbPose.pos);
 
-const mind = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.34, charge: -90 });
-const files = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.2, charge: -34, maxLabels: 70 });
+const mind = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.4, charge: -90, beamWidth: 2.4 });
+const files = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.26, charge: -34, maxLabels: 70, beamWidth: 1.7 });
 scene.add(mind.group, files.group);
 
 function resize() {
@@ -75,6 +63,9 @@ function resize() {
   const hgt = window.innerHeight;
   renderer.setSize(w, hgt, false);
   composer.setSize(w, hgt);
+  const pr = renderer.getPixelRatio();
+  screen.uniforms.uRes.value.set(w * pr, hgt * pr);
+  screen.uniforms.uPixel.value = Math.max(1, Math.round(pr));
   camera.aspect = w / hgt;
   camera.updateProjectionMatrix();
 }
@@ -101,6 +92,7 @@ function buildMind() {
       size: n.type === 'core' ? 13 : n.type === 'project' ? (n.id === activeProject ? 10 : 7.5) : n.type === 'document' ? 5 : 3.6 + Math.min(n.weight || 1, 6) * 0.45,
       showLabel: n.type === 'core' || n.type === 'project' || nodes.length < 40,
       pinned: n.type === 'core',
+      stem: n.type === 'core' || n.type === 'project',
       near: n.type === 'project' ? 'core' : n.project,
       spread: 35,
       data: n,
@@ -137,8 +129,10 @@ function buildFiles() {
         label: n.name,
         color: n.parent ? KIND_COLOR[n.kind] || KIND_COLOR.other : '#ffffff',
         size: !n.parent ? 12 : n.dir ? 3.2 + Math.min(6, Math.log2(1 + c + n.more) * 1.1) : 2.2,
+        shape: n.dir ? 1 : 0, // folders are diamonds, files are dots
         showLabel: n.depth <= 1 && (n.dir || fileNodes.length < 200),
         pinned: !n.parent,
+        stem: !n.parent || (n.dir && n.depth <= 1),
         near: n.parent,
         spread: [0, 90, 40, 22, 14, 10][Math.min(5, n.depth)],
         data: n,
@@ -190,8 +184,29 @@ function flyTo(target, distance, seconds = 1.4) {
   flight = { t: 0, seconds, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), toTarget: target.clone(), toPos: target.clone().add(dir.multiplyScalar(distance)) };
 }
 
+// Where the projection table sits. Under a map it is sized to the map; in Core it is sized to the
+// orb, which lives in front of the camera, so it follows the camera's distance from the centre.
+const FLOOR = { dropMin: 0.58, dropMax: 0.92, radius: 0.66, glow: 0.62, coreDrop: 0.25, coreRadius: 0.2 };
+
+/** How far below a map's centre its table sits: just under the lowest node, within limits that keep it in the picture. */
+function floorDrop(graph) {
+  return THREE.MathUtils.clamp(-graph.bottom + graph.radius * 0.06, graph.radius * FLOOR.dropMin, graph.radius * FLOOR.dropMax);
+}
+
 function fit(graph) {
-  flyTo(new THREE.Vector3(0, 0, 0), Math.max(260, graph.radius * 2.3));
+  // Aim a little below the middle of the map (more, the lower its table), so the table is in the picture too.
+  const aim = (floorDrop(graph) - graph.radius * 0.5) * 0.4;
+  flyTo(new THREE.Vector3(0, -aim, 0), Math.max(280, graph.radius * 2.65));
+}
+
+function stageTarget() {
+  if (view === 'core') {
+    const d = camera.position.distanceTo(controls.target);
+    return { y: controls.target.y - d * FLOOR.coreDrop, radius: d * FLOOR.coreRadius, height: d * FLOOR.coreDrop, opacity: 1, color: WARM };
+  }
+  const g = view === 'files' ? files : mind;
+  const drop = floorDrop(g);
+  return { y: -drop, radius: g.radius * FLOOR.radius, height: drop * 1.2, opacity: FLOOR.glow, color: view === 'files' ? COOL : WARM };
 }
 
 function setView(next, focusText) {
@@ -222,7 +237,7 @@ function orbTarget() {
   const halfH = d * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const halfW = halfH * camera.aspect;
   if (view === 'core') return { pos: new THREE.Vector3(0, halfH * 0.07, -d), scale: Math.min(1.55, halfW * 0.42) };
-  return { pos: new THREE.Vector3(-halfW + 1.9, -halfH + 1.75, -d), scale: 0.52 };
+  return { pos: new THREE.Vector3(-halfW + 2.0, -halfH + 2.05, -d), scale: 0.52 };
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +522,7 @@ function frame(now = performance.now()) {
   const hearing = voiceState === 'hearing';
   orb.setState(hearing ? 'listening' : voice.speaking ? 'speaking' : generating || voiceState === 'transcribing' ? 'thinking' : 'idle');
   orb.level = voice.level;
+  orb.dock = view === 'core' ? 0 : 1;
   const target = orbTarget();
   const ease = 1 - Math.exp(-dt * 4);
   orb.group.position.lerp(target.pos, ease);
@@ -514,6 +530,11 @@ function frame(now = performance.now()) {
   orb.update(dt, (hgt / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * orbPose.scale);
   orb.group.scale.setScalar(orbPose.scale * (orb.pulse || 1));
 
+  stage.update(dt, stageTarget());
+  mind.floorY = view === 'mind' ? stage.cur.y : null;
+  files.floorY = view === 'files' ? stage.cur.y : null;
+  screen.uniforms.uTime.value = stage.time;
+  screen.uniforms.uTint.value.copy(stage.color);
   mind.update(dt, camera, w, hgt);
   files.update(dt, camera, w, hgt);
   composer.render();
