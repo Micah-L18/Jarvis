@@ -54,23 +54,32 @@ camera.add(orb.group); // the hologram lives in front of the camera, like a HUD 
 const orbPose = { pos: new THREE.Vector3(0, 0.25, -10), scale: 1.2 };
 orb.group.position.copy(orbPose.pos);
 
-const mind = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.4, charge: -90, beamWidth: 2.4 });
-const files = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.26, charge: -34, maxLabels: 70, beamWidth: 1.7 });
+const mind = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.5, charge: -90, beamWidth: 1.2, flatten: 0.07 });
+const files = new Graph3D({ labelLayer: $('labels'), linkOpacity: 0.34, charge: -34, maxLabels: 70, beamWidth: 0.9, flatten: 0.04 });
 scene.add(mind.group, files.group);
 
 function resize() {
   const w = window.innerWidth;
   const hgt = window.innerHeight;
+  // The drawing buffer always matches the display's pixels (also after the window moves to another
+  // screen or the zoom changes), so the scan lines never beat against a rescaled canvas.
+  const pr = Math.min(window.devicePixelRatio, 2);
+  renderer.setPixelRatio(pr);
+  composer.setPixelRatio(pr);
   renderer.setSize(w, hgt, false);
   composer.setSize(w, hgt);
-  const pr = renderer.getPixelRatio();
   screen.uniforms.uRes.value.set(w * pr, hgt * pr);
   screen.uniforms.uPixel.value = Math.max(1, Math.round(pr));
+  stage.setSize(w * pr, hgt * pr);
   camera.aspect = w / hgt;
   camera.updateProjectionMatrix();
+  placeCallout();
 }
 window.addEventListener('resize', resize);
-resize();
+// A change of display scale does not always come with a resize event, so watch for it directly.
+(function watchScale() {
+  matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener('change', () => { resize(); watchScale(); }, { once: true });
+})();
 
 // ---------------------------------------------------------------------------
 // Mind map (what Jarvis knows)
@@ -92,7 +101,7 @@ function buildMind() {
       size: n.type === 'core' ? 13 : n.type === 'project' ? (n.id === activeProject ? 10 : 7.5) : n.type === 'document' ? 5 : 3.6 + Math.min(n.weight || 1, 6) * 0.45,
       showLabel: n.type === 'core' || n.type === 'project' || nodes.length < 40,
       pinned: n.type === 'core',
-      stem: n.type === 'core' || n.type === 'project',
+      hub: n.type === 'core' || n.type === 'project',
       near: n.type === 'project' ? 'core' : n.project,
       spread: 35,
       data: n,
@@ -132,7 +141,7 @@ function buildFiles() {
         shape: n.dir ? 1 : 0, // folders are diamonds, files are dots
         showLabel: n.depth <= 1 && (n.dir || fileNodes.length < 200),
         pinned: !n.parent,
-        stem: !n.parent || (n.dir && n.depth <= 1),
+        hub: n.dir || !n.parent,
         near: n.parent,
         spread: [0, 90, 40, 22, 14, 10][Math.min(5, n.depth)],
         data: n,
@@ -176,37 +185,92 @@ async function expandFolder(node) {
 
 let view = 'core';
 let flight = null;
+let follow = null; // the map being kept in frame while its layout settles (until the user takes the camera)
 
 function flyTo(target, distance, seconds = 1.4) {
   const dir = camera.position.clone().sub(controls.target);
   if (dir.lengthSq() < 1) dir.set(0, 0.2, 1);
   dir.normalize();
-  flight = { t: 0, seconds, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), toTarget: target.clone(), toPos: target.clone().add(dir.multiplyScalar(distance)) };
+  flight = { t: 0, seconds, dir, framing: false, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), toTarget: target.clone(), toPos: target.clone().add(dir.clone().multiplyScalar(distance)) };
 }
 
-// Where the projection table sits. Under a map it is sized to the map; in Core it is sized to the
-// orb, which lives in front of the camera, so it follows the camera's distance from the centre.
-const FLOOR = { dropMin: 0.58, dropMax: 0.92, radius: 0.66, glow: 0.62, coreDrop: 0.25, coreRadius: 0.2 };
+// The projection table. Under a map it sits clear below the lowest node and is sized to the map;
+// in Core it is sized to the orb, which lives in front of the camera, so it follows the camera's
+// distance from the centre.
+const FLOOR = { gap: 0.16, radius: 0.5, glow: 0.5, cone: 0.1, coreDrop: 0.25, coreRadius: 0.17, coreCone: 0.22 };
+const tableY = (graph) => graph.bottom - Math.max(14, graph.radius * FLOOR.gap);
+const tableRadius = (graph) => Math.max(50, graph.spread * FLOOR.radius);
 
-/** How far below a map's centre its table sits: just under the lowest node, within limits that keep it in the picture. */
-function floorDrop(graph) {
-  return THREE.MathUtils.clamp(-graph.bottom + graph.radius * 0.06, graph.radius * FLOOR.dropMin, graph.radius * FLOOR.dropMax);
+// Framing a map: the band of the window it must sit in (NDC: clear of the top bar, the caption and
+// the edges), with the table's near rim just above the caption.
+const framing = { sinE: 0.28, tanFov: 1, aspect: 1, top: 0.74, bottom: -0.62, side: 0.74, floorY: 0, floorR: 1, floorLimit: -0.66, minDist: 240 };
+const framed = { y: 0, dist: 0 };
+
+function solveFraming(graph, rounds) {
+  const dy = camera.position.y - controls.target.y;
+  framing.sinE = flight ? flight.dir.y : dy / (camera.position.distanceTo(controls.target) || 1);
+  framing.tanFov = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  framing.aspect = camera.aspect;
+  framing.floorY = tableY(graph);
+  framing.floorR = tableRadius(graph) * 1.08;
+  return graph.frame(framing, framed, rounds);
 }
 
 function fit(graph) {
-  // Aim a little below the middle of the map (more, the lower its table), so the table is in the picture too.
-  const aim = (floorDrop(graph) - graph.radius * 0.5) * 0.4;
-  flyTo(new THREE.Vector3(0, -aim, 0), Math.max(280, graph.radius * 2.65));
+  flight = null;
+  framed.y = (graph.top + tableY(graph)) / 2;
+  framed.dist = graph.radius * 2.7;
+  solveFraming(graph, 10);
+  flyTo(new THREE.Vector3(0, framed.y, 0), framed.dist);
+  flight.framing = true;
+  follow = graph;
 }
 
+/** While a freshly shown map is still settling, keep it framed: retarget the flight, then ease after it. */
+function keepFramed(dt) {
+  const graph = follow;
+  if (graph.settling) solveFraming(graph, 2);
+  if (flight) {
+    if (!flight.framing) return;
+    flight.toTarget.set(0, framed.y, 0);
+    flight.toPos.copy(flight.dir).multiplyScalar(framed.dist).add(flight.toTarget);
+    return;
+  }
+  const k = 1 - Math.exp(-dt * 2.2);
+  const dist = camera.position.distanceTo(controls.target);
+  const off = framed.y - controls.target.y;
+  const next = dist + (framed.dist - dist) * k;
+  camera.position.sub(controls.target).multiplyScalar(next / (dist || 1));
+  controls.target.y += off * k;
+  controls.target.x -= controls.target.x * k;
+  controls.target.z -= controls.target.z * k;
+  camera.position.add(controls.target);
+  if (!graph.settling && Math.abs(off) < 0.5 && Math.abs(framed.dist - dist) < 1) follow = null;
+}
+
+const stageAim = { y: 0, radius: 1, height: 1, opacity: 0, cone: 0, detail: 0, color: WARM };
 function stageTarget() {
+  const aim = stageAim;
   if (view === 'core') {
     const d = camera.position.distanceTo(controls.target);
-    return { y: controls.target.y - d * FLOOR.coreDrop, radius: d * FLOOR.coreRadius, height: d * FLOOR.coreDrop, opacity: 1, color: WARM };
+    aim.y = controls.target.y - d * FLOOR.coreDrop;
+    aim.radius = d * FLOOR.coreRadius;
+    aim.height = d * FLOOR.coreDrop;
+    aim.opacity = 1;
+    aim.cone = FLOOR.coreCone;
+    aim.detail = 1;
+    aim.color = WARM;
+    return aim;
   }
   const g = view === 'files' ? files : mind;
-  const drop = floorDrop(g);
-  return { y: -drop, radius: g.radius * FLOOR.radius, height: drop * 1.2, opacity: FLOOR.glow, color: view === 'files' ? COOL : WARM };
+  aim.y = tableY(g);
+  aim.radius = tableRadius(g);
+  aim.height = (g.top - aim.y) * 0.9;
+  aim.opacity = FLOOR.glow;
+  aim.cone = FLOOR.cone;
+  aim.detail = 0;
+  aim.color = view === 'files' ? COOL : WARM;
+  return aim;
 }
 
 function setView(next, focusText) {
@@ -217,6 +281,7 @@ function setView(next, focusText) {
   mind.labelsOn = next === 'mind';
   files.labelsOn = next === 'files';
   select(null);
+  follow = null;
   controls.autoRotateSpeed = next === 'core' ? 0.25 : 0.12;
   if (next === 'files') loadFiles().then(() => focusText && focusByName(files, focusText));
   const graph = next === 'files' ? files : mind;
@@ -232,12 +297,19 @@ function focusByName(graph, text) {
 }
 
 // Where the hologram sits: centre stage in Core, docked bottom-left while a map is up.
+const orbAim = { pos: new THREE.Vector3(), scale: 1 };
 function orbTarget() {
   const d = 10;
   const halfH = d * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   const halfW = halfH * camera.aspect;
-  if (view === 'core') return { pos: new THREE.Vector3(0, halfH * 0.07, -d), scale: Math.min(1.55, halfW * 0.42) };
-  return { pos: new THREE.Vector3(-halfW + 2.0, -halfH + 2.05, -d), scale: 0.52 };
+  if (view === 'core') {
+    orbAim.pos.set(0, halfH * 0.07, -d);
+    orbAim.scale = Math.min(1.55, halfW * 0.42);
+  } else {
+    orbAim.pos.set(-halfW + 2.0, -halfH + 2.05, -d);
+    orbAim.scale = 0.52;
+  }
+  return orbAim;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +325,10 @@ function select(node, graph) {
   selected = node ? { node, graph } : null;
   if (!node) {
     card.hidden = true;
+    aim.classList.remove('on');
     return;
   }
+  follow = null;
   graph.setFocus(node.id);
   flyTo(new THREE.Vector3(node.x, node.y, node.z), graph === files ? 150 : 170, 1.1);
   const d = node.data;
@@ -287,11 +361,54 @@ function select(node, graph) {
     ].filter(Boolean));
   }
   card.hidden = false;
+  placeCallout();
+}
+
+// The targeting brackets around the selected node and the thin callout line tying it to its card:
+// one small SVG overlay, moved each frame while something is selected.
+const aim = $('aim');
+const aimMark = $('aim-mark');
+const aimLine = $('aim-line');
+const aimAt = { x: 0, y: 0, r: 0, visible: false };
+const callout = { x: 0, y: 0, half: -1 }; // where the line leaves the card; the bracket size last drawn
+
+/** Measured when the card or the window changes, not per frame. */
+function placeCallout() {
+  if (!selected) return;
+  const box = $('card').getBoundingClientRect();
+  callout.x = box.right + 5;
+  callout.y = box.top - 5;
+}
+
+function trackSelection(w, hgt) {
+  if (!selected) return;
+  const { node, graph } = selected;
+  if (graph.byId.get(node.id) !== node) { // the data was rebuilt: follow the node's new record
+    const now = graph.byId.get(node.id);
+    if (!now) return aim.classList.remove('on');
+    selected.node = now;
+  }
+  const at = graph.screenOf(selected.node, camera, w, hgt, aimAt);
+  aim.classList.toggle('on', at.visible);
+  if (!at.visible) return;
+  const half = Math.round(at.r + 7);
+  if (half !== callout.half) { // four corners, redrawn only when the marker changes size
+    callout.half = half;
+    const leg = Math.max(5, Math.round(half * 0.36));
+    aimMark.setAttribute('d', `M${-half},${leg - half}V${-half}H${leg - half}M${half - leg},${-half}H${half}V${leg - half}M${half},${half - leg}V${half}H${half - leg}M${leg - half},${half}H${-half}V${half - leg}`);
+  }
+  aimMark.setAttribute('transform', `translate(${at.x.toFixed(1)},${at.y.toFixed(1)})`);
+  // from the card's corner bracket, a short level run, then straight to the nearest corner of the brackets
+  const elbow = callout.x + 16;
+  const ex = at.x - half, ey = at.y + (callout.y < at.y ? -half : half);
+  if (ex < elbow + 12) aimLine.setAttribute('points', '');
+  else aimLine.setAttribute('points', `${callout.x},${callout.y} ${elbow},${callout.y} ${ex.toFixed(1)},${ey.toFixed(1)}`);
 }
 
 const activeGraph = () => (view === 'files' ? files : view === 'mind' ? mind : null);
 let downAt = null;
-canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; controls.autoRotate = false; });
+canvas.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; controls.autoRotate = false; follow = null; });
+canvas.addEventListener('wheel', () => { follow = null; }, { passive: true });
 canvas.addEventListener('pointermove', (e) => {
   const g = activeGraph();
   if (!g || e.buttons) return;
@@ -517,6 +634,7 @@ function frame(now = performance.now()) {
     controls.target.lerpVectors(flight.fromTarget, flight.toTarget, k);
     if (flight.t >= 1) flight = null;
   }
+  if (follow) keepFramed(dt);
   controls.update();
 
   const hearing = voiceState === 'hearing';
@@ -530,13 +648,15 @@ function frame(now = performance.now()) {
   orb.update(dt, (hgt / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * orbPose.scale);
   orb.group.scale.setScalar(orbPose.scale * (orb.pulse || 1));
 
-  stage.update(dt, stageTarget());
+  stage.update(dt, stageTarget(), camera.position);
   mind.floorY = view === 'mind' ? stage.cur.y : null;
   files.floorY = view === 'files' ? stage.cur.y : null;
   screen.uniforms.uTime.value = stage.time;
   screen.uniforms.uTint.value.copy(stage.color);
-  mind.update(dt, camera, w, hgt);
-  files.update(dt, camera, w, hgt);
+  const pr = renderer.getPixelRatio();
+  mind.update(dt, camera, w, hgt, pr);
+  files.update(dt, camera, w, hgt, pr);
+  trackSelection(w, hgt);
   composer.render();
   requestAnimationFrame(frame);
 }
@@ -545,6 +665,7 @@ function frame(now = performance.now()) {
 // Boot
 // ---------------------------------------------------------------------------
 
+resize();
 buildMind();
 renderChips();
 setView('core');

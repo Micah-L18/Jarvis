@@ -1,53 +1,80 @@
-// A 3D force-directed graph drawn as a hologram: marker dots joined by beams of light, hanging in
-// the air above the projection table. Used twice — once for what Jarvis knows, once for the file system.
+// A 3D force-directed graph drawn as a hologram: ringed markers joined by thin beams of light,
+// hanging in the air above the projection table. Used twice — once for what Jarvis knows, once for
+// the file system.
 import * as THREE from 'three';
-import { forceSimulation, forceLink, forceManyBody, forceCenter } from 'd3-force-3d';
+import { forceSimulation, forceLink, forceManyBody, forceCenter, forceY } from 'd3-force-3d';
 
-const MARK_SCALE = 0.72; // marker size on screen = node size * viewport height * this / distance
+// Marker size on screen, in CSS pixels = node size * viewport height * MARK_SCALE / distance. Past the
+// knee a marker grows more slowly and it never exceeds MARK_MAX, so a close-up hub cannot take over.
+const MARK_SCALE = 1.1;
 const MARK_MIN = 2.6;
-const MARK_MAX = 96;
+const MARK_KNEE = 30;
+const MARK_MAX = 48;
+const MARK_DETAIL = 12; // from about this size a marker has room for its rings
+const FOCUS_GROW = 1.5;
+const HOVER_GROW = 1.25;
+const DIAMOND = 0.72; // a diamond's flats sit this much closer in than a circle of the same marker
 
-// Nodes are markers, not stars: a crisp bright centre inside a thin ring (a diamond for aShape = 1),
-// with reticle ticks once they are large enough on screen to carry them. They do not twinkle.
+function markPx(size, height, dist) {
+  let px = (size * height * MARK_SCALE) / dist;
+  if (px > MARK_KNEE) px = MARK_KNEE + (px - MARK_KNEE) * 0.35;
+  return Math.min(MARK_MAX, Math.max(MARK_MIN, px));
+}
+
+// Nodes are markers, not stars: a bright core inside a thin halo ring; hubs carry a second, outer
+// ring; the selected node's outer ring is broken and turns slowly. aShape 1 draws the same thing as
+// a diamond (folders). aRing: 0 plain, 1 hub or hovered, 2 selected. All sizes are CSS pixels (uPr
+// is the renderer's pixel ratio), so strokes stay thin and identical on any display.
 const VERT = /* glsl */ `
-  attribute vec3 aColor; attribute float aSize; attribute float aAlpha; attribute float aShape;
-  uniform float uScale;
-  const float MARK_MIN = ${MARK_MIN.toFixed(1)}; const float MARK_MAX = ${MARK_MAX.toFixed(1)};
-  varying vec3 vColor; varying float vAlpha; varying float vPx; varying float vShape;
+  attribute vec3 aColor; attribute float aSize; attribute float aAlpha; attribute float aShape; attribute float aRing;
+  uniform float uScale; uniform float uPr;
+  varying vec3 vColor; varying float vAlpha; varying float vPx; varying float vShape; varying float vRing;
   void main(){
-    vColor = aColor; vAlpha = aAlpha; vShape = aShape;
+    vColor = aColor; vAlpha = aAlpha; vShape = aShape; vRing = aRing;
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
-    vPx = clamp(aSize * uScale / -mv.z, MARK_MIN, MARK_MAX);
-    gl_PointSize = vPx;
+    float px = aSize * uScale / max(-mv.z, 0.001);
+    px = min(px, ${MARK_KNEE.toFixed(1)} + (px - ${MARK_KNEE.toFixed(1)}) * 0.35);
+    vPx = clamp(px, ${MARK_MIN.toFixed(1)}, ${MARK_MAX.toFixed(1)});
+    gl_PointSize = vPx * uPr;
     gl_Position = projectionMatrix * mv;
   }`;
 const FRAG = /* glsl */ `
-  uniform float uOpacity;
-  varying vec3 vColor; varying float vAlpha; varying float vPx; varying float vShape;
+  uniform float uOpacity; uniform float uSpin;
+  varying vec3 vColor; varying float vAlpha; varying float vPx; varying float vShape; varying float vRing;
   void main(){
-    vec2 p = (gl_PointCoord - 0.5) * 2.0;
-    float d = mix(length(p), (abs(p.x) + abs(p.y)) * 0.8, vShape);
-    float px = 2.0 / vPx;                                  // one screen pixel, in marker units
-    float big = smoothstep(7.0, 15.0, vPx);                // enough pixels to draw a ring?
-    float rc = mix(0.7, 0.27, big);
-    float core = 1.0 - smoothstep(rc - px, rc + px, d);
-    float ring = (1.0 - smoothstep(px * 0.6, px * 1.6, abs(d - 0.7))) * big;
-    float reticle = smoothstep(24.0, 40.0, vPx) * step(min(abs(p.x), abs(p.y)), px * 0.8) * step(0.8, d) * step(d, 0.98);
-    float halo = 1.0 - smoothstep(0.0, 1.0, d);
-    float a = (core * mix(0.8, 1.0, big) + ring * 0.85 + reticle * 0.6 + halo * halo * 0.14) * vAlpha * uOpacity;
+    vec2 p = gl_PointCoord - 0.5;
+    float R = 0.5 * vPx;                                   // everything below is in CSS pixels
+    float k = mix(1.0, ${DIAMOND.toFixed(2)}, vShape);
+    float d = mix(length(p), (abs(p.x) + abs(p.y)) * 0.7071, vShape) * vPx; // distance from the centre / from a diamond's edge
+    float detail = smoothstep(${(MARK_DETAIL - 3).toFixed(1)}, ${(MARK_DETAIL + 3).toFixed(1)}, vPx);
+    float coreR = max(min(R * mix(0.5, 0.2, detail), 1.9 + R * 0.06), 1.0) * k; // the core stays a point, however close
+    float core = 1.0 - smoothstep(coreR - 0.7, coreR + 0.7, d);
+    float w = 0.3 + vPx * 0.007;                            // half a stroke
+    float r1 = R * 0.56 * k;
+    float ring1 = (1.0 - smoothstep(w, w + 0.9, abs(d - r1))) * detail;
+    float hub = step(0.5, vRing), sel = step(1.5, vRing);
+    float r2 = (R * 0.92 - 0.8) * k;
+    float ring2 = (1.0 - smoothstep(w, w + 0.9, abs(d - r2))) * detail * hub;
+    ring2 *= mix(1.0, smoothstep(0.2, 0.36, abs(sin((atan(p.y, p.x) + uSpin) * 1.5))), sel);
+    float fill = (1.0 - smoothstep(r1 - 1.0, r1, d)) * detail;
+    float glow = 1.0 - smoothstep(0.0, mix(R * k, r1, detail), d);
+    float a = (core + ring1 * 0.8 + ring2 * mix(0.55, 1.0, sel) + fill * 0.05 + glow * glow * mix(0.3, 0.14, detail)) * vAlpha * uOpacity;
     if (a < 0.004) discard;
-    gl_FragColor = vec4(mix(vColor, vec3(1.0), core * mix(0.12, 0.6, big)), a);
+    gl_FragColor = vec4(mix(vColor, vec3(1.0), core * mix(0.3, 0.6, detail)), a); // small markers keep their type colour
   }`;
 
-// Links are beams: camera-facing ribbons a few pixels wide with a hot core and a soft edge,
-// one instanced quad per link (a single draw call however many there are).
+// Links are beams: thin camera-facing ribbons, one instanced quad per link (a single draw call
+// however many there are). The quad is a little wider than the beam and the fragment shader draws
+// the line inside it from the distance to its centre, so even a hairline stays smooth.
+const BEAM_PAD = 1.5;
 const BEAM_VERT = /* glsl */ `
   attribute vec3 aStart; attribute vec3 aEnd; attribute vec3 aColStart; attribute vec3 aColEnd;
   uniform vec2 uRes; uniform float uWidth;
-  varying vec3 vColor; varying float vSide;
+  varying vec3 vColor; varying float vD;
   void main(){
     vColor = mix(aColStart, aColEnd, position.y);
-    vSide = position.x;
+    float halfW = uWidth * 0.5 + ${BEAM_PAD.toFixed(1)};
+    vD = position.x * halfW;
     vec4 s = modelViewMatrix * vec4(aStart, 1.0);
     vec4 e = modelViewMatrix * vec4(aEnd, 1.0);
     float near = -1.0;                                      // trim whatever passes behind the camera
@@ -60,17 +87,17 @@ const BEAM_VERT = /* glsl */ `
     float len = length(dir);
     dir = len > 1e-4 ? dir / len : vec2(1.0, 0.0);
     vec4 c = mix(cs, ce, position.y);
-    c.xy += vec2(-dir.y, dir.x) * position.x * uWidth * 2.0 / uRes * c.w;
+    c.xy += vec2(-dir.y, dir.x) * position.x * halfW * 2.0 / uRes * c.w;
     gl_Position = c;
   }`;
 const BEAM_FRAG = /* glsl */ `
-  uniform float uOpacity;
-  varying vec3 vColor; varying float vSide;
+  uniform float uOpacity; uniform float uWidth;
+  varying vec3 vColor; varying float vD;
   void main(){
-    float x = abs(vSide);
-    float core = 1.0 - smoothstep(0.18, 0.5, x);
-    float glow = (1.0 - x) * (1.0 - x);
-    gl_FragColor = vec4(vColor, (core + glow * 0.4) * uOpacity);
+    float x = abs(vD);                                      // CSS pixels from the centre of the beam
+    float core = 1.0 - smoothstep(uWidth * 0.5 - 0.5, uWidth * 0.5 + 0.5, x);
+    float glow = max(0.0, 1.0 - x / (uWidth * 0.5 + ${BEAM_PAD.toFixed(1)}));
+    gl_FragColor = vec4(vColor, (core + glow * glow * 0.22) * uOpacity);
   }`;
 
 function beamGeometry(count) {
@@ -88,30 +115,47 @@ function beamGeometry(count) {
   return geo;
 }
 
-const STEMS = 48; // how many major nodes get a plumb line down to the table
-const FOOT = 10; // segments in the little ring where a plumb line lands
-const STEM_FLOATS = (1 + FOOT) * 6;
+// Plumb lines: the hovered and the selected node each drop a line to the projection table, ending
+// in a small landing ring. A few slots are enough (two in use, the rest fading out).
+const STEM_SLOTS = 4;
+const FOOT = 20; // segments in a landing ring
+const STEM_VERTS = (1 + FOOT) * 2;
+const CIRCLE = new Float32Array((FOOT + 1) * 2); // the unit circle, worked out once
+for (let j = 0; j <= FOOT; j++) {
+  CIRCLE[j * 2] = Math.cos((j / FOOT) * Math.PI * 2);
+  CIRCLE[j * 2 + 1] = Math.sin((j / FOOT) * Math.PI * 2);
+}
 
 const tmp = new THREE.Vector3();
+const WHITE = new THREE.Color('#ffffff');
 
 export class Graph3D {
-  /** @param opts {labelLayer: HTMLElement, linkOpacity, charge, maxLabels, beamWidth} */
+  /** @param opts {labelLayer: HTMLElement, linkOpacity, charge, maxLabels, beamWidth (CSS px), flatten} */
   constructor(opts) {
-    this.opts = { linkOpacity: 0.3, charge: -60, maxLabels: 60, beamWidth: 2.2, ...opts };
+    this.opts = { linkOpacity: 0.3, charge: -60, maxLabels: 60, beamWidth: 1.1, flatten: 0, ...opts };
     this.group = new THREE.Group();
     this.nodes = [];
     this.links = [];
     this.byId = new Map();
+    this.neighbors = new Map();
     this.opacity = 0;
     this.targetOpacity = 0;
     this.focusId = null;
     this.hoverId = null;
     this.labelsOn = true;
+    this.time = 0;
+    // Extent of the layout, refreshed whenever it moves: furthest node from the centre, furthest
+    // from the vertical axis, and the lowest and highest node.
     this.radius = 100;
-    this.bottom = -100; // lowest node's y, so the table can sit under it
+    this.spread = 100;
+    this.bottom = -60;
+    this.top = 60;
 
     const light = { transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false };
-    this.pointsMat = new THREE.ShaderMaterial({ uniforms: { uScale: { value: 600 }, uOpacity: { value: 0 } }, vertexShader: VERT, fragmentShader: FRAG, ...light });
+    this.pointsMat = new THREE.ShaderMaterial({
+      uniforms: { uScale: { value: 600 }, uPr: { value: 1 }, uOpacity: { value: 0 }, uSpin: { value: 0 } },
+      vertexShader: VERT, fragmentShader: FRAG, ...light,
+    });
     this.points = new THREE.Points(new THREE.BufferGeometry(), this.pointsMat);
     this.points.frustumCulled = false;
     this.lineMat = new THREE.ShaderMaterial({
@@ -121,12 +165,14 @@ export class Graph3D {
     this.lines = new THREE.Mesh(beamGeometry(0), this.lineMat);
     this.lines.frustumCulled = false;
     this.lines.visible = false;
-    // Plumb lines from the major nodes down to the projection table, so the map reads as a
-    // measured volume standing on the emitter rather than as points adrift.
-    this.floorY = null; // world y of the table, set from outside; null hides the plumb lines
-    this.stemNodes = [];
+
+    this.floorY = null; // world y of the table, set from outside; null means no plumb lines
+    this.stemSlots = Array.from({ length: STEM_SLOTS }, () => ({ id: null, a: 0, paintedA: -1, x: NaN, y: NaN, z: NaN, floor: 0, pf: NaN, foot: 0, r: 1, g: 1, b: 1 }));
+    const sgeo = new THREE.BufferGeometry();
+    sgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(STEM_SLOTS * STEM_VERTS * 3), 3));
+    sgeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(STEM_SLOTS * STEM_VERTS * 3), 3));
     this.stemMat = new THREE.LineBasicMaterial({ vertexColors: true, opacity: 0, ...light });
-    this.stems = new THREE.LineSegments(new THREE.BufferGeometry(), this.stemMat);
+    this.stems = new THREE.LineSegments(sgeo, this.stemMat);
     this.stems.frustumCulled = false;
     this.stems.visible = false;
     this.group.add(this.stems, this.lines, this.points);
@@ -138,12 +184,20 @@ export class Graph3D {
       .force('center', forceCenter(0, 0, 0).strength(0.03))
       .velocityDecay(0.32)
       .stop();
+    // A gentle pull toward the horizontal plane: the map settles wider than tall, like an object
+    // hovering over the table, while staying a volume.
+    if (this.opts.flatten) this.sim.force('flatten', forceY(0).strength(this.opts.flatten));
     this.labelEls = new Map();
+  }
+
+  /** True while the layout is still moving. */
+  get settling() {
+    return this.nodes.length > 0 && this.sim.alpha() > 0.012;
   }
 
   /**
    * @param nodes [{id, label, color:'#rrggbb', size, showLabel, pinned, near?:id, shape?: 0 round | 1 diamond,
-   *   stem?: drop a plumb line to the table, data}]
+   *   hub?: draw the second, outer ring, data}]
    * @param links [{source:id, target:id, distance?, strength?}]
    * Positions of nodes that already exist are kept, so the map evolves instead of reshuffling.
    */
@@ -190,6 +244,7 @@ export class Graph3D {
     geo.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
     geo.setAttribute('aSize', new THREE.BufferAttribute(new Float32Array(n), 1));
     geo.setAttribute('aAlpha', new THREE.BufferAttribute(new Float32Array(n), 1));
+    geo.setAttribute('aRing', new THREE.BufferAttribute(new Float32Array(n), 1));
     geo.setAttribute('aShape', new THREE.BufferAttribute(Float32Array.from(this.nodes, (node) => node.shape || 0), 1));
     this.points.geometry.dispose();
     this.points.geometry = geo;
@@ -197,14 +252,9 @@ export class Graph3D {
     this.lines.geometry = beamGeometry(this.links.length);
     this.lines.visible = this.links.length > 0;
 
-    this.stemNodes = this.nodes.filter((node) => node.stem).sort((a, b) => b.size - a.size).slice(0, STEMS);
-    const sgeo = new THREE.BufferGeometry();
-    sgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.stemNodes.length * STEM_FLOATS), 3));
-    sgeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(this.stemNodes.length * STEM_FLOATS), 3));
-    this.stems.geometry.dispose();
-    this.stems.geometry = sgeo;
-
+    // A node that has gone can be neither selected nor hovered.
     if (this.focusId && !this.byId.has(this.focusId)) this.focusId = null;
+    if (this.hoverId && !this.byId.has(this.hoverId)) this.hoverId = null;
     this._paint();
     this._syncLabels();
     // Lay out most of the way before showing a brand-new map, so it doesn't explode on screen.
@@ -212,88 +262,146 @@ export class Graph3D {
     this._writePositions();
   }
 
-  /** Colours, sizes and dimming — recomputed when data, focus or hover changes. */
+  /** Colours, sizes, rings and dimming — recomputed when data, focus or hover changes. */
   _paint() {
     const geo = this.points.geometry;
     if (!geo.attributes.aColor) return; // nothing loaded yet
     const col = geo.attributes.aColor.array;
     const size = geo.attributes.aSize.array;
     const alpha = geo.attributes.aAlpha.array;
+    const ring = geo.attributes.aRing.array;
     const focus = this.focusId;
-    const near = focus ? this.neighbors.get(focus) || new Set() : null;
-    this.nodes.forEach((node, i) => {
-      const lit = !focus || node.id === focus || near.has(node.id);
+    const hover = this.hoverId;
+    const near = focus ? this.neighbors.get(focus) : null;
+    for (let i = 0; i < this.nodes.length; i++) {
+      const node = this.nodes[i];
+      const lit = !focus || node.id === focus || Boolean(near && near.has(node.id));
       node.lit = lit;
-      col.set([node.color.r, node.color.g, node.color.b], i * 3);
-      size[i] = node.size * (node.id === focus ? 1.7 : node.id === this.hoverId ? 1.4 : 1);
-      alpha[i] = lit ? 1 : 0.16;
       node.index = i;
-    });
-    geo.attributes.aColor.needsUpdate = geo.attributes.aSize.needsUpdate = geo.attributes.aAlpha.needsUpdate = true;
+      col[i * 3] = node.color.r; col[i * 3 + 1] = node.color.g; col[i * 3 + 2] = node.color.b;
+      size[i] = node.size * (node.id === focus ? FOCUS_GROW : node.id === hover ? HOVER_GROW : 1);
+      ring[i] = node.id === focus ? 2 : node.id === hover || node.hub ? 1 : 0;
+      alpha[i] = lit ? 1 : 0.16;
+    }
+    geo.attributes.aColor.needsUpdate = geo.attributes.aSize.needsUpdate = geo.attributes.aAlpha.needsUpdate = geo.attributes.aRing.needsUpdate = true;
 
     const cols = this.lines.geometry.userData.cols;
     const lcol = cols.array;
-    this.links.forEach((l, i) => {
+    for (let i = 0; i < this.links.length; i++) {
+      const l = this.links[i];
       const a = typeof l.source === 'object' ? l.source : this.byId.get(l.source);
       const b = typeof l.target === 'object' ? l.target : this.byId.get(l.target);
       const hot = focus && (a.id === focus || b.id === focus);
       const k = focus ? (hot ? 1.6 : 0.12) : 1;
-      lcol.set([a.color.r * k, a.color.g * k, a.color.b * k, b.color.r * k, b.color.g * k, b.color.b * k], i * 6);
-    });
+      const o = i * 6;
+      lcol[o] = a.color.r * k; lcol[o + 1] = a.color.g * k; lcol[o + 2] = a.color.b * k;
+      lcol[o + 3] = b.color.r * k; lcol[o + 4] = b.color.g * k; lcol[o + 5] = b.color.b * k;
+    }
     cols.needsUpdate = true;
-
-    // Plumb lines: brightest where they leave the table, fading on the way up to the node.
-    const scol = this.stems.geometry.attributes.color.array;
-    this.stemNodes.forEach((node, i) => {
-      const k = node.lit ? 1 : 0.15;
-      const r = node.color.r * k, g = node.color.g * k, b = node.color.b * k;
-      const o = i * STEM_FLOATS;
-      scol.set([r * 0.08, g * 0.08, b * 0.08, r * 0.42, g * 0.42, b * 0.42], o);
-      for (let j = 0; j < FOOT * 2; j++) scol.set([r * 0.8, g * 0.8, b * 0.8], o + 6 + j * 3);
-    });
-    this.stems.geometry.attributes.color.needsUpdate = true;
   }
 
   _writePositions() {
     const pos = this.points.geometry.attributes.position.array;
-    let r2 = 0;
-    let low = 0;
-    this.nodes.forEach((n, i) => {
+    let r2 = 0, s2 = 0, low = 0, high = 0;
+    for (let i = 0; i < this.nodes.length; i++) {
+      const n = this.nodes[i];
       pos[i * 3] = n.x; pos[i * 3 + 1] = n.y; pos[i * 3 + 2] = n.z;
-      r2 = Math.max(r2, n.x * n.x + n.y * n.y + n.z * n.z);
-      low = Math.min(low, n.y);
-    });
+      const h2 = n.x * n.x + n.z * n.z;
+      if (h2 > s2) s2 = h2;
+      if (h2 + n.y * n.y > r2) r2 = h2 + n.y * n.y;
+      if (n.y < low) low = n.y;
+      if (n.y > high) high = n.y;
+    }
     this.radius = Math.max(60, Math.sqrt(r2));
+    this.spread = Math.max(40, Math.sqrt(s2));
     this.bottom = low;
+    this.top = high;
     this.points.geometry.attributes.position.needsUpdate = true;
     const ends = this.lines.geometry.userData.ends;
     const lp = ends.array;
-    this.links.forEach((l, i) => {
-      const a = l.source, b = l.target;
-      lp[i * 6] = a.x; lp[i * 6 + 1] = a.y; lp[i * 6 + 2] = a.z;
-      lp[i * 6 + 3] = b.x; lp[i * 6 + 4] = b.y; lp[i * 6 + 5] = b.z;
-    });
+    for (let i = 0; i < this.links.length; i++) {
+      const a = this.links[i].source, b = this.links[i].target;
+      const o = i * 6;
+      lp[o] = a.x; lp[o + 1] = a.y; lp[o + 2] = a.z;
+      lp[o + 3] = b.x; lp[o + 4] = b.y; lp[o + 5] = b.z;
+    }
     ends.needsUpdate = true;
   }
 
-  /** Plumb lines and the small rings where they land. Cheap (at most STEMS nodes), so done every frame. */
-  _writeStems() {
-    const pos = this.stems.geometry.attributes.position.array;
-    const y = this.floorY;
-    const foot = this.radius * 0.014;
-    this.stemNodes.forEach((node, i) => {
-      const o = i * STEM_FLOATS;
-      if (node.y - y < foot * 2) { // at or under the table: nothing to draw
-        pos.fill(0, o, o + STEM_FLOATS);
-        return;
+  /**
+   * Plumb lines for the hovered and the selected node. Each fades in and out (so nothing pops, on a
+   * view switch included), and the buffers are only rewritten for a slot whose node, table or
+   * brightness actually changed.
+   */
+  _updateStems(dt) {
+    const slots = this.stemSlots;
+    const on = this.floorY !== null && this.opacity > 0.01;
+    const want0 = on ? this.focusId : null;
+    const want1 = on && this.hoverId !== this.focusId ? this.hoverId : null;
+    // give each wanted node a slot: a free one, else the faintest one that is on its way out
+    for (let w = 0; w < 2; w++) {
+      const id = w ? want1 : want0;
+      if (id === null) continue;
+      let have = false, pick = -1;
+      for (let i = 0; i < STEM_SLOTS; i++) {
+        const s = slots[i];
+        if (s.id === id) { have = true; break; }
+        if (s.id !== null && (s.id === want0 || s.id === want1)) continue;
+        if (pick < 0 || (slots[pick].id !== null && (s.id === null || s.a < slots[pick].a))) pick = i;
       }
-      pos.set([node.x, node.y, node.z, node.x, y, node.z], o);
-      for (let j = 0; j < FOOT; j++) {
-        const a0 = (j / FOOT) * Math.PI * 2, a1 = ((j + 1) / FOOT) * Math.PI * 2;
-        pos.set([node.x + Math.cos(a0) * foot, y, node.z + Math.sin(a0) * foot, node.x + Math.cos(a1) * foot, y, node.z + Math.sin(a1) * foot], o + 6 + j * 6);
+      if (!have && pick >= 0) {
+        const s = slots[pick];
+        s.id = id; s.a = 0; s.paintedA = -1; s.x = NaN;
       }
-    });
-    this.stems.geometry.attributes.position.needsUpdate = true;
+    }
+
+    const pos = this.stems.geometry.attributes.position;
+    const col = this.stems.geometry.attributes.color;
+    const P = pos.array, C = col.array;
+    const k = 1 - Math.exp(-dt * 9);
+    let any = false, moved = false, painted = false;
+    for (let i = 0; i < STEM_SLOTS; i++) {
+      const s = slots[i];
+      if (s.id === null) continue;
+      const o = i * STEM_VERTS * 3;
+      const node = this.byId.get(s.id);
+      const foot = this.radius * 0.016;
+      const wanted = Boolean(node) && (s.id === want0 || s.id === want1) && node.y - this.floorY > foot * 2;
+      s.a += ((wanted ? 1 : 0) - s.a) * k;
+      if (!wanted && s.a < 0.01) { // faded out: free the slot
+        P.fill(0, o, o + STEM_VERTS * 3);
+        s.id = null; s.a = 0;
+        moved = true;
+        continue;
+      }
+      any = true;
+      if (wanted) s.floor = this.floorY; // while fading out it stays where it stood
+      if (node && (node.x !== s.x || node.y !== s.y || node.z !== s.z || s.floor !== s.pf || foot !== s.foot)) {
+        s.x = node.x; s.y = node.y; s.z = node.z; s.pf = s.floor; s.foot = foot;
+        s.r = node.color.r; s.g = node.color.g; s.b = node.color.b;
+        P[o] = s.x; P[o + 1] = s.y; P[o + 2] = s.z;
+        P[o + 3] = s.x; P[o + 4] = s.floor; P[o + 5] = s.z;
+        for (let j = 0; j < FOOT; j++) {
+          const q = o + 6 + j * 6;
+          P[q] = s.x + CIRCLE[j * 2] * foot; P[q + 1] = s.floor; P[q + 2] = s.z + CIRCLE[j * 2 + 1] * foot;
+          P[q + 3] = s.x + CIRCLE[j * 2 + 2] * foot; P[q + 4] = s.floor; P[q + 5] = s.z + CIRCLE[j * 2 + 3] * foot;
+        }
+        moved = true;
+        s.paintedA = -1;
+      }
+      if (Math.abs(s.a - s.paintedA) > 0.004) { // brightest where it lands, fading on the way up to the node
+        s.paintedA = s.a;
+        const r = s.r * s.a, g = s.g * s.a, b = s.b * s.a;
+        C[o] = r * 0.06; C[o + 1] = g * 0.06; C[o + 2] = b * 0.06;
+        C[o + 3] = r * 0.5; C[o + 4] = g * 0.5; C[o + 5] = b * 0.5;
+        for (let q = o + 6; q < o + STEM_VERTS * 3; q += 3) { C[q] = r * 0.85; C[q + 1] = g * 0.85; C[q + 2] = b * 0.85; }
+        painted = true;
+      }
+    }
+    if (moved) pos.needsUpdate = true;
+    if (painted) col.needsUpdate = true;
+    this.stems.visible = any;
+    this.stemMat.opacity = 0.7 * this.opacity;
   }
 
   show(opacity = 1) {
@@ -317,6 +425,80 @@ export class Graph3D {
     const want = String(text || '').toLowerCase().trim();
     if (!want) return null;
     return this.nodes.find((n) => n.label.toLowerCase() === want) || this.nodes.find((n) => n.label.toLowerCase().includes(want)) || null;
+  }
+
+  // ---- framing ----------------------------------------------------------------
+
+  /**
+   * Where the camera should aim and how far back it should stand so that the map and its table sit
+   * inside a band of the screen, whichever way the map is turned (every node is treated as the ring
+   * it sweeps around the vertical axis).
+   * @param view {sinE: sine of the camera's elevation, tanFov: tan(fov / 2), aspect,
+   *   top / bottom / side: limits in NDC for the nodes, floorY / floorR: the table, floorLimit: lowest its near rim may sit}
+   * @param out {y, dist} — the previous answer on the way in (the solve is iterative), the new one on the way out
+   * @param rounds how many refinement passes to run
+   */
+  frame(view, out, rounds = 8) {
+    const sinE = THREE.MathUtils.clamp(view.sinE, 0.1, 0.8);
+    const cosE = Math.sqrt(1 - sinE * sinE);
+    const t = view.tanFov;
+    const span = view.top - view.bottom;
+    const floorShift = view.bottom - view.floorLimit; // lets the table's own limit be compared on the nodes' scale
+    let ty = Number.isFinite(out.y) ? out.y : 0;
+    let dist = out.dist > 0 ? out.dist : this.radius * 2.7;
+    const nodes = this.nodes;
+    for (let round = 0; round < rounds; round++) {
+      let hi = -Infinity, lo = Infinity, wide = 0;
+      for (let i = -1; i < nodes.length; i++) {
+        // i = -1 is the table's rim
+        const y = i < 0 ? view.floorY : nodes[i].y;
+        const rho = i < 0 ? view.floorR : Math.sqrt(nodes[i].x * nodes[i].x + nodes[i].z * nodes[i].z);
+        const dy = y - ty;
+        const base = dist - dy * sinE;
+        const dn = Math.max(base - rho * cosE, dist * 0.05); // depth when the ring is nearest the camera
+        const df = Math.max(base + rho * cosE, dist * 0.05); // … and furthest
+        const yn = (dy * cosE - rho * sinE) / (dn * t);
+        const yf = (dy * cosE + rho * sinE) / (df * t);
+        if (i < 0) {
+          lo = Math.min(lo, yn + floorShift);
+          continue;
+        }
+        if (yn > hi) hi = yn;
+        if (yf > hi) hi = yf;
+        if (yn < lo) lo = yn;
+        if (yf < lo) lo = yf;
+        const x = rho / (Math.sqrt(Math.max(base * base - rho * rho * cosE * cosE, 1e-6)) * t * view.aspect);
+        if (x > wide) wide = x;
+      }
+      if (hi === -Infinity) { hi = 0; lo = Math.min(lo, 0); }
+      // centre the content in the band, then stand back (or step in) until it just fills it
+      const up = ((view.top - hi) - (lo - view.bottom)) / 2;
+      ty -= (up * t * dist) / cosE;
+      dist = Math.max(view.minDist, dist * Math.max((hi - lo) / span, wide / view.side));
+    }
+    out.y = ty;
+    out.dist = dist;
+    return out;
+  }
+
+  /** How big a node's marker is drawn, as the radius of its outermost ring in CSS pixels. */
+  _markRadius(node, dist, height) {
+    const focus = node.id === this.focusId, hover = node.id === this.hoverId;
+    const px = markPx(node.size * (focus ? FOCUS_GROW : hover ? HOVER_GROW : 1), height, dist);
+    if (px < MARK_DETAIL) return px * 0.3;
+    const corner = node.shape ? DIAMOND * 1.4142 : 1; // a diamond reaches furthest at its points
+    return px * 0.5 * (focus || hover || node.hub ? 0.92 : 0.56) * corner;
+  }
+
+  /** Where a node is on screen (CSS pixels) and how large its marker is drawn. Writes into out {x, y, r, visible}. */
+  screenOf(node, camera, width, height, out) {
+    const dist = camera.position.distanceTo(tmp.set(node.x, node.y, node.z));
+    tmp.project(camera);
+    out.visible = this.opacity > 0.5 && tmp.z > -1 && tmp.z < 1;
+    out.x = (tmp.x * 0.5 + 0.5) * width;
+    out.y = (-tmp.y * 0.5 + 0.5) * height;
+    out.r = this._markRadius(node, dist, height);
+    return out;
   }
 
   // ---- labels ---------------------------------------------------------------
@@ -353,7 +535,7 @@ export class Graph3D {
       el.textContent = node.label;
       el.classList.toggle('major', Boolean(node.showLabel));
       el.classList.toggle('focus', id === this.focusId || id === this.hoverId);
-      el.style.color = `#${node.color.clone().lerp(new THREE.Color('#ffffff'), 0.45).getHexString()}`;
+      el.style.color = `#${node.color.clone().lerp(WHITE, 0.45).getHexString()}`;
     }
   }
 
@@ -361,20 +543,22 @@ export class Graph3D {
     const visible = this.labelsOn && this.opacity > 0.5;
     for (const [id, el] of this.labelEls) {
       const node = this.byId.get(id);
-      tmp.set(node.x, node.y, node.z).project(camera);
+      if (!node) { // gone from the data; its label goes at the next sync
+        el.style.opacity = 0;
+        continue;
+      }
       const dim = this.focusId && !node.lit;
+      const dist = camera.position.distanceTo(tmp.set(node.x, node.y, node.z));
+      tmp.project(camera);
       if (!visible || tmp.z > 1 || dim) {
         el.style.opacity = 0;
         continue;
       }
-      const dist = camera.position.distanceTo(tmp.set(node.x, node.y, node.z));
-      tmp.project(camera);
       const fade = id === this.focusId || id === this.hoverId ? 1 : THREE.MathUtils.clamp(1.5 - dist / (this.radius * 2.4), 0.15, 0.95);
       el.style.opacity = fade * this.opacity;
-      // keep the text clear of the marker's ring, however large the marker is drawn
-      const size = node.size * (id === this.focusId ? 1.7 : id === this.hoverId ? 1.4 : 1);
-      const ring = THREE.MathUtils.clamp((size * height * MARK_SCALE) / dist, MARK_MIN, MARK_MAX) * 0.35;
-      el.style.transform = `translate(${(tmp.x * 0.5 + 0.5) * width + Math.max(0, ring - 6)}px, ${(-tmp.y * 0.5 + 0.5) * height}px)`;
+      // the text starts just outside the marker's outermost ring, however large the marker is drawn
+      const clear = this._markRadius(node, dist, height) + 5;
+      el.style.transform = `translate(${((tmp.x * 0.5 + 0.5) * width + clear).toFixed(1)}px, ${((-tmp.y * 0.5 + 0.5) * height).toFixed(1)}px)`;
     }
   }
 
@@ -399,7 +583,9 @@ export class Graph3D {
     return best;
   }
 
-  update(dt, camera, width, height) {
+  /** @param width, height the viewport in CSS pixels  @param pixelRatio the renderer's pixel ratio */
+  update(dt, camera, width, height, pixelRatio = 1) {
+    this.time += dt;
     this.opacity += (this.targetOpacity - this.opacity) * (1 - Math.exp(-dt * 5));
     if (Math.abs(this.targetOpacity - this.opacity) < 0.003) this.opacity = this.targetOpacity;
     this.group.visible = this.opacity > 0.01;
@@ -407,19 +593,17 @@ export class Graph3D {
       this.sim.tick();
       this._writePositions();
     }
+    this._updateStems(dt);
     if (!this.group.visible) {
       for (const el of this.labelEls.values()) el.style.opacity = 0;
       return;
     }
     this.pointsMat.uniforms.uScale.value = height * MARK_SCALE;
+    this.pointsMat.uniforms.uPr.value = pixelRatio;
     this.pointsMat.uniforms.uOpacity.value = this.opacity;
+    this.pointsMat.uniforms.uSpin.value = (this.time * 0.4) % (Math.PI * 4); // the selected marker's ring turns slowly
     this.lineMat.uniforms.uRes.value.set(width, height);
     this.lineMat.uniforms.uOpacity.value = this.opts.linkOpacity * this.opacity;
-    this.stems.visible = this.floorY !== null && this.stemNodes.length > 0;
-    if (this.stems.visible) {
-      this._writeStems();
-      this.stemMat.opacity = 0.5 * this.opacity;
-    }
     this._placeLabels(camera, width, height);
   }
 }

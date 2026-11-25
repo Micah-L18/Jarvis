@@ -1,7 +1,9 @@
 // The projection table. Everything Jarvis shows is thrown up into the room from an emitter disc
-// beneath it: concentric rings, gauge ticks and a polar grid drawn in thin additive light, a cone
-// of light rising from the lens, and a final screen pass that gives the picture its room
-// (dark graphite, not black) and its scan lines. The whole stage is three draw calls.
+// beneath it, drawn in thin additive light, with a cone of light rising from the lens. Under the
+// orb (Core) the disc is a full instrument: rings, gauge ticks, a polar grid. Under a map it is
+// pared back to a ticked rim, one inner ring and the glow of the lens, so it never competes with
+// the data. A final screen pass gives the picture its room (dark, warm at the centre) and its scan
+// lines. The whole stage is three draw calls.
 import * as THREE from 'three';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 
@@ -11,13 +13,22 @@ const TAU = Math.PI * 2;
 // Emitter disc
 // ---------------------------------------------------------------------------
 
+// Where the caption and the hint sit (bottom centre of the window): the table's light is faded out
+// behind them, so the words stand on clean dark background. uRes is the drawing buffer's size.
+const CAPTION_MASK = /* glsl */ `
+  float captionMask(vec2 res){
+    vec2 sc = gl_FragCoord.xy / res;
+    return 1.0 - 0.96 * (1.0 - smoothstep(0.135, 0.19, sc.y)) * (1.0 - smoothstep(0.3, 0.4, abs(sc.x - 0.5)));
+  }`;
+
 const FLOOR_VERT = /* glsl */ `
-  attribute float aSpin; attribute float aAlpha; attribute float aRise;
-  uniform float uTime;
+  attribute float aSpin; attribute float aAlpha; attribute float aRise; attribute float aDetail;
+  uniform float uTime; uniform float uDetail;
   varying float vA; varying float vR;
   void main(){
     vec3 q = position;
-    float a = aAlpha;
+    float a = aAlpha * mix(1.0, uDetail, aDetail);          // instrument detail is only drawn under the orb
+    vR = length(position.xz);
     if (aRise > 0.0) {
       // a ring climbing the light cone, widening with it and thinning out as it goes
       float y = fract(position.y + uTime * aRise);
@@ -29,17 +40,19 @@ const FLOOR_VERT = /* glsl */ `
     float c = cos(ang), s = sin(ang);
     q = vec3(q.x * c - q.z * s, q.y, q.x * s + q.z * c);
     vA = a;
-    vR = length(q.xz);
     gl_Position = projectionMatrix * modelViewMatrix * vec4(q, 1.0);
   }`;
 const FLOOR_FRAG = /* glsl */ `
-  uniform vec3 uColor; uniform float uOpacity; uniform float uTime;
+  uniform vec3 uColor; uniform float uOpacity; uniform float uTime; uniform float uFar; uniform vec2 uRes;
   varying float vA; varying float vR;
+  ${CAPTION_MASK}
   void main(){
     // a slow ripple of light leaving the lens and crossing the disc
     float wave = fract(uTime * 0.07) * 1.5;
     float pulse = smoothstep(0.16, 0.0, abs(vR - wave)) * (1.0 - wave / 1.5);
     float a = vA * uOpacity * (1.0 + pulse * 1.1);
+    a *= mix(1.0, uFar, smoothstep(0.1, 0.3, vR));          // the big arcs step back when the viewer is in among them
+    a *= captionMask(uRes);
     vec3 col = mix(uColor, mix(uColor, vec3(1.0), 0.65), clamp(vA, 0.0, 1.0) * 0.55);
     gl_FragColor = vec4(col, a);
   }`;
@@ -51,6 +64,8 @@ class Sketch {
     this.spin = [];
     this.alpha = [];
     this.rise = [];
+    this.det = [];
+    this.detail = 0; // 1 while sketching instrument detail (shown under the orb only)
   }
 
   v(x, y, z, spin, alpha, rise = 0) {
@@ -58,6 +73,7 @@ class Sketch {
     this.spin.push(spin);
     this.alpha.push(alpha);
     this.rise.push(rise);
+    this.det.push(this.detail);
   }
 
   /** Arc of a circle as line segments. from/to are fractions of a turn. */
@@ -112,20 +128,28 @@ class Sketch {
     geo.setAttribute('aSpin', new THREE.Float32BufferAttribute(this.spin, 1));
     geo.setAttribute('aAlpha', new THREE.Float32BufferAttribute(this.alpha, 1));
     geo.setAttribute('aRise', new THREE.Float32BufferAttribute(this.rise, 1));
+    geo.setAttribute('aDetail', new THREE.Float32BufferAttribute(this.det, 1));
     return geo;
   }
 }
 
 function emitterLines() {
   const s = new Sketch();
-  // the lens
+  // Always there: the lens, one inner ring, and the rim — a full gauge circle with measurement ticks.
   s.arc(0.045, 0, 0.95);
+  s.arc(0.5, 0, 0.3);
+  s.arc(1.0, 0.035, 0.6);
+  s.ticks(1.0, 0.018, 180, 0.035, 0.6, 5);
+  s.ticks(1.0, 0.07, 12, 0.035, 0.75, 1);
+
+  // Everything below is instrument detail, drawn under the orb only.
+  s.detail = 1;
   s.arc(0.085, 0.5, 0.7, 0.02, 0.3); s.arc(0.085, 0.5, 0.7, 0.36, 0.63); s.arc(0.085, 0.5, 0.7, 0.69, 0.97);
   s.arc(0.13, 0, 0.5);
   s.ticks(0.13, 0.012, 24, 0, 0.6, 3);
 
   // polar grid, fixed to the table and fading toward the rim
-  for (const [r, a] of [[0.25, 0.3], [0.5, 0.24], [0.75, 0.17]]) s.arc(r, 0, a);
+  for (const [r, a] of [[0.25, 0.3], [0.75, 0.17]]) s.arc(r, 0, a);
   for (let i = 0; i < 12; i++) s.spoke((i / 12) * TAU, 0.13, 1.0, 0, 0.3, 0.08);
   for (let i = 0; i < 36; i++) if (i % 3) s.spoke((i / 36) * TAU, 0.75, 1.0, 0, 0.13, 0.05);
 
@@ -137,11 +161,6 @@ function emitterLines() {
   s.arc(0.62, -0.06, 0.62, 0.0, 0.2); s.arc(0.62, -0.06, 0.62, 0.25, 0.46); s.arc(0.62, -0.06, 0.62, 0.5, 0.7); s.arc(0.62, -0.06, 0.62, 0.76, 0.96);
   s.arc(0.635, -0.06, 0.3, 0.05, 0.16); s.arc(0.635, -0.06, 0.3, 0.55, 0.66);
   s.ticks(0.62, -0.016, 96, -0.06, 0.5, 4, (i) => i % 24 > 19);
-
-  // rim: a full gauge circle with measurement ticks
-  s.arc(1.0, 0.035, 0.6);
-  s.ticks(1.0, 0.018, 180, 0.035, 0.6, 5);
-  s.ticks(1.0, 0.07, 12, 0.035, 0.75, 1);
 
   // outer brackets, drifting back
   for (let i = 0; i < 6; i++) s.arc(1.1, -0.02, 0.36, i / 6 + 0.02, i / 6 + 0.11);
@@ -156,8 +175,9 @@ function emitterFills() {
   const s = new Sketch();
   s.band(0.0, 0.045, 0, 0.9, 0.8); // lens
   s.band(0.045, 0.4, 0, 0.22, 0.0); // light pooled around it
-  s.band(0.0, 1.0, 0, 0.05, 0.0); // the faintest wash, so the disc reads as a surface
-  // translucent bands riding the rings
+  s.band(0.0, 1.0, 0, 0.04, 0.0); // the faintest wash, so the disc reads as a surface
+  // translucent bands riding the instrument rings
+  s.detail = 1;
   for (const [from, to] of [[0.03, 0.2], [0.4, 0.52], [0.7, 0.9]]) s.band(0.385, 0.415, 0.11, 0.17, 0.17, from, to);
   for (const [from, to] of [[0.08, 0.18], [0.3, 0.43], [0.58, 0.64], [0.8, 0.93]]) s.band(0.655, 0.675, -0.06, 0.12, 0.12, from, to);
   for (let i = 0; i < 4; i++) s.band(1.045, 1.062, 0.035, 0.07, 0.07, i / 4 + 0.03, i / 4 + 0.17);
@@ -169,35 +189,38 @@ function emitterFills() {
 // ---------------------------------------------------------------------------
 
 const CONE_VERT = /* glsl */ `
-  varying vec3 vN; varying vec3 vV; varying float vH; varying float vAng;
+  varying vec3 vN; varying vec3 vV; varying float vH; varying vec2 vXZ;
   void main(){
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     vN = normalMatrix * normal;
     vV = -mv.xyz;
     vH = uv.y;
-    vAng = atan(position.z, position.x);
+    vXZ = position.xz; // the angle is taken per fragment: interpolating it would smear across its branch cut
     gl_Position = projectionMatrix * mv;
   }`;
 const CONE_FRAG = /* glsl */ `
-  uniform vec3 uColor; uniform float uOpacity; uniform float uTime;
-  varying vec3 vN; varying vec3 vV; varying float vH; varying float vAng;
+  uniform vec3 uColor; uniform float uOpacity; uniform float uTime; uniform vec2 uRes;
+  varying vec3 vN; varying vec3 vV; varying float vH; varying vec2 vXZ;
+  ${CAPTION_MASK}
   void main(){
     // thick through the middle, vanishing at the silhouette: reads as a volume of lit air
     float body = pow(abs(dot(normalize(vN), normalize(vV))), 1.4);
     float h = pow(1.0 - vH, 1.7);
-    float rays = 0.72 + 0.28 * sin(vAng * 18.0 + uTime * 0.12) * sin(vAng * 7.0 - uTime * 0.07);
-    gl_FragColor = vec4(uColor, body * h * rays * uOpacity);
+    float ang = atan(vXZ.y, vXZ.x);
+    float rays = 0.72 + 0.28 * sin(ang * 18.0 + uTime * 0.12) * sin(ang * 7.0 - uTime * 0.07);
+    gl_FragColor = vec4(uColor, body * h * rays * uOpacity * captionMask(uRes));
   }`;
 
 /**
  * An open, upward-widening cone of faint light. Unit height, base at y = 0.
- * Returns the mesh; drive `material.uniforms.uOpacity / uTime / uColor`.
+ * Returns the mesh; drive `material.uniforms.uOpacity / uTime / uColor`. uRes (the drawing buffer's
+ * size) switches on the fade behind the caption; left at its default the cone is drawn everywhere.
  */
 export function lightCone({ bottom = 0.2, top = 0.78, color = '#ff9a2e', opacity = 0.2 } = {}) {
   const geo = new THREE.CylinderGeometry(top, bottom, 1, 48, 1, true);
   geo.translate(0, 0.5, 0);
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uColor: { value: new THREE.Color(color) }, uOpacity: { value: opacity }, uTime: { value: 0 } },
+    uniforms: { uColor: { value: new THREE.Color(color) }, uOpacity: { value: opacity }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) } },
     vertexShader: CONE_VERT, fragmentShader: CONE_FRAG,
     transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, side: THREE.DoubleSide,
   });
@@ -210,45 +233,66 @@ export function lightCone({ bottom = 0.2, top = 0.78, color = '#ff9a2e', opacity
 // Stage
 // ---------------------------------------------------------------------------
 
+const EASED = ['y', 'radius', 'height', 'opacity', 'cone', 'detail'];
+const CONE_BOTTOM = 0.2, CONE_TOP = 0.78; // the cone's radius at the table and at its top, in disc radii
+const smooth = (x, a, b) => THREE.MathUtils.smoothstep(x, a, b);
+
 export class Stage {
   constructor() {
     this.group = new THREE.Group();
     this.time = 0;
     this.color = new THREE.Color('#ff9a2e');
-    this.cur = null; // {y, radius, height, opacity}
+    this.cur = null; // {y, radius, height, opacity, cone, detail}
     this.floorMat = new THREE.ShaderMaterial({
-      uniforms: { uColor: { value: this.color }, uOpacity: { value: 0 }, uTime: { value: 0 } },
+      uniforms: { uColor: { value: this.color }, uOpacity: { value: 0 }, uTime: { value: 0 }, uDetail: { value: 1 }, uFar: { value: 1 }, uRes: { value: new THREE.Vector2(1, 1) } },
       vertexShader: FLOOR_VERT, fragmentShader: FLOOR_FRAG,
       transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, side: THREE.DoubleSide,
     });
     this.lines = new THREE.LineSegments(emitterLines(), this.floorMat);
     this.fills = new THREE.Mesh(emitterFills(), this.floorMat);
-    this.cone = lightCone();
+    this.cone = lightCone({ bottom: CONE_BOTTOM, top: CONE_TOP });
     this.cone.material.uniforms.uColor.value = this.color;
+    this.cone.material.uniforms.uRes.value = this.floorMat.uniforms.uRes.value;
     for (const o of [this.fills, this.cone, this.lines]) {
       o.frustumCulled = false;
       this.group.add(o);
     }
   }
 
+  /** The drawing buffer's size in pixels (for the fade behind the caption). */
+  setSize(width, height) {
+    this.floorMat.uniforms.uRes.value.set(width, height);
+  }
+
   /**
-   * @param target {y, radius, height, opacity, color: THREE.Color} — where the disc should sit (world y),
-   *   how wide it is, how far up the light reaches, and what colour it throws.
+   * @param target {y, radius, height, opacity, cone, detail, color: THREE.Color} — where the disc sits
+   *   (world y), how wide it is, how far up the light reaches, how bright the disc and the cone are,
+   *   how much instrument detail the disc carries (0..1), and what colour it throws.
+   * @param eye the camera's world position: when the viewer is inside the cone of light, or in
+   *   close over the table, the haze and the big arcs fade so they do not wash over the picture.
    */
-  update(dt, target) {
+  update(dt, target, eye) {
     this.time += dt;
-    if (!this.cur) this.cur = { y: target.y, radius: target.radius, height: target.height, opacity: 0 };
+    if (!this.cur) this.cur = { y: target.y, radius: target.radius, height: target.height, opacity: 0, cone: target.cone, detail: target.detail };
     const k = 1 - Math.exp(-dt * 3.2);
     const c = this.cur;
-    for (const key of ['y', 'radius', 'height', 'opacity']) c[key] += (target[key] - c[key]) * k;
+    for (let i = 0; i < EASED.length; i++) c[EASED[i]] += (target[EASED[i]] - c[EASED[i]]) * k;
     this.color.lerp(target.color, k);
     this.group.position.y = c.y;
     this.group.scale.set(c.radius, c.height, c.radius);
     this.group.visible = c.opacity > 0.01;
+
+    const up = eye.y - c.y;
+    const out = Math.hypot(eye.x, eye.z);
+    const coneR = c.radius * (CONE_BOTTOM + (CONE_TOP - CONE_BOTTOM) * THREE.MathUtils.clamp(up / c.height, 0, 1));
+    const clear = Math.min(smooth(out / coneR, 1.15, 2.6), smooth(Math.hypot(out, up) / c.radius, 1.6, 3.4));
+
     this.floorMat.uniforms.uTime.value = this.time;
     this.floorMat.uniforms.uOpacity.value = c.opacity;
+    this.floorMat.uniforms.uDetail.value = c.detail;
+    this.floorMat.uniforms.uFar.value = 0.1 + 0.9 * clear;
     this.cone.material.uniforms.uTime.value = this.time;
-    this.cone.material.uniforms.uOpacity.value = c.opacity * 0.22;
+    this.cone.material.uniforms.uOpacity.value = c.opacity * c.cone * clear;
   }
 }
 
@@ -277,18 +321,22 @@ const SCREEN = {
       vec3 c = texture2D(tDiffuse, vUv).rgb;
       float aspect = uRes.x / uRes.y;
 
-      // Hologram texture. Both are multiplied in, so they only show where light already is.
+      // Hologram texture: fine scan lines, as deep as the projected light at that pixel is bright,
+      // so they texture the hologram itself and never band the empty room or the soft glow around it.
+      float lit = smoothstep(0.03, 0.3, max(c.r, max(c.g, c.b)));
       float row = mod(floor(gl_FragCoord.y / uPixel), 3.0);
-      c *= row < 1.0 ? 0.82 : 1.0;                                   // fine scan lines
+      c *= 1.0 - 0.2 * lit * step(row, 0.5);
       float sweep = fract(uTime / 11.0) * 1.3 - 0.15;                 // one slow pass up the picture
       c *= 1.0 + 0.2 * smoothstep(0.09, 0.0, abs(vUv.y - sweep));
 
-      // The room: warm graphite, lit a little by the projector, falling off into the corners.
+      // The room: dark, a little warmth at the centre falling away to nothing in the corners,
+      // and the faintest spill of the emitter's colour above the table.
       vec2 p = (vUv - vec2(0.5, 0.46)) * vec2(aspect, 1.0);
       float fall = smoothstep(1.15, 0.05, length(p));
-      vec3 room = vec3(0.0108, 0.0096, 0.0088) * (0.3 + 0.7 * fall);
+      vec3 room = vec3(0.0034, 0.0025, 0.0019) * (0.12 + 0.88 * fall * fall);
       vec2 q = (vUv - vec2(0.5, 0.30)) * vec2(aspect * 0.8, 1.5);
-      room += uTint * 0.0052 * smoothstep(0.75, 0.0, length(q));     // spill from the emitter
+      float spill = smoothstep(0.75, 0.0, length(q));
+      room += uTint * 0.0022 * spill * spill;
       // The hologram is held back a little behind the captions and the top bar, so the words always win.
       float strip = (1.0 - smoothstep(0.04, 0.2, vUv.y)) * smoothstep(0.42, 0.26, abs(vUv.x - 0.5));
       float bar = smoothstep(0.87, 0.96, vUv.y);
