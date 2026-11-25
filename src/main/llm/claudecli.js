@@ -95,6 +95,7 @@ export function describeCliError(err) {
     case 'busy': return 'The cloud model is having trouble right now. Give it a moment.';
     case 'offline': return 'I could not reach the cloud model. Check the internet connection, or switch me to the local model.';
     case 'unsafe': return 'Claude Code offered tools I did not ask for, so I stopped. Update Claude Code, or switch me to an API key.';
+    case 'missing_package': return 'A part of me is not installed yet. Run npm install in the Jarvis folder, then start me again.';
     default: return `The cloud model returned an error: ${detail || err?.message || String(err)}`;
   }
 }
@@ -310,7 +311,15 @@ export class ClaudeCli {
   }
 
   async load() {
-    if (!this.sdk) this.sdk = await import('@anthropic-ai/claude-agent-sdk');
+    if (!this.sdk) {
+      try {
+        this.sdk = await import('@anthropic-ai/claude-agent-sdk');
+      } catch (err) {
+        // New code pulled without `npm install`: say so instead of reading out a module path.
+        if (err?.code === 'ERR_MODULE_NOT_FOUND') throw new CliError('missing_package');
+        throw err;
+      }
+    }
     return this.sdk;
   }
 
