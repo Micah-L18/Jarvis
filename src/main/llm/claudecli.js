@@ -32,8 +32,9 @@ const NEVER = [
 const MAX_STEPS = 24;
 // verbatimPrompts (speech is never read as a /command or an @file) needs at least this.
 export const MIN_VERSION = '2.1.248';
-// Background filing: the fastest model first; the next one only if the login does not offer it.
-const EXTRACT_MODELS = ['claude-haiku-5-5', 'claude-sonnet-5-5'];
+// Background filing, quickest first; the next one only if the login does not offer it. Through the
+// CLI a structured answer takes Sonnet about 3.4 s and Haiku about 4.5 s (Haiku is lighter on the plan).
+const EXTRACT_MODELS = ['claude-sonnet-5-5', 'claude-haiku-5-5'];
 
 // How a turn is laid out for a process that keeps no conversation of its own.
 const LAYOUT = `How messages reach you

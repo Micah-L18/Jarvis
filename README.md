@@ -16,16 +16,22 @@ npm start
 
 `npm run dev` opens it in a window instead of full screen. F11 (or `F`) toggles full screen.
 
-Requires Node 20+. The first launch downloads the speech models (about 170 MB, once) — you'll see progress in the top-left corner.
+Requires Node 20+. The first launch downloads the speech models (about 170 MB, once) — you'll see progress in the top-left corner. `npm install` also brings the Claude Agent SDK with its own copy of Claude Code (about 400 MB); Jarvis prefers the `claude` you already have and falls back to that copy.
 
 ### Give it a brain
 
-Press **Tab** to open the controls, then under **Brain** pick one:
+If you use [Claude Code](https://claude.com/claude-code) and are signed in to it, there is nothing to set up: Jarvis thinks through that sign-in. No API key.
 
-- **Cloud** — paste an Anthropic API key. Uses Claude (Opus 5.5 by default; Sonnet, Haiku and Fable are in the dropdown). The key is stored encrypted with your OS keychain.
+Press **Tab** to open the controls to change it. Under **Brain**:
+
+- **Cloud** — Claude (Opus 5.5 by default; Sonnet, Haiku and Fable are in the dropdown; Haiku answers soonest). **Sign in with** chooses how:
+  - **Claude login (Claude Code CLI)**, the default. Jarvis runs the `claude` program on your computer and uses the account it is signed in to, so replies count against that plan's limits. The line underneath says what it found — `Claude Code 2.1.332 found · signed in` — or what to do: install the CLI, or run `claude` in a terminal and sign in, then press **Re-check**. If `claude` is somewhere unusual, put its location in **Path to claude**.
+  - **API key** — paste an Anthropic API key instead. It is stored encrypted with your OS keychain.
 - **Local** — install [Ollama](https://ollama.com), pull a model that supports tools (`ollama pull qwen3`), and choose it from the list. Nothing leaves your machine.
 
-You can flip between them at any time from the chip in the top-left corner; the conversation and memory carry over.
+You can flip between cloud and local at any time from the chip in the top-left corner; the conversation and memory carry over. The chip also says when the cloud brain cannot answer yet (`signed out`, `no Claude Code`, `no API key`).
+
+With the Claude login, Jarvis uses Claude Code only as a way to reach the model. The model gets Jarvis's own tools and, with Internet access on, web search and page fetching — never Claude Code's shell, file editing or agents, and nothing from your Claude Code settings, instructions, hooks, skills, plugins or MCP servers. Jarvis's conversations do not appear among your Claude Code sessions. The sign-in is yours and for your own use; Anthropic's terms do not let an app hand a Claude login on to other people.
 
 ## Talking to it
 
@@ -74,7 +80,8 @@ Long work — a practice plan, research notes, a dataset — is written as a mar
 ## Privacy
 
 - Local mode: everything stays on the machine.
-- Cloud mode: what you say, the memory summary, and tool results (including any file contents Jarvis reads at your request) are sent to Anthropic.
+- Cloud mode: what you say, the memory summary, and tool results (including any file contents Jarvis reads at your request) are sent to Anthropic — through your Claude login or your API key, whichever is chosen.
+- With the Claude login, the Claude Code program adds a little of its own to each request: the account's email address, and a note of the operating system, the date and the (empty) folder inside Jarvis's data folder that it runs in. Pages are fetched from this computer rather than by Anthropic. It keeps no transcript, and nothing is remembered between one reply and the next except what Jarvis's own memory puts in front of it — so what you delete is gone there too.
 - File tools are confined to the folder you choose; they can read and open, never write or delete. Jarvis only writes inside its own project folders.
 - All data lives in the app's data folder (shown under System in the controls).
 
@@ -86,6 +93,6 @@ npm test
 
 ```
 src/main/        Electron main process: agent loop, memory graph, tools, MCP, file scan, speech process
-src/main/llm/    The two brains: Anthropic (cloud) and Ollama (local)
+src/main/llm/    The brains: Claude through the Claude Code login or an API key (cloud), Ollama (local)
 src/renderer/    The window: hologram, 3D graphs, voice loop, HUD and controls
 ```

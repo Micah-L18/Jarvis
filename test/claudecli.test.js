@@ -398,16 +398,16 @@ test('claude cli: finding Claude Code and reading its sign-in', async () => {
   for (const p of ['C:\\Users\\ana\\.local\\bin\\claude.exe', 'C:\\Users\\ana\\AppData\\Roaming\\npm\\claude.cmd']) assert.equal(win.includes(p), true, p);
 });
 
-test('claude cli: background filing asks for JSON on the fastest model the login has', async () => {
+test('claude cli: background filing asks for JSON on the quickest model the login has', async () => {
   const schema = { type: 'object', properties: { nodes: { type: 'array' } }, required: ['nodes'] };
   const { cli, sdk } = makeCli(async function* (run) {
     yield init(run.options);
-    if (run.options.model === 'claude-haiku-5-5') { yield cliSays('model_not_found', 'not on this plan'); yield done({ is_error: true }); return; }
+    if (run.options.model === 'claude-sonnet-5-5') { yield cliSays('model_not_found', 'not on this plan'); yield done({ is_error: true }); return; }
     if (run.prompt === 'nothing') { yield done({ structured_output: undefined }); return; }
     yield done({ structured_output: { nodes: [{ label: 'Budget' }] } });
   });
   assert.deepEqual(await cli.extractJson({ system: 'Extract.', user: 'the exchange', schema, fallbackModel: 'claude-opus-5-5' }), { nodes: [{ label: 'Budget' }] });
-  assert.deepEqual(sdk.runs.map((r) => r.options.model), ['claude-haiku-5-5', 'claude-sonnet-5-5']);
+  assert.deepEqual(sdk.runs.map((r) => r.options.model), ['claude-sonnet-5-5', 'claude-haiku-5-5']);
   const o = sdk.runs[1].options;
   assert.deepEqual([o.effort, o.systemPrompt, o.outputFormat, o.thinking], ['low', 'Extract.', { type: 'json_schema', schema }, { type: 'disabled' }]);
   assert.deepEqual([o.tools, o.allowedTools, o.mcpServers, o.settingSources, o.persistSession, o.includePartialMessages], [[], [], {}, [], false, false]);
@@ -415,7 +415,7 @@ test('claude cli: background filing asks for JSON on the fastest model the login
   assert.equal(sdk.runs[1].prompt, 'the exchange');
 
   assert.equal(await cli.extractJson({ system: 'Extract.', user: 'nothing', schema }), null);
-  assert.equal(sdk.runs.at(-1).options.model, 'claude-sonnet-5-5', 'the model that was missing is not tried again');
+  assert.equal(sdk.runs.at(-1).options.model, 'claude-haiku-5-5', 'the model that was missing is not tried again');
 });
 
 // ---- through the Agent --------------------------------------------------------------------------
