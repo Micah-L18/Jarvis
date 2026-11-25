@@ -1,0 +1,26 @@
+{
+  "name": "jarvis",
+  "version": "0.1.0",
+  "description": "A voice-first personal AI with 3D mind maps of what it knows and of your file system.",
+  "main": "src/main/main.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node build.mjs && electron .",
+    "dev": "node build.mjs && electron . --windowed",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "electron": "^45.5.0",
+    "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.14.0",
+    "@huggingface/transformers": "^3.8.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "d3-force-3d": "^3.0.6",
+    "kokoro-js": "^1.2.1",
+    "three": "^0.187.0"
+  }
+}

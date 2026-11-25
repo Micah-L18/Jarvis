@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' blob:; worker-src blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' blob:">
+  <title>J.A.R.V.I.S.</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <canvas id="space"></canvas>
+  <div id="labels"></div>
+
+  <header id="hud-top">
+    <div id="brand">
+      <div class="wordmark">J.A.R.V.I.S.</div>
+      <div id="chips">
+        <button class="chip" id="chip-brain" title="Switch between cloud and local AI"></button>
+        <button class="chip" id="chip-net" title="Turn internet access on or off"></button>
+        <button class="chip" id="chip-mic" title="Mute or unmute the microphone (M)"></button>
+      </div>
+      <div id="status-line"></div>
+    </div>
+    <nav id="views">
+      <button data-view="core">Core</button>
+      <button data-view="mind">Mind</button>
+      <button data-view="files">Files</button>
+    </nav>
+    <div id="top-actions">
+      <button id="btn-full" title="Full screen (F11)">⛶</button>
+      <button id="btn-panel" title="Controls (Tab)">☰</button>
+    </div>
+  </header>
+
+  <aside id="card" hidden></aside>
+  <div id="toasts"></div>
+
+  <footer id="talk">
+    <div id="said-user"></div>
+    <div id="said-jarvis"></div>
+    <div id="tool-line"></div>
+    <form id="type-form" hidden>
+      <input id="type-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type to Jarvis…">
+    </form>
+    <div id="hint">Just talk · hold Space to push-to-talk · / to type · Tab for controls</div>
+  </footer>
+
+  <aside id="panel" hidden></aside>
+  <script type="module" src="../../dist/renderer.js"></script>
+</body>
+</html>
