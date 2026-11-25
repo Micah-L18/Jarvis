@@ -19,6 +19,23 @@ const progress = (what) => (p) => {
 let asr;
 const getAsr = () => (asr ||= pipeline('automatic-speech-recognition', 'onnx-community/whisper-base.en', { dtype: 'q8', device: 'cpu', progress_callback: progress('listening') }));
 
+// Live captions use the tiny Whisper, fetched the first time they are wanted (124 MB, once).
+// Integer encoder, full-precision decoder: on a CPU that mix was the quickest of the four.
+// Until it is ready, captions are simply not shown — nothing waits for it.
+let tiny = null;
+let tinyLoading = null;
+let tinyFailedAt = -Infinity;
+function getTiny() {
+  if (tiny || tinyLoading || Date.now() - tinyFailedAt < 10 * 60e3) return tiny;
+  tinyLoading = pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny.en', {
+    dtype: { encoder_model: 'q8', decoder_model_merged: 'fp32' }, device: 'cpu', progress_callback: progress('captions'),
+  }).then((model) => { tiny = model; }, () => {
+    tinyFailedAt = Date.now();
+    post({ type: 'status', what: 'captions', failed: true });
+  }).finally(() => { tinyLoading = null; });
+  return null;
+}
+
 // The voice comes in two sizes. The full-precision one speaks about 2.5 times faster on a CPU
 // (the small one is built from integer operations that run slowly), but it is a 325 MB download
 // against 92 MB. So: start on whichever is already here, fetch the fast one in the background
@@ -79,14 +96,101 @@ const handlers = {
   },
 };
 
+// Long recordings go through in slices of up to 28 seconds — one Whisper window each — and each
+// slice is its own job on the chain, so what the user says meanwhile is heard between slices.
+// Slices end at the quietest moment of their last five seconds so a word is not cut in two.
+// (Whisper's own chunking, and timestamps, both dropped whole sentences in testing.)
+// `abort_long` stops a job before its next slice.
+const RATE = 16000;
+const SLICE = 28 * RATE;
+const abortedLong = new Set();
+function quietest(audio, from, to) {
+  const win = RATE / 10;
+  let best = to;
+  let bestEnergy = Infinity;
+  for (let i = from; i + win <= to; i += win / 2) {
+    let e = 0;
+    for (let j = i; j < i + win; j++) e += audio[j] * audio[j];
+    if (e < bestEnergy) {
+      bestEnergy = e;
+      best = i + win / 2;
+    }
+  }
+  return Math.round(best);
+}
+async function transcribeLong(id, { audio }) {
+  audio = audio instanceof Float32Array ? audio : new Float32Array(audio);
+  const chunks = [];
+  try {
+    for (let start = 0; start < audio.length;) {
+      if (abortedLong.has(id)) throw new Error('Transcription stopped.');
+      let end = Math.min(audio.length, start + SLICE);
+      if (end < audio.length) end = quietest(audio, end - 5 * RATE, end);
+      const piece = audio.slice(start, end);
+      const out = await enqueue(async () => (abortedLong.has(id) ? null : (await getAsr())(piece)));
+      if (!out) throw new Error('Transcription stopped.');
+      const text = (out.text || '').trim();
+      if (text && !JUNK.test(text)) chunks.push({ text, timestamp: [start / RATE, end / RATE] });
+      start = end;
+      post({ type: 'status', what: 'transcript', job: id, at: start / RATE, of: audio.length / RATE });
+    }
+    post({ type: 'result', id, value: { text: chunks.map((c) => c.text).join(' '), chunks } });
+  } catch (err) {
+    post({ type: 'status', what: 'transcript', job: id, stopped: true });
+    post({ type: 'result', id, error: err?.message || String(err) });
+  } finally {
+    abortedLong.delete(id);
+  }
+}
+function enqueue(fn) {
+  waiting++;
+  const job = chain.then(() => { waiting--; return fn(); });
+  chain = job.catch(() => {});
+  return job;
+}
+
+// A live caption of what the user has said so far. It must never hold up real work: it is skipped
+// when anything else is waiting or a newer one has come in, and stops mid-sentence if a job arrives
+// while it runs (only the encoder pass, a few hundred ms, cannot be cut short).
+const STOP = new Error('caption overtaken');
+let partials = 0;
+function partial(id, { audio }) {
+  const mine = ++partials;
+  const model = getTiny();
+  const skip = () => mine !== partials || waiting > 0;
+  if (!model || skip()) return void post({ type: 'result', id, value: null });
+  chain = chain.then(async () => {
+    let value = null;
+    try {
+      if (!skip()) {
+        const out = await model(audio instanceof Float32Array ? audio : new Float32Array(audio), {
+          max_new_tokens: 120,
+          streamer: { put() { if (skip()) throw STOP; }, end() {} },
+        });
+        const text = (out.text || '').trim();
+        value = JUNK.test(text) ? '' : text;
+      }
+    } catch { /* overtaken, or the model failed: no caption this time */ }
+    post({ type: 'result', id, value });
+  });
+}
+
 // One job at a time: inference is CPU-bound, and ordering keeps spoken sentences in sequence.
 // `cancel` jumps the queue and voids any speech still waiting to be synthesized (the user interrupted).
 // `stale` does the same for a transcription started on a hunch that the user had finished, when they had not.
 let chain = Promise.resolve();
 let epoch = 0;
 let hunch = 0;
+let waiting = 0; // jobs queued behind the one running, live captions aside
 port.on('message', ({ data }) => {
   const { id, op, args } = data;
+  if (op === 'partial') return void partial(id, args || {});
+  if (op === 'transcribe_long') return void transcribeLong(id, args || {});
+  if (op === 'abort_long') {
+    abortedLong.add(args?.job);
+    post({ type: 'result', id, value: true });
+    return;
+  }
   if (op === 'cancel' || op === 'stale') {
     if (op === 'cancel') epoch++;
     else hunch++;
@@ -95,7 +199,9 @@ port.on('message', ({ data }) => {
   }
   const mine = epoch;
   const myHunch = hunch;
+  waiting++;
   chain = chain.then(async () => {
+    waiting--;
     if ((op === 'synthesize' && mine !== epoch) || (op === 'transcribe' && args?.guess && myHunch !== hunch)) {
       post({ type: 'result', id, value: null });
       return;

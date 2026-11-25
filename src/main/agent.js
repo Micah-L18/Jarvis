@@ -20,9 +20,16 @@ How you talk
 
 Doing work
 - When a request needs tools, say a few words first so there is no dead air ("Right away." "Let me look."), do the work, then tell them the upshot in a sentence or two.
-- Anything too long to say — a practice plan, research notes, a dataset, a draft — goes into a project document with save_document. Then tell them the gist aloud and that it is saved; offer to open it. Never read a document out in full unless asked.
+- Anything too long to say — a practice plan, research notes, a dataset, a draft — goes into a project document with save_document. Then tell them the gist aloud and that it is saved; offer to show it. Never read a document out in full unless asked.
 - Projects are how related things stay together: a team they coach, a research question, a trip. When a conversation is clearly part of an ongoing effort, work inside that project (create it if needed) without making a ceremony of it.
 - You can change what is on screen with show_view: yourself, the map of what you know, or the map of their files.
+
+Files
+- When they ask to see, open, pull up or look at a file, or ask about a specific file that is not already on screen (what is in it, what it says, a summary), put it on screen in the app with show_file as well as answering: pictures, 3D models, PDFs, documents, code, spreadsheets, recordings and video all open there. Use open_path only when they ask for another app or the default app, or for a folder they want opened outside. After saving a document, offer to show it in the app.
+- "This", "that file" or "it" usually means what is on screen now, named under "On screen now" below. Use its path.
+- To look at a picture, read it with read_file: you see the image itself. Long documents come in parts; read on with page or offset until you have what you need.
+- "Summarize" a file: read it (all of it, in parts if long), then say a short summary aloud, three to five sentences. If the material is long, also save a fuller summary with save_document, titled "<file name> — summary" with for_file set to the file, and say it is saved.
+- "Transcribe" a file: for recordings and video use transcribe_media; for PDFs, Word documents, slides, spreadsheets, web pages and text use transcribe_document; for a picture, read the text off it yourself with read_file and save it with save_document, titled "<file name> — transcript" with for_file set. The transcript lands in the viewer's Text tab. Then say one line, such as "Transcript's in the Text tab, and saved." Never read a transcript out.
 
 Memory
 - Your long-term memory is a mind map they can see and edit. A background process files each conversation into it automatically, so you don't need to call remember for ordinary talk — only when asked to remember something specific.
@@ -73,7 +80,8 @@ const EXTRACT_SCHEMA = {
 
 export class Agent {
   /**
-   * @param deps {settings, memory, skills, mcp, claude, getApiKey(), emit(event), ui(event), fsRoot(), openPath(p)}
+   * @param deps {settings, memory, skills, mcp, claude, getApiKey(), emit(event), ui(event), fsRoot(), openPath(p),
+   *   onScreen?() -> {path, kind, name} | null, media?, transcribe?, transcribeSpeed?} (the last three: see builtinTools)
    * `claude` is the ClaudeCli (the cloud brain on the Claude Code login). `providers` can be overridden in tests.
    */
   constructor(deps, providers = {}) {
@@ -121,13 +129,16 @@ export class Agent {
         ? 'Internet\nInternet access is on: you can search the web and read pages. Use it for anything current or anything you are not sure of, and mention where a surprising claim comes from.'
         : 'Internet\nInternet access is switched off. You cannot look anything up; say so if asked for current information, and answer from what you know with that caveat.',
     ].filter(Boolean).join('\n\n');
-    const volatile = `Right now it is ${new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}.\n\nWhat you know\n${this.d.memory.digest()}`;
+    const shown = this.d.onScreen?.();
+    const screen = shown?.path ? `\n\nOn screen now: ${shown.name || shown.path} (${shown.kind || 'file'}) at ${shown.path}` : '';
+    const volatile = `Right now it is ${new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}.${screen}\n\nWhat you know\n${this.d.memory.digest()}`;
     return { stable, volatile };
   }
 
   tools() {
     const s = this.d.settings.get();
-    const ctx = { memory: this.d.memory, skills: this.d.skills, settings: this.d.settings, ui: this.d.ui, fsRoot: this.d.fsRoot, openPath: this.d.openPath };
+    const { memory, skills, settings, ui, fsRoot, openPath, media, transcribe, transcribeSpeed } = this.d;
+    const ctx = { memory, skills, settings, ui, fsRoot, openPath, media, transcribe, transcribeSpeed, signal: () => this.active?.signal };
     const tools = [...builtinTools(ctx, { localWeb: s.webSearch && s.provider === 'local' }), ...this.d.mcp.tools()];
     return tools.sort((a, b) => a.name.localeCompare(b.name));
   }

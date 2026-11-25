@@ -20,6 +20,11 @@ const PAUSE_LONG = 45;
 // Transcription starts this far into the silence, on the hunch that the user has finished, so the
 // words are usually ready by the time the pause is long enough to be sure.
 const GUESS_AFTER = 12;
+// Live captions while the user talks: the first once there is this much voice (frames), then again
+// each time one comes back and at least this much more has been heard; only the latest stretch is sent.
+const LIVE_FIRST = 40;
+const LIVE_EVERY = 25;
+const LIVE_SPAN = 1000;
 const MIC = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
 
 function resample(input, fromRate, toRate) {
@@ -42,7 +47,7 @@ function resample(input, fromRate, toRate) {
  * progress line, or it stays on screen for a download that is no longer happening.
  */
 export function speechStatus(msg) {
-  const what = msg.what === 'voice' ? 'voice' : msg.what === 'faster voice' ? 'faster voice' : 'speech recognition';
+  const what = msg.what === 'voice' ? 'voice' : msg.what === 'faster voice' ? 'faster voice' : msg.what === 'captions' ? 'live captions' : 'speech recognition';
   if (msg.failed) return { text: `The ${what} could not be downloaded — I will try again next time`, ttl: 6000 };
   if (msg.done) return { text: `${what} ready`, ttl: 2500 };
   if (msg.total) return { text: `Downloading ${what} model (one time) — ${Math.round((msg.loaded / msg.total) * 100)}%`, ttl: 0 };
@@ -62,8 +67,10 @@ export function speakable(text) {
 
 export class Voice {
   /**
-   * @param cb {onUtterance(text), onBargeIn(), onState(state), onStatus(text), onNotice(text), onDevices(), settings() -> voice settings}
+   * @param cb {onUtterance(text), onPartial(text), onSpoken(upTo), onBargeIn(), onState(state), onStatus(text), onNotice(text), onDevices(), settings() -> voice settings}
    * state: 'idle' | 'hearing' | 'transcribing' | 'speaking'
+   * onPartial: the words heard so far, while the user is still talking.
+   * onSpoken: the reply is being spoken up to this many characters of the text given to say().
    */
   constructor(cb) {
     this.cb = cb;
@@ -83,13 +90,16 @@ export class Voice {
     this.frame = [];
     this.frameLen = 0;
     this.preroll = [];
-    this.capture = null; // {frames:[], voiced, silence}
+    this.capture = null; // {frames:[], voiced, silence, speech, liveAt, live}
+    this.liveCaptions = true;
     this.noise = 0.004;
     this.onset = 0;
     this.holdUntil = 0;
+    this.holds = new Set(); // things playing sound of their own (a video in the viewer): not the user talking
     // speech out
     this.epoch = 0;
     this.textBuf = '';
+    this.fed = 0; // characters given to say() since the last hush
     this.queue = Promise.resolve();
     this.pendingSpeech = 0;
     this.source = null;
@@ -243,6 +253,13 @@ export class Voice {
     this.micLevel = 0;
   }
 
+  /** Hands-free listening pauses while `key` is held (push-to-talk still works). */
+  hold(key, on) {
+    if (!on) return void this.holds.delete(key);
+    this.holds.add(key);
+    if (this.capture && !this.ptt) { this._drop(); this.cb.onState('idle'); }
+  }
+
   setMuted(muted) {
     this.muted = muted;
     if (muted) this._drop();
@@ -282,11 +299,17 @@ export class Voice {
     const speaking = this.speaking || performance.now() < this.holdUntil;
     if (this.muted && !this.ptt) return;
     if (this.ptt) {
-      this.capture?.frames.push(frame);
-      if (this.capture) { this.capture.voiced++; this._unguess(this.capture); }
+      const cap = this.capture;
+      if (!cap) return;
+      cap.frames.push(frame);
+      cap.voiced++;
+      if (rms > Math.max(0.014, this.noise * 3.2) * 0.6) cap.speech++;
+      this._unguess(cap);
+      this._live(cap);
       return;
     }
     if (!s.handsFree) return;
+    if (this.holds.size) { this.onset = 0; return; }
     // While Jarvis is talking, either ignore the mic or demand a clear, sustained voice before interrupting.
     if (speaking && !s.bargeIn) { this._drop(); return; }
 
@@ -305,13 +328,31 @@ export class Voice {
     }
     const cap = this.capture;
     cap.frames.push(frame);
-    if (rms > threshold * 0.6) { cap.voiced++; cap.silence = 0; this._unguess(cap); } else cap.silence++;
+    if (rms > threshold * 0.6) { cap.voiced++; cap.speech++; cap.silence = 0; this._unguess(cap); } else cap.silence++;
+    this._live(cap);
     if (cap.silence === GUESS_AFTER && cap.voiced >= 12 && !cap.guess) {
       cap.guess = window.jarvis.invoke('speech:transcribe', this._pcm(cap.frames), true).catch(() => null);
     }
     // A shorter pause ends a short remark; give longer thoughts a little more room.
     const patience = cap.voiced > 150 ? PAUSE_LONG : PAUSE;
     if (cap.silence >= patience || cap.frames.length > 1500) this._finish();
+  }
+
+  /**
+   * Ask for a caption of what has been said so far, while the user is audibly talking. One at a time,
+   * never alongside a hunch, and one that comes back after the remark ended (or was dropped) is ignored.
+   */
+  _live(cap) {
+    if (!this.liveCaptions || cap.live || cap.guess || cap.silence || cap.speech < LIVE_FIRST) return;
+    if (cap.liveAt && cap.frames.length - cap.liveAt < LIVE_EVERY) return;
+    cap.live = true;
+    cap.liveAt = cap.frames.length;
+    window.jarvis.invoke('speech:partial', this._pcm(cap.frames.slice(-LIVE_SPAN)))
+      .catch(() => null)
+      .then((text) => {
+        cap.live = false;
+        if (text && this.capture === cap) this.cb.onPartial?.(text);
+      });
   }
 
   /** The user went on talking: the transcription started on a hunch is of half a remark. */
@@ -330,7 +371,7 @@ export class Voice {
   }
 
   _begin(pre = []) {
-    this.capture = { frames: [...pre], voiced: 0, silence: 0 };
+    this.capture = { frames: [...pre], voiced: 0, silence: 0, speech: 0, liveAt: 0, live: false };
     this.preroll = [];
     this.onset = 0;
     this.cb.onState('hearing');
@@ -369,6 +410,7 @@ export class Voice {
   /** Feed streamed reply text; complete sentences are spoken as soon as they exist. */
   say(delta) {
     this.textBuf += delta;
+    this.fed += delta.length;
     for (;;) {
       // A sentence ends at punctuation followed by a space; very short fragments ("Mr.", "3.") stay attached.
       let cut = -1;
@@ -382,21 +424,26 @@ export class Voice {
         if (m) cut = m[0].length;
       }
       if (cut < 0) break;
-      this._enqueue(this.textBuf.slice(0, cut));
+      this._enqueue(this.textBuf.slice(0, cut), this.fed - this.textBuf.length + cut);
       this.textBuf = this.textBuf.slice(cut);
     }
   }
 
   /** The reply is complete: speak whatever is left in the buffer. */
   flush() {
-    if (this.textBuf.trim()) this._enqueue(this.textBuf);
+    if (this.textBuf.trim()) this._enqueue(this.textBuf, this.fed);
     this.textBuf = '';
     this.firstChunk = true;
   }
 
-  _enqueue(raw) {
+  /** `upTo`: where this piece ends in the text given to say(), for the caption that follows the voice. */
+  _enqueue(raw, upTo = this.fed) {
     const text = speakable(raw);
-    if (!text) return;
+    if (!text) { // nothing to read aloud (a code block), but the caption still moves past it in turn
+      const epoch = this.epoch;
+      this.queue = this.queue.then(() => { if (epoch === this.epoch) this.cb.onSpoken?.(upTo); });
+      return;
+    }
     this.firstChunk = false;
     const s = this.cb.settings();
     const epoch = this.epoch;
@@ -408,11 +455,13 @@ export class Voice {
       try {
         if (epoch !== this.epoch) return;
         if (s.tts === 'off') {
+          this.cb.onSpoken?.(upTo);
           await new Promise((r) => setTimeout(r, Math.min(4000, text.length * 45)));
         } else {
           const clip = audio && (await audio);
           if (epoch !== this.epoch) return;
           this.heard += (this.heard ? ' ' : '') + text;
+          this.cb.onSpoken?.(upTo);
           if (clip?.audio) await this._play(clip, epoch);
           else await this._systemSpeak(text, s, epoch);
         }
@@ -513,6 +562,7 @@ export class Voice {
     this.epoch++;
     this.pendingSpeech = 0;
     this.textBuf = '';
+    this.fed = 0;
     this.firstChunk = true;
     const src = this.source;
     this.source = null;
@@ -528,5 +578,6 @@ export class Voice {
   /** Call when a reply finished normally. */
   settle() {
     this.heard = '';
+    this.fed = 0;
   }
 }

@@ -50,6 +50,8 @@ Just talk. It listens continuously, works out when you've finished a thought, an
 | **1 2 3** | Core / Mind / Files view |
 | **Tab** | Controls |
 
+While you talk, the words it has caught so far appear under the hologram and settle into the final transcript when you stop (live captions use a small extra model, about 124 MB, fetched the first time you speak). Its own reply is captioned as it speaks: the part already said is bright, the rest dim.
+
 Speech recognition (Whisper) and the voice (Kokoro, a British male voice by default) both run locally. If you use open speakers and it keeps interrupting itself, turn off "Let me interrupt while it is talking" under Voice, or use headphones.
 
 The microphone and the speaker are chosen separately under **Voice** in the controls — a headset microphone with desk speakers, say. The meter beside the microphone shows what it hears and **Test** plays a tone through the speaker. If a chosen device is unplugged, Jarvis uses the system default until it comes back.
@@ -58,7 +60,7 @@ The microphone and the speaker are chosen separately under **Voice** in the cont
 
 - **Core** — the hologram. It breathes when idle, tightens its rings when it hears you, spins up while thinking, and its surface follows the voice when it speaks.
 - **Mind** — a 3D map of what it knows. Projects are the double-ringed gold hubs; people, topics, facts, tasks and documents hang off them. Click any marker to see it, and **Forget** to delete it.
-- **Files** — a 3D map of your folders (your home folder by default; change it under Files in the controls). Folders are diamonds, files are dots. Click a folder to open it further; click a file to open or reveal it.
+- **Files** — a 3D map of your folders (your home folder by default; change it under Files in the controls). Folders are diamonds, files are dots. Click a folder to open it further; click a file to see it in the app — pictures, 3D models (as a hologram or solid), PDFs, markdown, code, tables, audio and video — with buttons to have Jarvis summarize or transcribe it, or open it in its own app. Esc closes it.
 
 ![The Mind view](docs/mind.png)
 

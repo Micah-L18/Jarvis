@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { validateInput } from '../tools.js';
+import { validateInput, toolResult } from '../tools.js';
 
 const SERVER = 'jarvis';
 const PREFIX = `mcp__${SERVER}__`;
@@ -245,6 +245,15 @@ function bundledBinary() {
   return '';
 }
 
+/** A tool's result as MCP content: text, and image items when it returns a picture. */
+export function mcpContent(out) {
+  const { text, images } = toolResult(out);
+  return [
+    ...(text || !images.length ? [{ type: 'text', text: text.slice(0, 60000) }] : []),
+    ...images.map((i) => ({ type: 'image', data: i.data, mimeType: i.mediaType })),
+  ];
+}
+
 /** JSON-schema tools in Jarvis's shape, served to the child over the SDK's in-process MCP transport. */
 function toolServer(defs, live) {
   const server = new Server({ name: SERVER, version: '1.0.0' }, { capabilities: { tools: {} } });
@@ -256,7 +265,7 @@ function toolServer(defs, live) {
     const problem = tool ? validateInput(tool.schema, input) : `unknown tool ${req.params.name}`;
     if (problem) return fail(`Invalid tool input: ${problem}`);
     try {
-      return { content: [{ type: 'text', text: String(await tool.run(input)).slice(0, 60000) }] };
+      return { content: mcpContent(await tool.run(input)) };
     } catch (err) {
       return fail(err?.message || String(err));
     }

@@ -1,4 +1,5 @@
 // Local brain: any tool-capable model served by Ollama on this machine. Nothing leaves the computer.
+import { toolResult } from '../tools.js';
 
 const MAX_STEPS = 16;
 
@@ -74,6 +75,32 @@ async function chat(baseUrl, body, signal) {
   return res;
 }
 
+// Whether a model can look at pictures, from what Ollama says about it. Asked once per model.
+const sight = new Map();
+export function canSee(baseUrl, model) {
+  const key = `${baseUrl}|${model}`;
+  if (!sight.has(key)) {
+    sight.set(key, fetch(`${baseUrl.replace(/\/$/, '')}/api/show`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model }), signal: AbortSignal.timeout(3000) })
+      .then((res) => (res.ok ? res.json() : {}))
+      .then((info) => Array.isArray(info.capabilities) && info.capabilities.includes('vision'))
+      .catch(() => {
+        sight.delete(key);
+        return false;
+      }));
+  }
+  return sight.get(key);
+}
+
+/** A tool's result as an Ollama tool message: pictures go along only to a model that can see them. */
+export async function toolMessage(name, out, { baseUrl, model }) {
+  const { text, images } = toolResult(out);
+  const msg = { role: 'tool', tool_name: name, content: text.slice(0, 24000) };
+  if (!images.length) return msg;
+  if (await canSee(baseUrl, model)) msg.images = images.map((i) => i.data);
+  else msg.content += `\n(The picture itself is not shown to you: ${model} cannot see images. Say so if asked what is in it; a vision model such as qwen2.5vl or gemma3, or the cloud brain, can.)`;
+  return msg;
+}
+
 /**
  * Run one user turn to completion against Ollama.
  * @param o {baseUrl, model, system (string), history, userText, tools, emit, signal}
@@ -135,7 +162,7 @@ export async function runOllamaTurn({ baseUrl, model, system, history, userText,
       } catch (err) {
         out = `Error: ${err?.message || err}`;
       }
-      messages.push({ role: 'tool', tool_name: name, content: String(out).slice(0, 24000) });
+      messages.push(await toolMessage(name, out, { baseUrl, model }));
     }
     if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
     if (spoken && !/\s$/.test(spoken)) {

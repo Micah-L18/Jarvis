@@ -22,9 +22,12 @@
     "@modelcontextprotocol/sdk": "^1.32.2",
     "d3-force-3d": "^3.0.6",
     "dompurify": "^3.5.0",
+    "jszip": "^3.10.2",
     "kokoro-js": "^1.2.1",
+    "mammoth": "^1.13.0",
     "marked": "^18.3.0",
     "pdfjs-dist": "^6.5.438",
+    "sharp": "^0.34.5",
     "three": "^0.187.0"
   }
 }

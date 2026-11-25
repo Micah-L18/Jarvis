@@ -792,3 +792,17 @@ test('controls: what the brain chip and the sign-in line say', () => {
   assert.match(claudeLogin({ state: 'managed', version: '2.1.332' }).line, /your organisation manages it .* Use an API key or Local instead/);
   assert.doesNotMatch(Object.values(claudeLogin({ state: 'missing' })).join(' '), /API key before|add an Anthropic API key/i);
 });
+
+test('claude cli: a picture a tool returns reaches the CLI as MCP image content', async () => {
+  const answers = {};
+  const { cli } = makeCli(async function* (run) {
+    yield init(run.options);
+    const client = await toolClient(run.options);
+    answers.pic = await client.callTool({ name: 'look', arguments: {} });
+    yield say('A square.');
+    yield done();
+  });
+  const look = { name: 'look', description: 'Look.', schema: { type: 'object', properties: {} }, run: async () => ({ text: 'pic.png: image', images: [{ mediaType: 'image/png', data: 'iVBORw0KGgo=' }] }) };
+  assert.equal(await cli.runTurn(turn({ tools: [look], emit: () => {} })), 'A square.');
+  assert.deepEqual(answers.pic.content, [{ type: 'text', text: 'pic.png: image' }, { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }]);
+});

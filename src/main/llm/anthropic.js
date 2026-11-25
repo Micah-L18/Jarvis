@@ -2,7 +2,7 @@
 // The loop is hand-rolled because tools run on this machine (files, MCP servers, the UI)
 // and speech needs every text delta the moment it arrives, plus instant cancellation.
 import Anthropic from '@anthropic-ai/sdk';
-import { validateInput } from '../tools.js';
+import { validateInput, toolResult } from '../tools.js';
 
 export const CLOUD_MODELS = [
   { id: 'claude-opus-5-5', label: 'Claude Opus 5.5' },
@@ -39,6 +39,16 @@ export function describeError(err) {
 
 export function isAbort(err) {
   return err instanceof Anthropic.APIUserAbortError || err?.name === 'AbortError';
+}
+
+/** A tool's result as tool_result content: plain text, or text and image blocks when it returns a picture. */
+export function resultContent(out) {
+  const { text, images } = toolResult(out);
+  if (!images.length) return text.slice(0, 60000);
+  return [
+    ...(text ? [{ type: 'text', text: text.slice(0, 60000) }] : []),
+    ...images.map((i) => ({ type: 'image', source: { type: 'base64', media_type: i.mediaType, data: i.data } })),
+  ];
 }
 
 /**
@@ -117,8 +127,7 @@ export async function runAnthropicTurn({ apiKey, model, effort, system, history,
       const problem = tool ? validateInput(tool.schema, call.input) : `unknown tool ${call.name}`;
       if (problem) return { type: 'tool_result', tool_use_id: call.id, is_error: true, content: `Invalid tool input: ${problem}` };
       try {
-        const out = await tool.run(call.input);
-        return { type: 'tool_result', tool_use_id: call.id, content: String(out).slice(0, 60000) };
+        return { type: 'tool_result', tool_use_id: call.id, content: resultContent(await tool.run(call.input)) };
       } catch (err) {
         return { type: 'tool_result', tool_use_id: call.id, is_error: true, content: err?.message || String(err) };
       }

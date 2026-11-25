@@ -7,8 +7,11 @@ import { Orb } from './orb.js';
 import { Stage, screenPass, steadyBloom, setCaptionBand, easeCaptionBand } from './stage.js';
 import { Graph3D } from './graph.js';
 import { Voice, speechStatus } from './voice.js';
+import { captionParts } from './captions.js';
 import { Panel, h } from './panel.js';
 import { claudeLogin, brainChip } from './brain.js';
+import { wireMedia } from './media.js';
+import { Viewer } from './viewer.js';
 
 const api = window.jarvis;
 const $ = (id) => document.getElementById(id);
@@ -380,6 +383,7 @@ function select(node, graph) {
       d.dir && d.more > 0 && h('p', {}, `${d.more} more item${d.more === 1 ? '' : 's'} inside not shown yet.`),
       h('div', { class: 'row' },
         d.dir && d.more > 0 && h('button', { class: 'btn solid', onclick: () => expandFolder(d) }, 'Open further'),
+        !d.dir && h('button', { class: 'btn solid', onclick: () => { select(null); viewer.open(d.id); } }, 'View'),
         h('button', { class: 'btn', onclick: () => api.invoke('fs:open', d.id) }, d.dir ? 'Open folder' : 'Open file'),
         h('button', { class: 'btn', onclick: () => api.invoke('fs:reveal', d.id) }, 'Reveal'),
         h('button', { class: 'btn', onclick: () => select(null) }, 'Close')),
@@ -457,6 +461,12 @@ canvas.addEventListener('pointerup', (e) => {
   const g = activeGraph();
   if (!g) return;
   const node = g.pick(camera, e.clientX, e.clientY, window.innerWidth, window.innerHeight);
+  if (node && g === files && !node.data.dir) { // a file opens in the viewer; folders keep their card
+    select(null);
+    files.setFocus(node.id);
+    viewer.open(node.data.id);
+    return;
+  }
   select(node, g);
 });
 
@@ -477,6 +487,8 @@ function setStatus(text, ttl = 0) {
   if (ttl) statusTimer = setTimeout(() => { $('status-line').textContent = ''; }, ttl);
 }
 
+wireMedia(api, { setStatus });
+
 let muted = false;
 function renderChips() {
   const s = state.settings;
@@ -495,6 +507,16 @@ const toggleMute = () => { muted = !muted; voice.setMuted(muted); renderChips();
 $('chip-mic').onclick = toggleMute;
 for (const b of $('views').children) b.onclick = () => setView(b.dataset.view);
 $('btn-full').onclick = () => api.invoke('window:fullscreen');
+
+const viewer = new Viewer({
+  api,
+  root: $('viewer'),
+  dim: $('viewer-dim'),
+  voice: () => voice,
+  send: (text) => sendToJarvis(text),
+  toast,
+  onClose: () => { if (!selected) files.setFocus(null); },
+});
 
 const panel = new Panel($('panel'), {
   state: () => state,
@@ -518,18 +540,49 @@ let replyLogged = true; // false while a reply is still being generated (so an i
 let voiceState = 'idle';
 let fadeTimer;
 
+let lastSaid = ''; // the user's line for the turn in progress, to put back if a new remark comes to nothing
 function showUser(text, live = false) {
+  if (live && text.length > 160) { const p = captionParts(text, null, 0, 160); text = p.lead + p.lit; }
+  else if (!live) lastSaid = text;
   $('said-user').textContent = text;
   $('said-user').classList.toggle('live', live);
   $('said-user').classList.remove('fade');
   fitCaptionBand(); // the user's line coming or going does not change the caption block's size
 }
+
+// Jarvis's line follows its voice: what has been spoken is lit, what is still to come is dim.
+// `base` is where this text starts in what the voice was given; spoken null = all lit (no voice to follow).
+const line = { text: '', base: 0, from: 0, spoken: null };
 function showJarvis(text) {
-  // Captions follow the voice: keep the most recent couple of lines.
-  const tail = text.length > 260 ? `…${text.slice(text.indexOf(' ', text.length - 260))}` : text;
-  $('said-jarvis').textContent = tail;
+  line.text = text;
+  renderJarvis();
   $('said-jarvis').classList.remove('fade');
   clearTimeout(fadeTimer);
+}
+function renderJarvis() {
+  const follow = line.spoken != null && state.settings.voice.tts !== 'off';
+  const p = captionParts(line.text, follow ? line.spoken : null, line.from);
+  const el = $('said-jarvis');
+  el.replaceChildren(p.lead + p.lit);
+  if (p.dim || p.trail) el.append(h('span', { class: 'ahead' }, p.dim + p.trail));
+}
+/** The text shown next is about to be spoken, from this point in what the voice is given. */
+function followVoice() {
+  Object.assign(line, { base: voice.fed, from: 0, spoken: 0 });
+}
+function spokenUpTo(upTo) {
+  if (line.spoken == null) return;
+  const at = upTo - line.base;
+  if (at <= line.spoken) return;
+  line.from = line.spoken;
+  line.spoken = at;
+  renderJarvis();
+}
+/** Nothing more is coming from the voice: light the whole line. */
+function allSpoken() {
+  if (line.spoken == null) return;
+  line.spoken = null;
+  renderJarvis();
 }
 function restCaptions() {
   clearTimeout(fadeTimer);
@@ -540,9 +593,12 @@ const voice = new Voice({
   settings: () => state.settings.voice,
   onState: (s) => {
     voiceState = s;
-    if (s === 'hearing') showUser('…', true);
-    if (s === 'idle' && !generating) { voice.settle(); restCaptions(); if ($('said-user').textContent === '…') showUser(''); }
+    if (s === 'hearing') { showUser('…', true); $('said-jarvis').classList.add('fade'); } // the floor is the user's
+    if (s === 'idle' && $('said-user').classList.contains('live')) showUser(generating ? lastSaid : ''); // a cough, or nothing heard
+    if (s === 'idle' && !generating) { if (!voice.speaking) allSpoken(); voice.settle(); restCaptions(); }
   },
+  onPartial: (text) => showUser(text.replace(/[.?!…]+$/, ''), true), // not finished yet, whatever Whisper's punctuation says
+  onSpoken: spokenUpTo,
   onStatus: (text) => toast(text, true),
   onNotice: (text) => toast(text),
   onDevices: () => panel.refreshDevices(),
@@ -553,6 +609,10 @@ const voice = new Voice({
 /** Stop Jarvis mid-thought. Returns what it had said aloud, if the reply was still unfinished. */
 function interrupt() {
   const heard = voice.hush();
+  if (line.spoken != null) { // what was never said aloud goes from the caption too
+    if (state.settings.voice.tts !== 'off') line.text = line.text.slice(0, line.spoken).trimEnd();
+    allSpoken();
+  }
   const unfinished = generating && !replyLogged;
   if (generating) api.invoke('chat:abort');
   generating = false;
@@ -571,6 +631,7 @@ function sendToJarvis(text) {
   cutOff();
   showUser(text);
   showJarvis('');
+  followVoice();
   generating = true;
   replyLogged = false;
   replyText = '';
@@ -594,6 +655,7 @@ api.on('chat', (e) => {
     toast(e.text);
   } else if (e.type === 'error') {
     toast(e.text, true);
+    followVoice();
     showJarvis(e.text);
     voice.say(`${e.text} `);
   } else if (e.type === 'done') {
@@ -602,7 +664,7 @@ api.on('chat', (e) => {
     generating = false;
     $('tool-line').textContent = '';
     voice.flush();
-    if (!voice.speaking) restCaptions();
+    if (!voice.speaking) { allSpoken(); restCaptions(); }
   }
 });
 
@@ -643,6 +705,7 @@ window.addEventListener('keydown', (e) => {
     if (typing()) document.activeElement.blur();
     if (!form.hidden) form.hidden = true;
     else if (panel.open) panel.toggle(false);
+    else if (viewer.isOpen) viewer.close();
     else if (selected) select(null);
     else if (generating || voice.speaking) cutOff();
     return;
@@ -717,7 +780,7 @@ buildMind();
 renderChips();
 setView('core');
 requestAnimationFrame(frame);
-window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, panel, loadFiles, state: () => state };
+window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, panel, loadFiles, state: () => state, viewer: { open: (p, o) => viewer.open(p, o), close: () => viewer.close(), state: () => viewer.state(), showText: (...a) => viewer.showText(...a) } };
 
 (async () => {
   const s = state.settings;
@@ -739,6 +802,7 @@ window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, pane
     setStatus('');
     const hour = new Date().getHours();
     const greeting = `Good ${hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening'}, ${s.address}. Systems are online.`;
+    followVoice();
     showJarvis(greeting);
     voice.say(greeting);
     voice.flush();

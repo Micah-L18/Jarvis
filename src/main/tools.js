@@ -4,17 +4,69 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { scan, isInside } from './fsscan.js';
 import { NODE_TYPES } from './memory.js';
+import { kindOf } from './filekind.js';
+import { extractText, canExtract, loadImage, imageSize, describeModel, stripHtml } from './extract.js';
 
 const str = (description) => ({ type: 'string', description });
 const obj = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 
-function stripHtml(html) {
-  return html
-    .replace(/<(script|style|noscript|svg|head)[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
+const TEXT_CAP = 40000;
+
+/** A tool's result as text plus any images. run() returns a string, or {text, images:[{mediaType, data}]} to show the model a picture. */
+export function toolResult(out) {
+  if (out && typeof out === 'object' && !Array.isArray(out)) return { text: String(out.text ?? ''), images: Array.isArray(out.images) ? out.images : [] };
+  return { text: String(out), images: [] };
+}
+
+export const bytes = (n) => (n < 1024 ? `${n} bytes` : n < 1024 ** 2 ? `${Math.round(n / 1024)} KB` : n < 1024 ** 3 ? `${(n / 1024 ** 2).toFixed(1)} MB` : `${(n / 1024 ** 3).toFixed(1)} GB`);
+export function duration(sec) {
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h) return `${h} hour${h > 1 ? 's' : ''}${m ? ` ${m} minute${m > 1 ? 's' : ''}` : ''}`;
+  if (m) return `${m} minute${m > 1 ? 's' : ''}${s && m < 5 ? ` ${s} seconds` : ''}`;
+  return `${s} seconds`;
+}
+const stamp = (sec) => {
+  const t = Math.max(0, Math.floor(sec));
+  const hh = Math.floor(t / 3600);
+  const mm = String(Math.floor((t % 3600) / 60)).padStart(hh ? 2 : 1, '0');
+  return `${hh ? `${hh}:` : ''}${mm}:${String(t % 60).padStart(2, '0')}`;
+};
+
+// Reading a long PDF a page at a time should not mean extracting it again for every page.
+const extracted = new Map();
+async function textOf(file, stat) {
+  const key = `${file}|${stat.size}|${stat.mtimeMs}`;
+  if (!extracted.has(key)) {
+    extracted.set(key, extractText(file));
+    while (extracted.size > 6) extracted.delete(extracted.keys().next().value);
+  }
+  try {
+    return await extracted.get(key);
+  } catch (err) {
+    extracted.delete(key);
+    throw err;
+  }
+}
+
+/** A long transcript in paragraphs, each led by the time it starts. */
+export function transcriptText(chunks, fallback = '') {
+  if (!chunks?.length) return fallback.trim();
+  const paras = [];
+  let cur = null;
+  for (const c of chunks) {
+    const text = String(c.text || '').trim();
+    if (!text) continue;
+    const at = c.timestamp?.[0] ?? 0;
+    if (!cur || at - cur.at >= 30) {
+      cur = { at, parts: [] };
+      paras.push(cur);
+    }
+    cur.parts.push(text);
+  }
+  return paras.map((p) => `[${stamp(p.at)}] ${p.parts.join(' ')}`).join('\n\n');
 }
 
 /** Minimal check of a tool input against its JSON schema: required keys and primitive types. */
@@ -32,7 +84,9 @@ export function validateInput(schema, input) {
 }
 
 /**
- * @param ctx {memory, skills, settings, ui(event), fsRoot(), openPath(p)}
+ * @param ctx {memory, skills, settings, ui(event), fsRoot(), openPath(p),
+ *   media?: {probe(path) -> {duration}, decode(path, {signal}) -> Float32Array (16 kHz mono)},
+ *   transcribe?(audio, {signal}) -> {text, chunks}, transcribeSpeed?() -> seconds of audio per second, signal?() -> AbortSignal}
  * @param opts {localWeb: boolean} — add client-side web tools (used when the model has no hosted search)
  */
 export function builtinTools(ctx, { localWeb = false } = {}) {
@@ -40,9 +94,34 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
   const inRoot = (p) => {
     const root = ctx.fsRoot();
     const full = path.resolve(root, p || '.');
-    if (!isInside(root, full)) throw new Error(`That is outside the folder I am allowed to see (${root}).`);
+    if (!isInside(root, full) && !(memory.projectsDir && isInside(memory.projectsDir, full))) throw new Error(`That is outside the folder I am allowed to see (${root}).`);
     return full;
   };
+  // A file to read or show: inside the root or Jarvis's own documents, also once links are followed.
+  const fileIn = async (p) => {
+    const full = inRoot(p);
+    let real;
+    try {
+      real = await fs.realpath(full);
+    } catch {
+      throw new Error(`There is no file at ${full}.`);
+    }
+    const roots = await Promise.all([ctx.fsRoot(), memory.projectsDir].filter(Boolean).map((r) => fs.realpath(r).catch(() => path.resolve(r))));
+    if (!roots.some((r) => isInside(r, real))) throw new Error(`That is outside the folder I am allowed to see (${ctx.fsRoot()}).`);
+    const stat = await fs.stat(real);
+    return { file: full, stat, kind: stat.isDirectory() ? 'folder' : kindOf(full), name: path.basename(full) };
+  };
+  const notFolder = (f) => {
+    if (f.kind === 'folder') throw new Error(`${f.file} is a folder; use list_folder, or show_view files with it as the focus.`);
+  };
+  const saveTranscript = (f, text, what) => {
+    const title = `${f.name} — transcript`;
+    const res = memory.saveDocument(null, title, `# ${title}\n\n${what} of ${f.file}\n\n${text}\n`);
+    ctx.ui({ type: 'document', title, file: res.file, project: res.project.label });
+    ctx.ui({ type: 'viewer_text', path: f.file, title, text });
+    return res;
+  };
+  const words = (text) => (text.match(/\S+/g) || []).length;
 
   const tools = [
     {
@@ -102,12 +181,25 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
     },
     {
       name: 'save_document',
-      description: 'Write a markdown document into a project folder. Use for anything too long to say aloud: plans, research notes, datasets, drafts. Saving with an existing title replaces that document.',
-      schema: obj({ title: str('Document title'), content: str('Full markdown content'), project: str('Project name. Omit for the active project.') }, ['title', 'content']),
-      run: async ({ title, content, project }) => {
+      description: 'Write a markdown document into a project folder. Use for anything too long to say aloud: plans, research notes, datasets, drafts, summaries and transcripts. Saving with an existing title replaces that document.',
+      schema: obj({
+        title: str('Document title'),
+        content: str('Full markdown content'),
+        project: str('Project name. Omit for the active project.'),
+        for_file: str('Path of the file this document summarizes or transcribes, if any. It is then shown beside that file in the viewer\'s Text tab.'),
+      }, ['title', 'content']),
+      run: async ({ title, content, project, for_file: forFile }) => {
         const res = memory.saveDocument(project, title, content);
         ctx.ui({ type: 'document', title, file: res.file, project: res.project.label });
-        return `Saved "${title}" in project "${res.project.label}" at ${res.file}.`;
+        let shown = '';
+        if (forFile) {
+          const f = await fileIn(forFile).catch(() => null);
+          if (f) {
+            ctx.ui({ type: 'viewer_text', path: f.file, title, text: content });
+            shown = ' It is in the viewer\'s Text tab beside that file.';
+          }
+        }
+        return `Saved "${title}" in project "${res.project.label}" at ${res.file}.${shown}${shown ? '' : ' You can offer to show it in the app (show_file).'}`;
       },
     },
     {
@@ -121,13 +213,17 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
     },
     {
       name: 'open_document',
-      description: 'Open a saved project document on screen in the default app so the user can read it.',
-      schema: obj({ title: str('Document title'), project: str('Project name. Omit to look across all projects.') }, ['title']),
-      run: async ({ title, project }) => {
+      description: 'Put a saved project document on screen in the app\'s viewer so the user can read it. Set outside to true only when they want it in another app.',
+      schema: obj({ title: str('Document title'), project: str('Project name. Omit to look across all projects.'), outside: { type: 'boolean', description: 'Open in the default app instead of the viewer' } }, ['title']),
+      run: async ({ title, project, outside }) => {
         const res = memory.readDocument(project, title);
         if (!res) return `No document called "${title}".`;
-        await ctx.openPath(res.doc.file);
-        return `Opened "${res.doc.label}".`;
+        if (outside) {
+          await ctx.openPath(res.doc.file);
+          return `Opened "${res.doc.label}" in its default app.`;
+        }
+        ctx.ui({ type: 'show_file', path: res.doc.file });
+        return `"${res.doc.label}" is on screen in the viewer.`;
       },
     },
     {
@@ -172,22 +268,127 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
       },
     },
     {
-      name: 'read_file',
-      description: 'Read a text file from the user\'s computer (first 40,000 characters).',
+      name: 'show_file',
+      description: 'Put a file on screen in the app\'s viewer: images, 3D models, PDFs, documents, text and code, spreadsheets, audio and video. Use this whenever the user asks to see, open, pull up or look at a file, or asks about a specific file. Returns what kind of file it is and, for text, how it begins.',
       schema: obj({ path: str('File path') }, ['path']),
       run: async ({ path: p }) => {
-        const file = inRoot(p);
-        const stat = await fs.stat(file);
-        if (stat.isDirectory()) throw new Error('That is a folder; use list_folder.');
-        const buf = await fs.readFile(file);
-        if (buf.subarray(0, 4000).includes(0)) return `${file} is a binary file (${stat.size} bytes); I can't read it as text.`;
-        const text = buf.toString('utf8');
-        return text.length > 40000 ? `${text.slice(0, 40000)}\n… (truncated, ${text.length} characters total)` : text;
+        const f = await fileIn(p);
+        notFolder(f);
+        ctx.ui({ type: 'show_file', path: f.file });
+        const lines = [`On screen: ${f.name} (${f.kind}, ${bytes(f.stat.size)}) at ${f.file}.`];
+        try {
+          if (f.kind === 'image' || f.kind === 'svg') {
+            const { width, height } = await imageSize(f.file);
+            if (width) lines.push(`${width} by ${height} pixels.`);
+            lines.push('To see what is in it, use read_file.');
+          } else if (f.kind === 'model') {
+            lines.push(`${await describeModel(f.file, f.stat.size)}. It is shown as a turntable they can spin.`);
+          } else if ((f.kind === 'audio' || f.kind === 'video') && ctx.media) {
+            const { duration: d } = await Promise.race([ctx.media.probe(f.file), new Promise((r) => setTimeout(() => r({}), 4000))]);
+            if (d) lines.push(`${f.kind === 'video' ? 'Video' : 'Recording'}, ${duration(d)} long. transcribe_media gets the words.`);
+          } else if (canExtract(f.file) && f.stat.size < 60e6) {
+            const doc = await textOf(f.file, f.stat);
+            if (doc.parts) lines.push(`${doc.parts.length} ${doc.partName}${doc.parts.length === 1 ? '' : 's'}.`);
+            const text = (doc.parts ? doc.parts.join('\n\n') : doc.text).trim();
+            lines.push(text ? `It begins:\n${text.slice(0, 2000)}${text.length > 2000 ? `\n… (${text.length.toLocaleString('en-GB')} characters in all; read_file for more)` : ''}` : 'There is no text in it that I can extract (a scanned document, perhaps).');
+          }
+        } catch {
+          /* the description is a bonus; the file is on screen either way */
+        }
+        return lines.join('\n');
+      },
+    },
+    {
+      name: 'read_file',
+      description: 'Read a file from the user\'s computer or a saved document: plain text and code, PDFs, Word (.docx), spreadsheets (.xlsx, .csv), slides (.pptx) and web pages come back as text, 40,000 characters at a time (use page or offset for the rest). Images come back as the picture itself, so you can see them.',
+      schema: obj({
+        path: str('File path'),
+        page: { type: 'integer', description: 'For PDFs, slides and spreadsheets: read only this page, slide or sheet (from 1)' },
+        offset: { type: 'integer', description: 'Character to start from, to continue a long text' },
+      }, ['path']),
+      run: async ({ path: p, page, offset = 0 }) => {
+        const f = await fileIn(p);
+        if (f.kind === 'folder') throw new Error('That is a folder; use list_folder.');
+        if (f.kind === 'image' || f.kind === 'svg') {
+          const img = await loadImage(f.file);
+          const note = `${f.file}: ${f.kind === 'svg' ? 'SVG drawing' : 'image'}, ${img.width} by ${img.height} pixels, ${bytes(f.stat.size)}${img.scaled && img.sentWidth !== img.width ? ` (shown to you at ${img.sentWidth} by ${img.sentHeight})` : ''}.`;
+          let source = '';
+          if (f.kind === 'svg') {
+            const svg = await fs.readFile(f.file, 'utf8');
+            source = `\nSVG source${svg.length > 4000 ? ' (start)' : ''}:\n${svg.slice(0, 4000)}`;
+          }
+          return { text: note + source, images: [{ mediaType: img.mediaType, data: img.data }] };
+        }
+        if (f.kind === 'audio' || f.kind === 'video') return `${f.file} is a ${f.kind === 'video' ? 'video' : 'recording'} (${bytes(f.stat.size)}). Use transcribe_media to get the words.`;
+        if (f.kind === 'model') return `${f.file}: ${await describeModel(f.file, f.stat.size)}, ${bytes(f.stat.size)}. Its geometry is not readable as text; show_file puts it on screen.`;
+        const doc = await textOf(f.file, f.stat);
+        if (doc.unreadable) return `${f.file}: ${doc.unreadable}`;
+        let text = doc.text;
+        let what = `${f.file} (${f.kind}${doc.parts ? `, ${doc.parts.length} ${doc.partName}${doc.parts.length === 1 ? '' : 's'}` : ''})`;
+        if (page && doc.parts) {
+          if (page < 1 || page > doc.parts.length) return `${what} has no ${doc.partName} ${page}.`;
+          text = doc.parts[page - 1];
+          what += `, ${doc.partName} ${page}`;
+        }
+        if (!text.trim()) return `${what}: no text in it that I can extract${f.kind === 'pdf' ? ' — it is probably scanned images of pages' : ''}.`;
+        const from = Math.max(0, Math.min(offset, text.length));
+        const slice = text.slice(from, from + TEXT_CAP);
+        const to = from + slice.length;
+        const more = to < text.length
+          ? `\n… (characters ${from.toLocaleString('en-GB')} to ${to.toLocaleString('en-GB')} of ${text.length.toLocaleString('en-GB')}; read_file with offset ${to}${page ? ` and page ${page}` : ''} continues)`
+          : from ? `\n(end; from character ${from.toLocaleString('en-GB')})` : '';
+        return `${what}\n${slice}${more}`;
+      },
+    },
+    {
+      name: 'transcribe_document',
+      description: 'Make a transcript of a text-bearing file (PDF, Word, slides, spreadsheet, web page, text or code): the full text is saved as a project document "<file> — transcript" and shown in the viewer\'s Text tab. Do not read it out. For images, look with read_file and save what you read with save_document (for_file set). For audio and video, use transcribe_media.',
+      schema: obj({ path: str('File path') }, ['path']),
+      run: async ({ path: p }) => {
+        const f = await fileIn(p);
+        notFolder(f);
+        if (f.kind === 'audio' || f.kind === 'video') return 'That is a recording; use transcribe_media.';
+        if (f.kind === 'image' || f.kind === 'svg') return 'That is an image: look at it with read_file, then save the text you read with save_document, title "<file name> — transcript" and for_file set to its path.';
+        if (!canExtract(f.file)) return `I can't get text out of ${f.name}.`;
+        const doc = await textOf(f.file, f.stat);
+        if (doc.unreadable) return doc.unreadable;
+        const text = (doc.parts ? doc.parts.map((t, i) => `## ${doc.partName[0].toUpperCase()}${doc.partName.slice(1)} ${i + 1}\n\n${t}`).join('\n\n') : doc.text).trim();
+        if (!text) return `${f.name} has no text in it that I can extract${f.kind === 'pdf' ? ' — it is probably scanned' : ''}.`;
+        const res = saveTranscript(f, text, 'Text');
+        return `Saved "${f.name} — transcript" (${words(doc.text.replace(/^\[(page|sheet|slide) \d+\]$/gm, '')).toLocaleString('en-GB')} words) in project "${res.project.label}" and put it in the viewer's Text tab. Confirm that in one short line; do not read it out. It begins: ${text.slice(0, 500)}`;
+      },
+    },
+    {
+      name: 'transcribe_media',
+      description: 'Transcribe the speech in an audio or video file with the local speech recognizer. The transcript is saved as a project document "<file> — transcript" and shown in the viewer\'s Text tab; do not read it out. Long recordings take a while: the first call says how long, then call again with confirm true.',
+      schema: obj({ path: str('Audio or video file path'), confirm: { type: 'boolean', description: 'Go ahead with a long recording after telling the user how long it will take' } }, ['path']),
+      run: async ({ path: p, confirm }) => {
+        const f = await fileIn(p);
+        notFolder(f);
+        if (f.kind !== 'audio' && f.kind !== 'video') return f.kind === 'image' || f.kind === 'svg'
+          ? 'That is an image: look at it with read_file, then save what you read with save_document (for_file set).'
+          : 'That is not a recording; use transcribe_document for text-bearing files.';
+        if (!ctx.media || !ctx.transcribe) return 'Transcribing recordings is not available right now.';
+        const signal = ctx.signal?.();
+        const { duration: d } = await Promise.race([ctx.media.probe(f.file).catch(() => ({})), new Promise((r) => setTimeout(() => r({}), 8000))]);
+        if (d > 2 * 3600) return `${f.name} is ${duration(d)} long; I can transcribe up to two hours at a time.`;
+        const speed = ctx.transcribeSpeed?.() || 6;
+        const eta = d ? d / speed + 5 : 0;
+        if (eta > 45 && !confirm) return `${f.name} is ${duration(d)} long; transcribing it here will take about ${duration(eta)}. Tell the user that in a sentence, then call transcribe_media again with confirm true.`;
+        const audio = await ctx.media.decode(f.file, { signal });
+        if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        if (!audio?.length) return `There is no sound in ${f.name} that I can decode.`;
+        if (audio.length / 16000 > 2 * 3600) return `${f.name} is over two hours long; I can transcribe up to two hours at a time.`;
+        const out = await ctx.transcribe(audio, { signal });
+        const text = transcriptText(out.chunks, out.text);
+        if (!text) return `I could not make out any speech in ${f.name}.`;
+        const res = saveTranscript(f, text, 'Transcript');
+        return `Saved "${f.name} — transcript" (${duration(audio.length / 16000)} of audio, ${words(out.text || text).toLocaleString('en-GB')} words) in project "${res.project.label}" and put it in the viewer's Text tab. Confirm that in one short line; do not read it out. It begins: ${text.slice(0, 500)}`;
       },
     },
     {
       name: 'open_path',
-      description: 'Open a file or folder on the user\'s computer in its default app.',
+      description: 'Open a file or folder on the user\'s computer in its default app, outside Jarvis. Only when they ask for another app or the default app, or want a folder opened; otherwise use show_file.',
       schema: obj({ path: str('File or folder path') }, ['path']),
       run: async ({ path: p }) => {
         const full = inRoot(p);

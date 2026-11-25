@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, session, systemPreferences, utilityProcess, globalShortcut } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, session, systemPreferences, utilityProcess, globalShortcut, protocol } from 'electron';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -12,12 +12,14 @@ import { scan, expand, isInside } from './fsscan.js';
 import { CLOUD_MODELS } from './llm/anthropic.js';
 import { listOllamaModels } from './llm/ollama.js';
 import { ClaudeCli } from './llm/claudecli.js';
+import { registerScheme, serveFiles, allowedPath } from './fileproto.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const windowed = process.argv.includes('--windowed');
 if (process.env.JARVIS_DATA_DIR) app.setPath('userData', path.resolve(process.env.JARVIS_DATA_DIR));
 // Jarvis greets you and speaks without waiting for a click.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+registerScheme(protocol); // jarvis-file:// for the file viewer; must happen before ready
 
 let win;
 let settings;
@@ -31,6 +33,9 @@ const send = (event, payload) => {
   if (win && !win.isDestroyed()) win.webContents.send(`jarvis:${event}`, payload);
 };
 const fsRoot = () => settings.get().fsRoot || os.homedir();
+// What the viewer may show and open: the chosen folder, and Jarvis's own project documents.
+const viewRoots = () => [fsRoot(), memory.projectsDir];
+const viewable = (p) => Boolean(allowedPath(p, viewRoots()));
 
 // ---- secrets (API key) ------------------------------------------------------
 
@@ -61,6 +66,9 @@ function speechCall(op, args) {
   if (!speech) {
     speech = utilityProcess.fork(path.join(here, 'speech-process.js'), [path.join(app.getPath('userData'), 'models')], { serviceName: 'Jarvis speech' });
     speech.on('message', (msg) => {
+      if (msg.type === 'status' && msg.what === 'transcript') {
+        return send('ui', msg.stopped ? { type: 'status', text: 'Transcription stopped', ttl: 2500 } : { type: 'status', text: `Transcribing — ${Math.round((msg.at / msg.of) * 100)}%`, ttl: msg.at >= msg.of ? 2500 : 0 });
+      }
       if (msg.type === 'status') return send('speech', msg);
       const pending = speechPending.get(msg.id);
       if (!pending) return;
@@ -79,6 +87,51 @@ function speechCall(op, args) {
     speechPending.set(id, { resolve, reject });
     speech.postMessage({ id, op, args });
   });
+}
+
+// ---- files on screen, and the sound inside recordings --------------------------
+
+let onScreen = null; // what the viewer shows: {path, kind, name}
+let transcribeSpeed = 0; // seconds of audio per second, measured on the last long transcription
+
+// Recordings are decoded in the window (Web Audio reads every format Chromium plays) and come back as 16 kHz mono.
+let mediaSeq = 0;
+const mediaPending = new Map();
+function mediaCall(type, file, { signal, timeout = 10 * 60_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const id = ++mediaSeq;
+    const done = (fn, value) => {
+      if (!mediaPending.delete(id)) return;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      fn(value);
+    };
+    const onAbort = () => done(reject, Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    const timer = setTimeout(() => done(reject, new Error('The window took too long to decode that file.')), timeout);
+    signal?.addEventListener('abort', onAbort);
+    mediaPending.set(id, (value) => (value?.error ? done(reject, new Error(value.error)) : done(resolve, value)));
+    send('ui', { type: 'decode_audio', id, path: file, probe: type === 'probe' });
+  });
+}
+const media = {
+  probe: (file) => mediaCall('probe', file, { timeout: 15_000 }),
+  decode: (file, { signal } = {}) => mediaCall('decode', file, { signal }),
+};
+
+/** A long recording through Whisper in slices; stops at the end of the current slice when `signal` fires. */
+async function transcribe(audio, { signal } = {}) {
+  const started = Date.now();
+  const job = speechCall('transcribe_long', { audio });
+  const id = speechSeq; // the number speechCall just gave the job
+  const onAbort = () => speech?.postMessage({ id: ++speechSeq, op: 'abort_long', args: { job: id } });
+  signal?.addEventListener('abort', onAbort);
+  try {
+    const out = await job;
+    if (audio.length >= 60 * 16000) transcribeSpeed = audio.length / 16000 / Math.max(1, (Date.now() - started) / 1000);
+    return out;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
 }
 
 // ---- state for the renderer -------------------------------------------------
@@ -166,9 +219,9 @@ function registerIpc() {
 
   handle('fs:scan', () => scan(fsRoot(), { maxDepth: settings.get().fsDepth, maxNodes: 3500 }));
   handle('fs:expand', (dir, depth) => (isInside(fsRoot(), dir) ? expand(dir, depth) : []));
-  handle('fs:open', (p) => (isInside(fsRoot(), p) ? shell.openPath(p) : 'outside root'));
+  handle('fs:open', (p) => (viewable(p) ? shell.openPath(p) : 'outside root'));
   handle('fs:reveal', (p) => {
-    if (isInside(fsRoot(), p)) shell.showItemInFolder(p);
+    if (viewable(p)) shell.showItemInFolder(p);
   });
   handle('fs:pickRoot', async () => {
     const res = await dialog.showOpenDialog(win, { title: 'Choose the folder Jarvis can see', defaultPath: fsRoot(), properties: ['openDirectory'] });
@@ -181,8 +234,14 @@ function registerIpc() {
   handle('speech:warm', (voice) => speechCall('warm', { voice }));
   handle('speech:transcribe', (audio, guess) => speechCall('transcribe', { audio, guess: Boolean(guess) }));
   handle('speech:stale', () => (speech ? speechCall('stale') : true));
+  handle('speech:partial', (audio) => (speech ? speechCall('partial', { audio }) : null));
   handle('speech:synthesize', (text, voice) => speechCall('synthesize', { text, voice }));
   handle('speech:cancel', () => (speech ? speechCall('cancel') : true));
+
+  handle('media:decoded', (id, value) => mediaPending.get(id)?.(value));
+  handle('viewer:state', (shown) => {
+    onScreen = shown?.path && viewable(shown.path) ? { path: shown.path, kind: String(shown.kind || ''), name: String(shown.name || '') } : null;
+  });
 
   handle('window:fullscreen', () => {
     win.setFullScreen(!win.isFullScreen());
@@ -234,8 +293,13 @@ app.whenReady().then(async () => {
     emit: (event) => send('chat', event),
     ui: (event) => send('ui', event),
     openPath: (p) => shell.openPath(p),
+    onScreen: () => onScreen,
+    media,
+    transcribe,
+    transcribeSpeed: () => transcribeSpeed,
   });
   memory.onChange((snapshot) => send('memory', snapshot));
+  serveFiles(protocol, viewRoots);
 
   // The window only ever asks for the microphone; grant that and nothing else. Listing the speakers
   // to choose from is its own check, so that list still works if the microphone is refused.
