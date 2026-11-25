@@ -11,6 +11,7 @@ import { Agent } from './agent.js';
 import { scan, expand, isInside } from './fsscan.js';
 import { CLOUD_MODELS } from './llm/anthropic.js';
 import { listOllamaModels } from './llm/ollama.js';
+import { ClaudeCli } from './llm/claudecli.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const windowed = process.argv.includes('--windowed');
@@ -24,6 +25,7 @@ let memory;
 let skills;
 let mcp;
 let agent;
+let claude;
 
 const send = (event, payload) => {
   if (win && !win.isDestroyed()) win.webContents.send(`jarvis:${event}`, payload);
@@ -85,6 +87,7 @@ function publicState() {
   return {
     settings: settings.get(),
     hasApiKey: Boolean(getApiKey()),
+    claude: claude.status(),
     cloudModels: CLOUD_MODELS,
     memory: memory.snapshot(),
     skills: skills.list(),
@@ -101,15 +104,26 @@ function registerIpc() {
   handle('state', publicState);
   handle('settings:set', async (patch) => {
     const before = JSON.stringify(settings.get().mcpServers);
+    const claudePath = settings.get().claudePath;
     settings.set(patch);
     if (JSON.stringify(settings.get().mcpServers) !== before) mcp.sync(settings.get().mcpServers);
     send('settings', publicState());
+    if (settings.get().claudePath !== claudePath) await claude.check({ again: true });
+    agent.prewarm(); // model, effort, the Internet switch, the brain itself: whatever changed, the next turn starts ready
     return settings.get();
   });
   handle('secrets:set', ({ anthropicKey }) => {
     writeSecrets({ ...readSecrets(), anthropicKey: String(anthropicKey || '').trim() });
     send('settings', publicState());
     return Boolean(getApiKey());
+  });
+
+  // The Claude Code login: 'claude:status' answers once it has been looked at; 'claude:check' looks again.
+  handle('claude:status', () => (claude.status().state === 'checking' ? claude.check() : claude.status()));
+  handle('claude:check', async () => {
+    const status = await claude.check({ again: true });
+    agent.prewarm();
+    return status;
   });
 
   handle('chat:send', (text, opts) => agent.send(String(text || '').trim(), opts));
@@ -133,15 +147,18 @@ function registerIpc() {
 
   handle('skills:save', (skill) => {
     skills.save(skill);
+    agent.prewarm();
     return skills.list();
   });
   handle('skills:remove', (id) => {
     skills.remove(id);
+    agent.prewarm();
     return skills.list();
   });
   handle('skills:import', async () => {
     const res = await dialog.showOpenDialog(win, { title: 'Choose a skill folder (containing SKILL.md)', properties: ['openDirectory'] });
     if (!res.canceled && res.filePaths[0]) skills.importFolder(res.filePaths[0]);
+    agent.prewarm();
     return skills.list();
   });
 
@@ -201,28 +218,40 @@ app.whenReady().then(async () => {
   settings = new Settings(dataDir);
   memory = new Memory(dataDir);
   skills = new Skills(dataDir);
-  mcp = new McpHub((status) => send('mcp', status));
+  mcp = new McpHub((status) => {
+    send('mcp', status);
+    agent?.prewarm(); // a connection's tools are part of what the next turn starts with
+  });
+  claude = new ClaudeCli({
+    workDir: path.join(dataDir, 'claude'), // an empty folder of its own, so the CLI has no project to look at
+    configuredPath: () => settings.get().claudePath,
+    onStatus: () => send('settings', publicState()),
+    log: process.env.JARVIS_DEBUG ? (line) => console.error(`[claude] ${line}`) : undefined,
+  });
   agent = new Agent({
-    settings, memory, skills, mcp, getApiKey, fsRoot,
+    settings, memory, skills, mcp, claude, getApiKey, fsRoot,
     emit: (event) => send('chat', event),
     ui: (event) => send('ui', event),
     openPath: (p) => shell.openPath(p),
   });
   memory.onChange((snapshot) => send('memory', snapshot));
 
-  // The window only ever asks for the microphone; grant that and nothing else.
+  // The window only ever asks for the microphone; grant that and nothing else. Listing the speakers
+  // to choose from is its own check, so that list still works if the microphone is refused.
   session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => cb(permission === 'media'));
-  session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === 'media');
+  session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === 'media' || permission === 'speaker-selection');
   if (process.platform === 'darwin') systemPreferences.askForMediaAccess('microphone').catch(() => {});
 
   registerIpc();
+  if (agent.brain() === 'cli') claude.check(); // find Claude Code while the window loads
   await createWindow();
-  mcp.sync(settings.get().mcpServers);
+  mcp.sync(settings.get().mcpServers).finally(() => agent.prewarm());
 });
 
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', () => {
   globalShortcut.unregisterAll();
   speech?.kill();
+  claude?.dispose();
   mcp?.closeAll();
 });

@@ -1,6 +1,7 @@
 // Ears and mouth. Listens continuously, decides when the user has started and finished a
 // thought, hands the audio to local Whisper, and speaks replies sentence by sentence as they
 // stream in — stopping instantly if the user talks over it.
+import { resolveDevice } from './devices.js';
 
 const WORKLET = `
 class Tap extends AudioWorkletProcessor {
@@ -13,6 +14,7 @@ class Tap extends AudioWorkletProcessor {
 registerProcessor('tap', Tap);`;
 
 const FRAME_MS = 20;
+const MIC = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
 
 function resample(input, fromRate, toRate) {
   if (fromRate === toRate) return input;
@@ -41,13 +43,21 @@ export function speakable(text) {
 
 export class Voice {
   /**
-   * @param cb {onUtterance(text), onBargeIn(), onState(state), onStatus(text), settings() -> voice settings}
+   * @param cb {onUtterance(text), onBargeIn(), onState(state), onStatus(text), onNotice(text), onDevices(), settings() -> voice settings}
    * state: 'idle' | 'hearing' | 'transcribing' | 'speaking'
    */
   constructor(cb) {
     this.cb = cb;
     this.level = 0; // mic or speech level 0..1, read by the orb
+    this.micLevel = 0; // the microphone alone, for the meter in the controls
     this.micOn = false;
+    // devices: what is plugged in, what is open ('' = system default), and which saved choice is being stood in for
+    this.devices = [];
+    this.micId = '';
+    this.sinkId = '';
+    this.missing = { microphone: '', speaker: '' };
+    this.micDown = false; // true once "microphone unavailable" has been said
+    globalThis.navigator?.mediaDevices?.addEventListener('devicechange', () => this.syncDevices());
     this.muted = false;
     this.ptt = false;
     // capture
@@ -87,21 +97,131 @@ export class Voice {
   // ---- listening --------------------------------------------------------------
 
   async startMic() {
-    if (this.micOn) return true;
-    try {
-      const ctx = this._ctx();
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
-      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
-      const tap = new AudioWorkletNode(ctx, 'tap');
-      tap.port.onmessage = (e) => this._onAudio(e.data);
-      ctx.createMediaStreamSource(this.stream).connect(tap);
-      this.frameSize = Math.round((ctx.sampleRate * FRAME_MS) / 1000);
-      this.micOn = true;
-      return true;
-    } catch (err) {
-      this.cb.onStatus(`Microphone unavailable (${err.message}). You can still type.`);
+    if (!this.micOn) await this.syncDevices();
+    return this.micOn;
+  }
+
+  /**
+   * Bring the open microphone and the speaker in line with the saved choices and with what is
+   * plugged in right now. Call it whenever either may have changed; calls run one after another.
+   */
+  syncDevices() {
+    this.syncing = (this.syncing || Promise.resolve()).then(() => this._sync()).catch(() => {});
+    return this.syncing;
+  }
+
+  async _sync() {
+    const s = this.cb.settings();
+    const list = () => navigator.mediaDevices.enumerateDevices().catch(() => []);
+    this.devices = await list();
+    await this._useSpeaker(s.outputDevice || '');
+    // Device names can be withheld until a microphone has been opened: look again after opening one.
+    if (await this._useMic(s.inputDevice || '')) this.devices = await list();
+    this.cb.onDevices?.();
+  }
+
+  /** All of Jarvis's sound leaves through the one context, so moving its sink moves everything. */
+  async _useSpeaker(wanted) {
+    const ctx = this._ctx();
+    if (!ctx.setSinkId) return;
+    let id = resolveDevice(this.devices, 'audiooutput', wanted);
+    if (id !== this.sinkId) {
+      try {
+        await ctx.setSinkId(id);
+      } catch {
+        id = '';
+        await ctx.setSinkId('').catch(() => {});
+      }
+      this.sinkId = id;
+    }
+    if (ctx.state === 'suspended') ctx.resume(); // the microphone is read through this context too
+    this._standIn('speaker', wanted, id);
+  }
+
+  /** Returns true if a microphone was (re)opened. */
+  async _useMic(wanted) {
+    const id = resolveDevice(this.devices, 'audioinput', wanted);
+    if (this.micOn && id === this.micId) {
+      this._standIn('microphone', wanted, id);
       return false;
     }
+    let error;
+    let opened = false;
+    // If the chosen microphone will not open, the system default is better than going deaf.
+    for (const attempt of id ? [id, ''] : ['']) {
+      error = null;
+      if (this.micOn && attempt === this.micId) break; // already standing in
+      try {
+        await this._openMic(attempt);
+        opened = true;
+        break;
+      } catch (err) {
+        error = err;
+      }
+    }
+    if (error && !this.micOn) {
+      if (!this.micDown) this.cb.onStatus(`Microphone unavailable (${error.message}). You can still type.`);
+      this.micDown = true;
+      if (this.capture && !this.ptt) this._finish(); // nothing more is coming
+      return false;
+    }
+    this.micDown = false;
+    this._standIn('microphone', wanted, this.micId);
+    return opened;
+  }
+
+  /** Say once when a saved device is missing and the system default is standing in, and when it returns. */
+  _standIn(what, wanted, used) {
+    if (wanted && used !== wanted) {
+      if (this.missing[what] !== wanted) this.cb.onNotice?.(`The saved ${what} is not available. Using the system default.`);
+      this.missing[what] = wanted;
+    } else {
+      if (wanted && this.missing[what] === wanted) this.cb.onNotice?.(`The saved ${what} is back. Using it again.`);
+      this.missing[what] = '';
+    }
+  }
+
+  /** Open a microphone ('' = system default) and swap it in for the one in use, which stays open until then. */
+  async _openMic(id) {
+    const ctx = this._ctx();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: id ? { ...MIC, deviceId: { exact: id } } : MIC });
+    try {
+      if (!this.tap) { // registered once; every microphone after the first plugs into the same tap
+        const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+        this.worklet ||= ctx.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+        await this.worklet.catch((err) => { this.worklet = null; throw err; });
+        this.tap = new AudioWorkletNode(ctx, 'tap');
+        this.tap.port.onmessage = (e) => this._onAudio(e.data);
+      }
+    } catch (err) {
+      for (const t of stream.getTracks()) t.stop();
+      throw err;
+    }
+    this._closeMic();
+    this.stream = stream;
+    this.micNode = ctx.createMediaStreamSource(stream);
+    this.micNode.connect(this.tap);
+    this.frameSize = Math.round((ctx.sampleRate * FRAME_MS) / 1000);
+    this.micId = id;
+    this.micOn = true;
+    // A different microphone has a different floor: learn it afresh. An utterance in progress carries on.
+    this.noise = 0.004;
+    this.onset = 0;
+    this.preroll = [];
+    stream.getAudioTracks()[0].onended = () => { // unplugged
+      if (this.stream !== stream) return;
+      this._closeMic();
+      this.syncDevices();
+    };
+  }
+
+  _closeMic() {
+    this.micNode?.disconnect();
+    this.micNode = null;
+    for (const t of this.stream?.getTracks() || []) { t.onended = null; t.stop(); }
+    this.stream = null;
+    this.micOn = false;
+    this.micLevel = 0;
   }
 
   setMuted(muted) {
@@ -136,6 +256,7 @@ export class Voice {
     let sum = 0;
     for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
     const rms = Math.sqrt(sum / frame.length);
+    this.micLevel = Math.min(1, rms * 9);
     if (!this.speaking) this.level = Math.min(1, rms * 9);
 
     const s = this.cb.settings();
@@ -263,7 +384,7 @@ export class Voice {
         this.pendingSpeech--;
         if (this.pendingSpeech === 0) {
           this.level = 0;
-          this.holdUntil = performance.now() + 350; // let the room echo die before trusting the mic
+          this.holdUntil = performance.now() + 350 + this._lag(); // let the room echo die before trusting the mic
           this.cb.onState('idle');
         }
       }
@@ -320,6 +441,34 @@ export class Voice {
       wobble();
       setTimeout(done, 400 + text.length * 120); // some OS voices never fire onend
     });
+  }
+
+  /** How far behind the speaker runs (ms): a wireless or HDMI output is still sounding after the last sample is sent. */
+  _lag() {
+    return Math.min(1000, (this.ctx?.outputLatency || 0) * 1000);
+  }
+
+  /** A short two-note chime through the chosen speaker, to confirm where Jarvis will be heard. */
+  testTone() {
+    const ctx = this._ctx();
+    const t0 = ctx.currentTime + 0.03;
+    let last;
+    for (const [freq, at] of [[587.33, 0], [880, 0.15]]) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, t0 + at);
+      gain.gain.exponentialRampToValueAtTime(0.2, t0 + at + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + at + 0.5);
+      osc.connect(gain).connect(this.analyser);
+      osc.start(t0 + at);
+      osc.stop(t0 + at + 0.52);
+      osc.onended = () => gain.disconnect();
+      last = osc;
+    }
+    // The microphone will hear the chime; it is not the user starting to speak.
+    if (!this.capture) this.holdUntil = Math.max(this.holdUntil, performance.now() + 1000 + this._lag());
+    return new Promise((resolve) => last.addEventListener('ended', resolve));
   }
 
   /** Stop talking immediately. Returns what had actually been said aloud so far. */

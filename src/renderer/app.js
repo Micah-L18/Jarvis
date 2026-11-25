@@ -8,6 +8,7 @@ import { Stage, screenPass, steadyBloom, setCaptionBand, easeCaptionBand } from 
 import { Graph3D } from './graph.js';
 import { Voice } from './voice.js';
 import { Panel, h } from './panel.js';
+import { claudeLogin, brainChip } from './brain.js';
 
 const api = window.jarvis;
 const $ = (id) => document.getElementById(id);
@@ -479,9 +480,10 @@ function setStatus(text, ttl = 0) {
 let muted = false;
 function renderChips() {
   const s = state.settings;
-  const model = s.provider === 'cloud' ? (state.cloudModels.find((m) => m.id === s.cloudModel)?.label || s.cloudModel).replace(/^Claude /, '').replace(/ \(.*/, '') : s.localModel || 'no model';
-  $('chip-brain').textContent = `${s.provider === 'cloud' ? 'Cloud' : 'Local'} · ${model}`;
+  const brain = brainChip(state);
+  $('chip-brain').textContent = brain.text;
   $('chip-brain').classList.toggle('cool', s.provider === 'local');
+  $('chip-brain').classList.toggle('off', brain.off);
   $('chip-net').textContent = s.webSearch ? 'Internet on' : 'Internet off';
   $('chip-net').classList.toggle('off', !s.webSearch);
   $('chip-mic').textContent = muted ? 'Mic muted' : s.voice.handsFree ? 'Listening' : 'Push to talk';
@@ -501,6 +503,7 @@ const panel = new Panel($('panel'), {
   focusMind: (id) => { if (view !== 'mind') setView('mind'); const n = mind.byId.get(id); if (n) select(n, mind); },
   setView,
   rescanFiles: () => { filesLoaded = false; loadFiles(true); if (view !== 'files') setView('files'); },
+  voice: () => voice,
 });
 $('btn-panel').onclick = () => panel.toggle();
 
@@ -541,7 +544,9 @@ const voice = new Voice({
     if (s === 'idle' && !generating) { voice.settle(); restCaptions(); if ($('said-user').textContent === '…') showUser(''); }
   },
   onStatus: (text) => toast(text, true),
-  onBargeIn: () => interrupt(),
+  onNotice: (text) => toast(text),
+  onDevices: () => panel.refreshDevices(),
+  onBargeIn: () => cutOff(),
   onUtterance: (text) => sendToJarvis(text),
 });
 
@@ -556,10 +561,14 @@ function interrupt() {
 }
 
 let pendingInterrupted = '';
+/** Interrupt, and keep what was heard of an unfinished reply so the next turn can record it as cut off. */
+function cutOff() {
+  pendingInterrupted = interrupt() || pendingInterrupted;
+}
 function sendToJarvis(text) {
   text = text.trim();
   if (!text) return;
-  pendingInterrupted = interrupt() || pendingInterrupted;
+  cutOff();
   showUser(text);
   showJarvis('');
   generating = true;
@@ -609,7 +618,7 @@ api.on('memory', (snapshot) => {
   if (keep && !mind.byId.has(keep)) select(null);
   panel.render();
 });
-api.on('settings', (next) => { state = next; renderChips(); panel.render(); });
+api.on('settings', (next) => { state = next; renderChips(); panel.render(); voice.syncDevices(); });
 api.on('mcp', (status) => { state.mcp = status; panel.render(); });
 api.on('speech', (msg) => {
   const what = msg.what === 'voice' ? 'voice' : 'speech recognition';
@@ -636,13 +645,13 @@ window.addEventListener('keydown', (e) => {
     if (!form.hidden) form.hidden = true;
     else if (panel.open) panel.toggle(false);
     else if (selected) select(null);
-    else if (generating || voice.speaking) interrupt();
+    else if (generating || voice.speaking) cutOff();
     return;
   }
   if (e.key === 'Tab' && !typing()) { e.preventDefault(); panel.toggle(); return; }
   if (typing() || e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.key === '/' || e.key === 'Enter') { e.preventDefault(); form.hidden = false; input.focus(); }
-  else if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) { interrupt(); voice.pushToTalk(true); } }
+  else if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) { cutOff(); voice.pushToTalk(true); } }
   else if (e.key === '1') setView('core');
   else if (e.key === '2') setView('mind');
   else if (e.key === '3') setView('files');
@@ -713,7 +722,16 @@ window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, pane
 
 (async () => {
   const s = state.settings;
-  if (s.provider === 'cloud' && !state.hasApiKey) toast('To wake the cloud brain, add an Anthropic API key under Brain in the panel (Tab) — or switch to Local.');
+  if (s.provider === 'cloud' && s.cloudAuth === 'key') {
+    if (!state.hasApiKey) toast('To wake the cloud brain, add an Anthropic API key under Brain in the panel (Tab) — or sign in with your Claude login there, or switch to Local.');
+  } else if (s.provider === 'cloud') {
+    api.invoke('claude:status').then((claude) => {
+      state.claude = claude;
+      renderChips();
+      const { toast: problem } = claudeLogin(claude);
+      if (problem) toast(problem, true);
+    });
+  }
   const micOk = await voice.startMic();
   if (!micOk) { muted = true; renderChips(); }
   try {

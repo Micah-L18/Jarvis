@@ -4,6 +4,8 @@ import path from 'node:path';
 
 export const DEFAULT_SETTINGS = {
   provider: 'cloud', // 'cloud' (Anthropic) | 'local' (Ollama)
+  cloudAuth: 'cli', // how the cloud brain signs in: 'cli' (the Claude Code login on this computer) | 'key' (an Anthropic API key)
+  claudePath: '', // where the claude program is, if it is not found by itself
   cloudModel: 'claude-opus-5-5',
   effort: 'low', // low | medium | high — how hard the cloud model thinks before answering
   localModel: '',
@@ -15,6 +17,8 @@ export const DEFAULT_SETTINGS = {
     tts: 'kokoro', // 'kokoro' (local neural voice) | 'system' (OS voices) | 'off'
     kokoroVoice: 'bm_george',
     systemVoice: '',
+    inputDevice: '', // microphone and speaker device ids; '' follows the system default
+    outputDevice: '',
     handsFree: true,
     bargeIn: true,
   },

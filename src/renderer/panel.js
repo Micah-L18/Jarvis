@@ -1,4 +1,7 @@
 // The control panel: brain, voice, skills, connections, projects, memory, files, system.
+import { deviceOptions } from './devices.js';
+import { claudeLogin } from './brain.js';
+
 const api = window.jarvis;
 
 export function h(tag, props = {}, ...children) {
@@ -20,7 +23,7 @@ const KOKORO_VOICES = [
 ];
 
 export class Panel {
-  /** @param app {state(), toast(text, error?), focusMind(id), setView(view), rescanFiles()} */
+  /** @param app {state(), toast(text, error?), focusMind(id), setView(view), rescanFiles(), voice() -> Voice} */
   constructor(root, app) {
     this.root = root;
     this.app = app;
@@ -39,7 +42,45 @@ export class Panel {
     if (open) {
       this.render();
       this.refreshLocalModels();
+      this.app.voice().syncDevices(); // look again at what is plugged in; the lists follow in refreshDevices()
+      this.runMeter();
     }
+  }
+
+  deviceSelect(kind, saved, onchange) {
+    const el = this.select(saved, deviceOptions(this.app.voice().devices, kind, saved), onchange);
+    el.dataset.devices = kind;
+    el.style.cssText = 'flex:1;min-width:0';
+    return el;
+  }
+
+  /** Something was plugged in or pulled out: redo the two device lists where they stand, leaving the rest of the panel (and whatever is being typed) alone. */
+  refreshDevices() {
+    if (!this.open) return;
+    const v = this.app.state().settings.voice;
+    for (const el of this.root.querySelectorAll('select[data-devices]')) {
+      const saved = (el.dataset.devices === 'audioinput' ? v.inputDevice : v.outputDevice) || '';
+      const options = deviceOptions(this.app.voice().devices, el.dataset.devices, saved);
+      if (options.length === el.options.length && options.every(([id, label], i) => el.options[i].value === id && el.options[i].text === label)) continue;
+      el.replaceChildren(...options.map(([id, label]) => h('option', { value: id }, label)));
+      el.value = saved;
+    }
+  }
+
+  /** The microphone level: one transform a frame while the panel is open, nothing once it is closed. */
+  runMeter() {
+    if (this.metering) return;
+    this.metering = true;
+    let bar = null;
+    let shown = 0;
+    const tick = () => {
+      if (!this.open) { this.metering = false; return; }
+      if (bar !== this.meterBar) { bar = this.meterBar; shown = 0; } // the panel was redrawn
+      const level = Math.max(this.app.voice().micLevel, shown * 0.88); // quick up, easy down
+      if (bar && Math.abs(level - shown) > 0.004) bar.style.transform = `scaleX(${(shown = level).toFixed(3)})`;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   }
 
   async refreshLocalModels() {
@@ -80,12 +121,9 @@ export class Panel {
     const s = st.settings;
     const cloud = s.provider === 'cloud';
     let keyInput;
-    const body = cloud
+    const login = claudeLogin(st.claude);
+    const signIn = s.cloudAuth === 'key'
       ? [
-          h('label', {}, 'Model'),
-          this.select(s.cloudModel, st.cloudModels.map((m) => [m.id, m.label]), (v) => this.set({ cloudModel: v })),
-          h('label', {}, 'Thinking'),
-          this.select(s.effort, [['low', 'Quick — best for conversation'], ['medium', 'Balanced'], ['high', 'Deep — slower, more careful']], (v) => this.set({ effort: v })),
           h('label', {}, `Anthropic API key ${st.hasApiKey ? '· saved' : '· needed'}`),
           h('div', { class: 'row' },
             (keyInput = h('input', { type: 'password', placeholder: st.hasApiKey ? '••••••••••••' : 'sk-ant-…', style: 'flex:1', 'data-live': '1' })),
@@ -96,6 +134,30 @@ export class Panel {
               this.app.toast('API key saved on this computer.');
             } }, 'Save')),
           h('p', { class: 'note' }, 'What you say and the tools\' results are sent to Anthropic. The key is stored encrypted with your OS keychain.'),
+        ]
+      : [
+          h('div', { class: 'row', style: 'margin-top:8px;flex-wrap:nowrap' },
+            h('span', { class: `dot ${login.dot}` }),
+            h('div', { style: 'flex:1;min-width:0;font:10px/1.6 var(--mono);color:var(--hot)', title: st.claude?.path || '' }, login.line),
+            h('button', { class: 'btn', title: 'Look for Claude Code and its sign-in again', onclick: async () => {
+              st.claude = await api.invoke('claude:check');
+              this.render();
+              const now = claudeLogin(st.claude);
+              this.app.toast(now.line, !now.ok);
+            } }, 'Re-check')),
+          h('label', {}, 'Path to claude (optional)'),
+          this.text(s.claudePath, (v) => this.set({ claudePath: v }), { placeholder: st.claude?.path || 'found automatically' }),
+          h('p', { class: 'note' }, 'Uses the sign-in of the Claude Code CLI on this computer — no API key. What you say and the tools\' results are sent to Anthropic and count against your Claude plan. Nothing else from your Claude Code setup is used.'),
+        ];
+    const body = cloud
+      ? [
+          h('label', {}, 'Model'),
+          this.select(s.cloudModel, st.cloudModels.map((m) => [m.id, m.label]), (v) => this.set({ cloudModel: v })),
+          h('label', {}, 'Thinking'),
+          this.select(s.effort, [['low', 'Quick — best for conversation'], ['medium', 'Balanced'], ['high', 'Deep — slower, more careful']], (v) => this.set({ effort: v })),
+          h('label', {}, 'Sign in with'),
+          this.select(s.cloudAuth, [['cli', 'Claude login (Claude Code CLI)'], ['key', 'API key']], (v) => this.set({ cloudAuth: v })),
+          ...signIn,
         ]
       : [
           h('label', {}, 'Ollama address'),
@@ -128,6 +190,15 @@ export class Panel {
       this.select(v.tts, [['kokoro', 'Neural voice (local)'], ['system', 'System voice'], ['off', 'Silent — captions only']], (x) => setV({ tts: x })),
       v.tts === 'kokoro' && this.select(v.kokoroVoice, KOKORO_VOICES, (x) => setV({ kokoroVoice: x })),
       v.tts === 'system' && this.select(v.systemVoice, [['', 'Best British voice available'], ...sysVoices.map((x) => [x.name, x.name])], (x) => setV({ systemVoice: x })),
+      h('label', {}, 'Microphone'),
+      h('div', { class: 'row' },
+        this.deviceSelect('audioinput', v.inputDevice, (x) => setV({ inputDevice: x })),
+        h('div', { class: 'meter', title: 'What the microphone hears' }, (this.meterBar = h('i')))),
+      h('label', {}, 'Speaker'),
+      h('div', { class: 'row' },
+        this.deviceSelect('audiooutput', v.outputDevice, (x) => setV({ outputDevice: x })),
+        h('button', { class: 'btn', title: 'Play a short tone through this speaker', onclick: () => this.app.voice().testTone() }, 'Test')),
+      v.tts === 'system' && h('p', { class: 'note' }, 'The system voice always plays through the system default speaker. Only the neural voice follows this choice.'),
       h('div', { style: 'margin-top:8px' },
         this.toggleRow('Hands-free: always listening', v.handsFree, (x) => setV({ handsFree: x })),
         this.toggleRow('Let me interrupt while it is talking', v.bargeIn, (x) => setV({ bargeIn: x }))),

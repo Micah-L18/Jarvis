@@ -111,6 +111,8 @@ button { cursor: pointer; background: none; border: 0; }
 .toggle i::after { content: ""; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px; background: var(--dim); transition: 0.15s; }
 .toggle.on i { border-color: var(--amber); }
 .toggle.on i::after { left: 20px; background: var(--amber); box-shadow: 0 0 8px var(--orange); }
+.meter { flex: none; width: 52px; height: 6px; border: 1px solid var(--line); }
+.meter i { display: block; height: 100%; background: var(--amber); box-shadow: 0 0 6px var(--orange); transform: scaleX(0); transform-origin: left; will-change: transform; }
 .list { max-height: 260px; overflow-y: auto; }
 .item { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid rgba(255, 150, 40, 0.1); font-size: 12px; }
 .item .grow { flex: 1; min-width: 0; }

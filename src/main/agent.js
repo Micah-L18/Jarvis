@@ -1,8 +1,10 @@
 // The agent: builds the prompt, runs a turn on whichever brain is selected, and afterwards
 // quietly files what was said into the mind map.
 import { builtinTools } from './tools.js';
+import { mentions } from './memory.js';
 import { runAnthropicTurn, extractJsonAnthropic, describeError, isAbort } from './llm/anthropic.js';
 import { runOllamaTurn, extractJsonOllama, describeOllamaError } from './llm/ollama.js';
+import { describeCliError } from './llm/claudecli.js';
 
 function persona({ userName, address }) {
   const who = userName || 'the user';
@@ -71,14 +73,33 @@ const EXTRACT_SCHEMA = {
 
 export class Agent {
   /**
-   * @param deps {settings, memory, skills, mcp, getApiKey(), emit(event), ui(event), fsRoot(), openPath(p)}
-   * `providers` can be overridden in tests.
+   * @param deps {settings, memory, skills, mcp, claude, getApiKey(), emit(event), ui(event), fsRoot(), openPath(p)}
+   * `claude` is the ClaudeCli (the cloud brain on the Claude Code login). `providers` can be overridden in tests.
    */
   constructor(deps, providers = {}) {
     this.d = deps;
-    this.providers = { runAnthropicTurn, runOllamaTurn, extractJsonAnthropic, extractJsonOllama, ...providers };
+    this.providers = {
+      runAnthropicTurn, runOllamaTurn, extractJsonAnthropic, extractJsonOllama,
+      runCliTurn: (o) => deps.claude.runTurn(o), extractJsonCli: (o) => deps.claude.extractJson(o),
+      ...providers,
+    };
     this.active = null;
     this.turnId = 0;
+  }
+
+  /** Which brain a turn runs on: 'local' (Ollama), 'cli' (Claude on the Claude Code login) or 'key' (Claude on an API key). */
+  brain() {
+    const s = this.d.settings.get();
+    return s.provider === 'local' ? 'local' : s.cloudAuth === 'key' ? 'key' : 'cli';
+  }
+
+  /** Keep a Claude Code process ready for the next turn while that is the brain in use; let it go otherwise. */
+  prewarm() {
+    const claude = this.d.claude;
+    if (!claude) return;
+    if (this.brain() !== 'cli') return claude.dropSpare();
+    const s = this.d.settings.get();
+    return claude.prewarm({ model: s.cloudModel, effort: s.effort, system: this.buildSystem(), tools: this.tools(), webSearch: s.webSearch });
   }
 
   abort() {
@@ -126,6 +147,7 @@ export class Agent {
       this.d.emit({ ...event, turn: id });
     };
 
+    const forgotBefore = memory.forgotten.length;
     if (interrupted) memory.logTurn('assistant', `${interrupted} — (cut off by the user)`);
     const history = normalizeHistory(memory.recentTurns(16));
     // If the last thing on record is the user (an earlier turn was cut off before any reply), fold it into this one.
@@ -135,16 +157,22 @@ export class Agent {
     const system = this.buildSystem();
     const tools = this.tools();
     this.d.emit({ type: 'start', turn: id });
+    const brain = this.brain();
     let error = '';
     try {
-      if (s.provider === 'local') {
+      if (brain === 'local') {
         await this.providers.runOllamaTurn({
           baseUrl: s.ollamaUrl, model: s.localModel, system: `${system.stable}\n\n${system.volatile}`,
           history, userText: modelText, tools, emit, signal: controller.signal,
         });
+      } else if (brain === 'cli') {
+        await this.providers.runCliTurn({
+          model: s.cloudModel, effort: s.effort, system,
+          history, userText: modelText, tools, webSearch: s.webSearch, emit, signal: controller.signal,
+        });
       } else {
         const apiKey = this.d.getApiKey();
-        if (!apiKey) throw new Error('I need an Anthropic API key before I can use the cloud model. Add one under Brain in the panel, or switch me to the local model.');
+        if (!apiKey) throw new Error('I need an Anthropic API key before I can use the cloud model. Add one under Brain in the panel, or switch me to the Claude login or the local model.');
         await this.providers.runAnthropicTurn({
           apiKey, model: s.cloudModel, effort: s.effort, system,
           history, userText: modelText, tools, webSearch: s.webSearch, emit, signal: controller.signal,
@@ -152,17 +180,20 @@ export class Agent {
       }
     } catch (err) {
       if (!(isAbort(err) || controller.signal.aborted)) {
-        error = s.provider === 'local' ? describeOllamaError(err, s.ollamaUrl) : describeError(err);
+        error = brain === 'local' ? describeOllamaError(err, s.ollamaUrl) : brain === 'cli' ? describeCliError(err) : describeError(err);
       }
     }
     const aborted = controller.signal.aborted;
     if (this.active === controller) this.active = null;
 
+    // Something forgotten during this turn must not come back through the turn's own words
+    // ("I've deleted Ana"): such a reply stays out of the record, and the exchange is not filed.
+    const gone = memory.forgotten.slice(forgotBefore);
     // An interrupted reply is logged by the next send(), once the UI knows how much was actually heard.
-    if (spoken.trim() && !aborted) memory.logTurn('assistant', spoken.trim());
+    if (spoken.trim() && !aborted && !mentions(spoken, gone)) memory.logTurn('assistant', spoken.trim());
     if (error) this.d.emit({ type: 'error', text: error, turn: id });
     this.d.emit({ type: 'done', turn: id, aborted, text: spoken.trim() });
-    if (spoken.trim() && !error) this.learn(userText, spoken.trim()).catch(() => {});
+    if (spoken.trim() && !error && !gone.length) this.learn(userText, spoken.trim()).catch(() => {});
     return { text: spoken.trim(), aborted, error };
   }
 
@@ -170,6 +201,7 @@ export class Agent {
   async learn(userText, assistantText) {
     const { settings, memory } = this.d;
     const s = settings.get();
+    const forgotBefore = memory.forgotten.length;
     const existing = [...memory.nodes.values()].filter((n) => n.type !== 'core');
     const user = `Existing projects: ${memory.projects().map((p) => p.label).join(', ') || '(none)'}
 Active project: ${memory.nodes.get(memory.activeProject)?.label}
@@ -179,16 +211,22 @@ Latest exchange
 User: ${userText}
 Assistant: ${assistantText}`;
     let result;
-    if (s.provider === 'local') {
+    const brain = this.brain();
+    if (brain === 'local') {
       if (!s.localModel) return [];
       result = await this.providers.extractJsonOllama({ baseUrl: s.ollamaUrl, model: s.localModel, system: EXTRACT_SYSTEM, user, schema: EXTRACT_SCHEMA });
+    } else if (brain === 'cli') {
+      result = await this.providers.extractJsonCli({ system: EXTRACT_SYSTEM, user, schema: EXTRACT_SCHEMA, fallbackModel: s.cloudModel });
     } else {
       const apiKey = this.d.getApiKey();
       if (!apiKey) return [];
       result = await this.providers.extractJsonAnthropic({ apiKey, system: EXTRACT_SYSTEM, user, schema: EXTRACT_SCHEMA });
     }
     if (!result) return [];
-    const added = memory.merge({ project: (result.project || '').trim(), nodes: result.nodes || [], links: result.links || [] });
+    // If something was forgotten while this was being worked out, it does not get filed again.
+    const gone = memory.forgotten.slice(forgotBefore);
+    const nodes = (result.nodes || []).filter((n) => !mentions(`${n.label} ${n.summary || ''}`, gone));
+    const added = memory.merge({ project: (result.project || '').trim(), nodes, links: result.links || [] });
     if (added.length) this.d.ui({ type: 'learned', labels: added.map((n) => n.label) });
     return added;
   }

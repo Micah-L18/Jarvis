@@ -8,6 +8,31 @@ import { readJson, writeJson, slugify } from './store.js';
 export const NODE_TYPES = ['project', 'topic', 'person', 'fact', 'preference', 'task', 'document'];
 const CORE = 'core';
 const GENERAL = 'project:general';
+// Words too common to stand for the thing being forgotten.
+const PLAIN = new Set('the and for with from about into that this these those user users name named called new old our his her their your you are was has have had not but all any one two day days week time thing things project'.split(' '));
+
+/**
+ * The words by which a memory would be recognised in conversation: its label, each telling word of
+ * the label, and the names in its summary ("The user's sister is named Ana" gives up "Ana").
+ */
+export function tellingWords(node) {
+  const label = String(node.label || '').toLowerCase();
+  const words = new Set(label.length > 2 ? [label] : []);
+  for (const w of label.split(/[^\p{L}\p{N}]+/u)) if (w.length > 2 && !PLAIN.has(w)) words.add(w);
+  for (const m of String(node.summary || '').matchAll(/(?<![.!?]\s|^)\b\p{Lu}[\p{L}\p{N}]{2,}/gu)) if (!PLAIN.has(m[0].toLowerCase())) words.add(m[0].toLowerCase());
+  return [...words];
+}
+
+/** Does this text mention any of those words (as whole words)? */
+export function mentions(text, words) {
+  const hay = String(text || '').toLowerCase();
+  return words.some((w) => {
+    for (let at = hay.indexOf(w); at >= 0; at = hay.indexOf(w, at + 1)) {
+      if (!/[\p{L}\p{N}]/u.test(hay[at - 1] || ' ') && !/[\p{L}\p{N}]/u.test(hay[at + w.length] || ' ')) return true;
+    }
+    return false;
+  });
+}
 
 export class Memory {
   constructor(dataDir) {
@@ -20,6 +45,7 @@ export class Memory {
     this.edges = saved?.edges || [];
     this.activeProject = saved?.activeProject || GENERAL;
     this.history = readJson(this.historyFile, []);
+    this.forgotten = []; // the telling words of everything forgotten since the app started, oldest first
     this.listeners = new Set();
     if (!this.nodes.has(CORE)) this.nodes.set(CORE, { id: CORE, label: 'JARVIS', type: 'core', summary: '', created: Date.now() });
     if (!this.nodes.has(GENERAL)) this._addProject('General', 'Everything that does not belong to a specific project.', GENERAL);
@@ -171,14 +197,15 @@ export class Memory {
       for (const n of this.nodes.values()) if (n.project === node.id) doomed.add(n.id);
       if (this.activeProject === node.id) this.activeProject = GENERAL;
     }
-    const labels = [...doomed].map((id) => this.nodes.get(id).label.toLowerCase()).filter((l) => l.length > 2);
+    const words = [...new Set([...doomed].flatMap((id) => tellingWords(this.nodes.get(id))))];
     for (const id of doomed) this.nodes.delete(id);
     this.edges = this.edges.filter((e) => !doomed.has(e.source) && !doomed.has(e.target));
     const before = this.history.length;
-    this.history = this.history.filter((h) => !labels.some((l) => h.text.toLowerCase().includes(l)));
+    this.history = this.history.filter((h) => !mentions(h.text, words));
     if (this.history.length !== before) writeJson(this.historyFile, this.history);
+    this.forgotten.push(...words);
     this._save();
-    return { node, removed: doomed.size };
+    return { node, removed: doomed.size, words };
   }
 
   // ---- conversation log ---------------------------------------------------

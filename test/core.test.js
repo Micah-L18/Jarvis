@@ -171,7 +171,7 @@ test('local brain: an interrupted reply is recorded as cut off on the next turn'
   server.close();
 });
 
-test('cloud brain (Anthropic SDK against a stub): request shape and tool loop', async () => {
+test('cloud brain with an API key (Anthropic SDK against a stub): request shape and tool loop', async () => {
   const bodies = [];
   const headers = [];
   const sse = (res, events) => {
@@ -204,7 +204,7 @@ test('cloud brain (Anthropic SDK against a stub): request shape and tool loop', 
   const saved = process.env.ANTHROPIC_BASE_URL;
   process.env.ANTHROPIC_BASE_URL = url;
   try {
-    const { agent, memory, events } = makeAgent(tmp(), { provider: 'cloud', webSearch: true });
+    const { agent, memory, events } = makeAgent(tmp(), { provider: 'cloud', cloudAuth: 'key', webSearch: true });
     const result = await agent.send('remember the budget is twelve thousand');
     assert.equal(result.error, '');
     assert.equal(result.text, 'Right away. Noted, sir.');
