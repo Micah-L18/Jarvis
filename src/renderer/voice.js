@@ -36,6 +36,19 @@ function resample(input, fromRate, toRate) {
   return out;
 }
 
+/**
+ * The status line for a message from the speech process: {text, ttl}, ttl 0 meaning "until the
+ * next one" — or null when there is nothing to show. A download that broke off must end the
+ * progress line, or it stays on screen for a download that is no longer happening.
+ */
+export function speechStatus(msg) {
+  const what = msg.what === 'voice' ? 'voice' : msg.what === 'faster voice' ? 'faster voice' : 'speech recognition';
+  if (msg.failed) return { text: `The ${what} could not be downloaded — I will try again next time`, ttl: 6000 };
+  if (msg.done) return { text: `${what} ready`, ttl: 2500 };
+  if (msg.total) return { text: `Downloading ${what} model (one time) — ${Math.round((msg.loaded / msg.total) * 100)}%`, ttl: 0 };
+  return null;
+}
+
 /** Make streamed model text safe to read aloud. */
 export function speakable(text) {
   return text

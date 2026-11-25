@@ -1,12 +1,39 @@
 // What to say about the cloud brain's sign-in. One place, because the controls, the chip in the
 // corner and the wake-up toast all report it. Pure, no window.
 
-/** @param c the main process's view of Claude Code: {state: 'checking'|'ready'|'signed_out'|'old'|'missing', version, path, source} */
+const PROVIDERS = { bedrock: 'Amazon Bedrock', vertex: 'Google Vertex AI', foundry: 'Microsoft Foundry' };
+
+/**
+ * @param c the main process's view of Claude Code:
+ *   {state: 'checking'|'ready'|'signed_out'|'old'|'missing'|'provider'|'managed', version, path, source, provider, policy}
+ *   `policy`: an organisation's managed Claude Code settings are in force on this computer.
+ */
 export function claudeLogin(c = {}) {
   const name = `Claude Code${c.version ? ` ${c.version}` : ''}${c.source === 'bundled' ? ' (built in)' : ''}`;
   switch (c.state) {
     case 'ready':
-      return { ok: true, dot: 'connected', line: `${name} found · signed in`, chip: '', toast: '' };
+      // Jarvis loads nothing of the user's Claude Code setup, but what an organisation imposes cannot be switched off. Say so.
+      return c.policy
+        ? {
+            ok: true, dot: 'connected', chip: '',
+            line: `${name} found · signed in · managed by your organisation: its Claude Code policy applies here too, and any hooks it sets see what you say and what I answer.`,
+            toast: 'Claude Code on this computer is managed by your organisation. Its policy applies to me as well: any hooks it sets see what you say and what I answer. An API key or Local (under Brain, Tab) avoids that.',
+          }
+        : { ok: true, dot: 'connected', line: `${name} found · signed in`, chip: '', toast: '' };
+    case 'provider': {
+      const where = PROVIDERS[c.provider] || c.provider || 'another provider';
+      return {
+        ok: false, dot: 'error', chip: 'not a Claude login',
+        line: `${name} found, but it is set up for ${where}, not a Claude login. Use an API key or Local instead.`,
+        toast: `Claude Code on this computer is set up for ${where} rather than a Claude login, so I will not send anything through it. Switch to an API key or Local under Brain (Tab).`,
+      };
+    }
+    case 'managed':
+      return {
+        ok: false, dot: 'error', chip: 'managed Claude Code',
+        line: `${name} found, but your organisation manages it (its own MCP servers are required), so it cannot be used this way. Use an API key or Local instead.`,
+        toast: 'Claude Code on this computer is managed by your organisation and cannot be used this way. Switch to an API key or Local under Brain (Tab).',
+      };
     case 'signed_out':
       return {
         ok: false, dot: 'error', chip: 'signed out',

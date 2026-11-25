@@ -244,6 +244,7 @@ app.whenReady().then(async () => {
   if (process.platform === 'darwin') systemPreferences.askForMediaAccess('microphone').catch(() => {});
 
   registerIpc();
+  claude.sweep(); // what a crash or a kill left of Jarvis among Claude Code's running sessions
   if (agent.brain() === 'cli') claude.check(); // find Claude Code while the window loads
   await createWindow();
   mcp.sync(settings.get().mcpServers).finally(() => agent.prewarm());

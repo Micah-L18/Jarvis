@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Voice } from '../src/renderer/voice.js';
+import { Voice, speechStatus } from '../src/renderer/voice.js';
 
 // The listening rules, fed 20 ms frames by hand, with the recognizer stood in for.
 function fakeVoice(transcripts = []) {
@@ -62,4 +62,14 @@ test('voice: the opening of a reply is released at its first comma, later text s
   for (const piece of ['It is fourteen degrees', ' and overcast, sir, with rain', ' expected by four. Take a coat, I would say.']) v.voice.say(piece);
   v.voice.flush();
   assert.deepEqual(out, ['It is fourteen degrees and overcast,', 'sir, with rain expected by four.', 'Take a coat, I would say.']);
+});
+
+test('voice: the status line follows a model download to its end, including one that breaks off', () => {
+  assert.deepEqual(speechStatus({ what: 'faster voice', file: 'onnx/model.onnx', loaded: 125763584, total: 325532232 }), { text: 'Downloading faster voice model (one time) — 39%', ttl: 0 });
+  assert.deepEqual(speechStatus({ what: 'faster voice', done: true }), { text: 'faster voice ready', ttl: 2500 });
+  const failed = speechStatus({ what: 'faster voice', failed: true });
+  assert.match(failed.text, /faster voice could not be downloaded/);
+  assert.equal(failed.ttl > 0, true, 'the progress line is replaced by one that goes away');
+  assert.deepEqual(speechStatus({ what: 'listening', done: true }), { text: 'speech recognition ready', ttl: 2500 });
+  assert.equal(speechStatus({ what: 'voice', done: false }), null);
 });

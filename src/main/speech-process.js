@@ -36,7 +36,7 @@ function fetchFast() {
       tts = Promise.resolve(model);
       post({ type: 'status', what: 'faster voice', done: true });
     })
-    .catch(() => {}); // the small voice carries on
+    .catch(() => post({ type: 'status', what: 'faster voice', failed: true })); // the small voice carries on; the window stops showing a download
 }
 function getTts() {
   if (tts) return tts;

@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
+import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { ClaudeCli, CliError, describeCliError, claudeEnv, candidatePaths, composePrompt, exposeTools, sessionOptions, MIN_VERSION } from '../src/main/llm/claudecli.js';
+import { ClaudeCli, CliError, describeCliError, claudeEnv, candidatePaths, composePrompt, exposeTools, sessionOptions, sweepSessions, managedMcpFile, MIN_VERSION } from '../src/main/llm/claudecli.js';
 import { Memory, tellingWords, mentions } from '../src/main/memory.js';
 import { Settings } from '../src/main/store.js';
 import { Skills } from '../src/main/skills.js';
@@ -40,36 +41,50 @@ async function toolClient(options) {
   return client;
 }
 
-/** Stands in for the Agent SDK. `script(run)` is an async generator of the messages one process emits. */
+/** Stands in for a child process: what it was killed with, and a stderr to write to. */
+function fakeChild() {
+  return Object.assign(new EventEmitter(), { stderr: new EventEmitter(), killed: false, kill(signal) { this.killed = signal; return true; } });
+}
+
+/**
+ * Stands in for the Agent SDK. `script(run)` is an async generator of the messages one process emits;
+ * `run.child` is the process, started the way the SDK does it: through the function Jarvis hands over.
+ * `sdk.starting(child)` can delay or fail the start of a spare.
+ */
 function fakeSdk(script) {
   const runs = [];
-  const start = (how, options, prompt) => {
-    const run = { how, options, prompt, closed: false };
+  const launch = (options) => options.spawnClaudeCodeProcess({ command: options.pathToClaudeCodeExecutable, args: [], cwd: options.cwd, env: options.env, signal: options.abortController.signal });
+  const start = (how, options, prompt, child) => {
+    const run = { how, options, prompt, child, closed: false };
     runs.push(run);
     return Object.assign(script(run), { close() { run.closed = true; } });
   };
   const spares = [];
-  return {
-    runs, spares,
-    query: ({ prompt, options }) => start('query', options, prompt),
+  const sdk = {
+    runs, spares, starting: null,
+    query: ({ prompt, options }) => start('query', options, prompt, launch(options)),
     startup: async ({ options }) => {
-      const spare = { options, closed: false, used: false };
+      const spare = { options, child: launch(options), closed: false, used: false };
       spares.push(spare);
-      return { query: (prompt) => { spare.used = true; return start('spare', options, prompt); }, close() { spare.closed = true; } };
+      await sdk.starting?.(spare.child);
+      return { query: (prompt) => { spare.used = true; return start('spare', options, prompt, spare.child); }, close() { spare.closed = true; } };
     },
   };
+  return sdk;
 }
 
 const found = { path: '/usr/local/bin/claude', source: 'installed', version: '2.1.332' };
-function makeCli(script, { locate = async () => found, auth = { ok: true, stdout: '{"loggedIn":true,"authMethod":"claude.ai"}' } } = {}) {
+function makeCli(script, { locate = async () => found, auth = { ok: true, stdout: '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}' }, policy = { settings: false, mcp: false } } = {}) {
   const sdk = fakeSdk(script);
   const statuses = [];
+  const asked = [];
   const cli = new ClaudeCli({
     workDir: path.join(tmp(), 'claude'), sdk, locate, onStatus: (s) => statuses.push(s.state),
     env: claudeEnv({ PATH: '/bin', ANTHROPIC_API_KEY: 'sk-test', ANTHROPIC_AUTH_TOKEN: 't', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli' }),
-    exec: async (_file, args) => (args[0] === 'auth' ? auth : { ok: true, stdout: `${found.version} (Claude Code)` }),
+    exec: async (_file, args) => { asked.push(args.join(' ')); return args.includes('auth') ? auth : { ok: true, stdout: `${found.version} (Claude Code)` }; },
+    spawn: fakeChild, policy: async () => policy,
   });
-  return { cli, sdk, statuses };
+  return { cli, sdk, statuses, asked };
 }
 
 const remembered = [];
@@ -169,7 +184,10 @@ test('claude cli: only Jarvis tools reach the model; web tools only with the Int
   for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT']) assert.equal(key in o.env, false, `${key} is not passed on`);
   assert.deepEqual([o.env.ENABLE_CLAUDEAI_MCP_SERVERS, o.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS, o.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY], ['false', '1', '1']);
   assert.doesNotMatch(o.systemPrompt, /Sources/);
-  for (const key of ['hooks', 'agents', 'resume', 'continue', 'canUseTool', 'additionalDirectories', 'settings']) assert.equal(key in o, false);
+  for (const key of ['hooks', 'agents', 'resume', 'continue', 'canUseTool', 'additionalDirectories', 'managedSettings', 'stderr']) assert.equal(key in o, false);
+  assert.deepEqual(o.settings, { crossSessionInbound: 'refuse' }, 'the only setting: other Claude Code sessions cannot send this one a message');
+  assert.equal(o.includeHookEvents, true);
+  assert.equal(typeof o.spawnClaudeCodeProcess, 'function', 'Jarvis starts the process itself, so that it can stop it');
 
   const on = [];
   const text = await cli.runTurn(turn({ webSearch: true, emit: (e) => on.push(e) }));
@@ -194,9 +212,12 @@ test('claude cli: only Jarvis tools reach the model; web tools only with the Int
 
 test('claude cli: a CLI that offers anything else is stopped before the model can use it', async () => {
   let controller;
-  const { cli } = makeCli(async function* (run) {
+  const ran = [];
+  const { cli, sdk } = makeCli(async function* (run) {
     controller = run.options.abortController;
-    yield { ...init(run.options), tools: ['mcp__jarvis__remember', 'Bash'] };
+    // The real process does not wait to be read: it sends the prompt and runs what the model calls, a moment after reporting its tools.
+    setTimeout(() => { if (!run.child.killed) ran.push(`${run.how}: the model called Bash`); }, 15);
+    yield { ...init(run.options), tools: [...(run.options.outputFormat ? ['StructuredOutput'] : ['mcp__jarvis__remember']), 'Bash'] };
     yield say('rm -rf');
     yield done();
   });
@@ -204,9 +225,20 @@ test('claude cli: a CLI that offers anything else is stopped before the model ca
   const err = await cli.runTurn(turn({ emit: (e) => events.push(e) })).catch((e) => e);
   assert.equal(err.kind, 'unsafe');
   assert.match(err.message, /Bash/);
+  assert.equal(sdk.runs[0].child.killed, 'SIGKILL', 'killed outright: asked to stop, it would finish the turn first');
   assert.equal(controller.signal.aborted, true);
   assert.deepEqual(events, []);
   assert.match(describeCliError(err), /tools I did not ask for/);
+
+  // the same from a parked process, and for background filing
+  await cli.prewarm(turn());
+  assert.equal((await cli.runTurn(turn()).catch((e) => e)).kind, 'unsafe');
+  assert.deepEqual([sdk.runs[1].how, sdk.runs[1].child.killed], ['spare', 'SIGKILL']);
+  assert.equal((await cli.extractJson({ system: 'Extract.', user: 'x', schema: { type: 'object' } }).catch((e) => e)).kind, 'unsafe');
+  assert.equal(sdk.runs[2].child.killed, 'SIGKILL');
+  await tick(40);
+  assert.deepEqual(ran, [], 'nothing ran after the refusal');
+  cli.dispose();
 
   const other = makeCli(async function* (run) {
     yield { ...init(run.options), mcp_servers: [{ name: 'jarvis' }, { name: 'github' }] };
@@ -304,6 +336,60 @@ test('claude cli: interrupting stops at once, and the next turn works', async ()
   assert.equal(sdk.runs.length, before, 'nothing is started for a turn that was already abandoned');
 });
 
+test('claude cli: an interruption while Claude Code is still being looked for is not lost', async () => {
+  const { cli, sdk } = makeCli(async function* (run) {
+    yield init(run.options);
+    yield calls('mcp__jarvis__forget');
+    yield say('Deleting that now. Done.');
+    yield done();
+  }, { locate: async () => { await tick(60); return found; } });
+  const ac = new AbortController();
+  const events = [];
+  const pending = cli.runTurn(turn({ emit: (e) => events.push(e), signal: ac.signal })).catch((e) => e);
+  await tick(20); // the first turn of a session: still finding the binary and reading the sign-in
+  ac.abort();
+  assert.equal((await pending).name, 'AbortError');
+  await tick(80);
+  assert.deepEqual([sdk.runs.length, sdk.spares.length, events.length], [0, 0, 0], 'no process, no tool call, nothing said');
+  assert.equal(await cli.runTurn(turn()), 'Deleting that now. Done.', 'and the next turn works');
+  cli.dispose();
+});
+
+test('claude cli: a spare taken by a turn that is then interrupted is closed if another was started meanwhile', async () => {
+  const { cli, sdk } = makeCli(async function* (run) {
+    yield init(run.options);
+    yield say('Here.');
+    yield done();
+  });
+  sdk.starting = () => tick(60); // a spare takes a while to be ready
+  await cli.prewarm(turn());
+  const ac = new AbortController();
+  const pending = cli.runTurn(turn({ signal: ac.signal })).catch((e) => e); // takes the spare and waits for it
+  await tick(10);
+  await cli.prewarm(turn()); // a connection came up, a setting was flipped: nothing parked, so another is started
+  assert.equal(sdk.spares.length, 2);
+  ac.abort();
+  assert.equal((await pending).name, 'AbortError');
+  await tick(100);
+  assert.deepEqual(sdk.spares.map((s) => [s.used, s.closed]), [[false, true], [false, false]], 'the one nobody holds any more is closed; the other waits for the next turn');
+  cli.dispose();
+  await tick();
+  assert.deepEqual(sdk.spares.map((s) => s.closed), [true, true], 'nothing is left running');
+
+  // without another prewarm in between, the spare goes back to serve the next turn
+  const again = makeCli(async function* (run) { yield init(run.options); yield say(`from ${run.how}`); yield done(); });
+  again.sdk.starting = () => tick(40);
+  await again.cli.prewarm(turn());
+  const stop = new AbortController();
+  const cut = again.cli.runTurn(turn({ signal: stop.signal })).catch((e) => e);
+  await tick(10);
+  stop.abort();
+  await cut;
+  assert.equal(await again.cli.runTurn(turn()), 'from spare');
+  assert.equal(again.sdk.spares.length >= 1 && again.sdk.spares[0].used, true);
+  again.cli.dispose();
+});
+
 test('claude cli: failures are told apart, never spoken as if they were the reply', async () => {
   const cases = {
     signedOut: [cliSays('authentication_failed', 'Not logged in · Please run /login'), done({ is_error: true })],
@@ -367,6 +453,8 @@ test('claude cli: finding Claude Code and reading its sign-in', async () => {
   await ready.cli.check();
   assert.deepEqual(ready.statuses, ['ready'], 'told once, not on every look');
 
+  assert.deepEqual(ready.asked.slice(0, 1), ['--setting-sources= auth status'], 'the sign-in is read as a turn sees it: without the user\'s settings files');
+
   const out = makeCli(async function* () { yield done(); }, { auth: { ok: false, stdout: '{"loggedIn":false,"authMethod":"none"}' } });
   assert.equal((await out.cli.check()).state, 'signed_out');
   await out.cli.prewarm(turn());
@@ -396,6 +484,128 @@ test('claude cli: finding Claude Code and reading its sign-in', async () => {
   for (const p of ['/opt/homebrew/bin/claude', '/usr/local/bin/claude', '/Users/ana/.claude/local/claude', '/Users/ana/.npm-global/bin/claude', '/Users/ana/.bun/bin/claude']) assert.equal(mac.includes(p), true, p);
   const win = candidatePaths({ env: { Path: 'C:\\Windows', APPDATA: 'C:\\Users\\ana\\AppData\\Roaming', LOCALAPPDATA: 'C:\\Users\\ana\\AppData\\Local' }, platform: 'win32', home: 'C:\\Users\\ana' });
   for (const p of ['C:\\Users\\ana\\.local\\bin\\claude.exe', 'C:\\Users\\ana\\AppData\\Roaming\\npm\\claude.cmd']) assert.equal(win.includes(p), true, p);
+});
+
+test('claude cli: nothing inherited decides where a turn goes or who pays for it', async () => {
+  // a shell set up for a gateway, for Bedrock, and a Claude Code terminal Jarvis was started from
+  const env = claudeEnv({
+    PATH: '/bin', HTTPS_PROXY: 'http://proxy:8080', AWS_REGION: 'us-east-1',
+    ANTHROPIC_API_KEY: 'sk-ant-x', ANTHROPIC_AUTH_TOKEN: 'gateway-token', ANTHROPIC_BASE_URL: 'https://gateway.example', ANTHROPIC_BEDROCK_BASE_URL: 'https://b.example',
+    ANTHROPIC_MODEL: 'm', ANTHROPIC_CUSTOM_HEADERS: 'X-Team: a', ANTHROPIC_VERTEX_PROJECT_ID: 'p', ANTHROPIC_FOUNDRY_RESOURCE: 'r',
+    CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_USE_VERTEX: '1', CLAUDE_CODE_USE_FOUNDRY: '1', CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat-x', CLAUDE_CODE_API_KEY_HELPER_TTL_MS: '1',
+    CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_SESSION_ID: 's', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/s.sock', CLAUDE_PID: '7', claude_code_use_bedrock: '1',
+    CLAUDE_CONFIG_DIR: '/home/ana/.claude-work', CLAUDE_CODE_GIT_BASH_PATH: 'C:\\Git\\bin\\bash.exe',
+  });
+  assert.deepEqual(Object.keys(env).filter((k) => /^(ANTHROPIC|CLAUDE)/i.test(k)).sort(), [
+    'CLAUDE_AGENT_SDK_CLIENT_APP', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'CLAUDE_CODE_DISABLE_CLAUDE_MDS', // Jarvis's own switches
+    'CLAUDE_CODE_GIT_BASH_PATH', 'CLAUDE_CONFIG_DIR', // where the login is kept, and where Windows finds its shell
+  ], 'no key, token, endpoint, model or provider switch survives');
+  assert.deepEqual([env.PATH, env.HTTPS_PROXY, env.AWS_REGION, env.CLAUDE_CONFIG_DIR], ['/bin', 'http://proxy:8080', 'us-east-1', '/home/ana/.claude-work']);
+
+  // a login that is really Bedrock, Vertex or a gateway (an organisation's settings can still make it so) is not used at all
+  const script = async function* (run) { yield init(run.options); yield say('Billed to AWS.'); yield done(); };
+  const bedrock = makeCli(script, { auth: { ok: true, stdout: '{"loggedIn":true,"authMethod":"third_party","apiProvider":"bedrock"}' } });
+  assert.deepEqual(await bedrock.cli.check(), { state: 'provider', path: '/usr/local/bin/claude', source: 'installed', version: '2.1.332', loggedIn: true, provider: 'bedrock' });
+  await bedrock.cli.prewarm(turn());
+  const err = await bedrock.cli.runTurn(turn()).catch((e) => e);
+  assert.equal(err.kind, 'provider');
+  assert.deepEqual([bedrock.sdk.runs.length, bedrock.sdk.spares.length], [0, 0], 'no process is started');
+  assert.match(describeCliError(err), /set up to use bedrock rather than a Claude login, so I will not send anything through it\. Switch me to an API key or the local model/);
+  assert.equal(claudeLogin(bedrock.cli.status()).ok, false);
+  assert.match(claudeLogin(bedrock.cli.status()).line, /set up for Amazon Bedrock, not a Claude login/);
+  // a CLI too old to name its provider is taken at its word
+  const unnamed = makeCli(script, { auth: { ok: true, stdout: '{"loggedIn":true}' } });
+  assert.equal((await unnamed.cli.check()).state, 'ready');
+});
+
+test('claude cli: what an organisation imposes on Claude Code is said, and its MCP servers are not worked around', async () => {
+  // managed settings: Jarvis cannot switch them off, so the status carries it for the controls to show
+  const script = async function* (run) { yield init(run.options); yield say('Here.'); yield done(); };
+  const policed = makeCli(script, { policy: { settings: true, mcp: false } });
+  assert.deepEqual(await policed.cli.check(), { state: 'ready', path: '/usr/local/bin/claude', source: 'installed', version: '2.1.332', loggedIn: true, policy: true });
+  assert.match(claudeLogin(policed.cli.status()).line, /signed in · managed by your organisation: its Claude Code policy applies here too, and any hooks it sets see what you say/);
+  assert.match(claudeLogin(policed.cli.status()).toast, /managed by your organisation/);
+  assert.equal(claudeLogin(policed.cli.status()).ok, true);
+
+  // a policy the check could not see (delivered some other way) shows itself when one of its hooks runs
+  const hooked = makeCli(async function* (run) {
+    yield init(run.options);
+    yield { type: 'system', subtype: 'hook_started', hook_id: 'h1', hook_name: 'UserPromptSubmit', hook_event: 'UserPromptSubmit' };
+    yield say('Here.');
+    yield done();
+  });
+  assert.equal((await hooked.cli.check()).policy, undefined);
+  assert.equal(await hooked.cli.runTurn(turn()), 'Here.');
+  assert.equal(hooked.cli.status().policy, true);
+  assert.deepEqual(hooked.statuses, ['ready', 'ready'], 'the controls are told');
+  assert.equal((await hooked.cli.check({ again: true })).policy, true, 'and it is not forgotten on a re-check');
+  hooked.cli.dispose();
+
+  // managed MCP servers: the CLI will not start without them and Jarvis will not start it with them
+  const servers = makeCli(script, { policy: { settings: false, mcp: true } });
+  assert.equal((await servers.cli.check()).state, 'managed');
+  await servers.cli.prewarm(turn());
+  const refused = await servers.cli.runTurn(turn()).catch((e) => e);
+  assert.equal(refused.kind, 'managed');
+  assert.deepEqual([servers.sdk.runs.length, servers.sdk.spares.length], [0, 0]);
+  assert.equal(describeCliError(refused), 'Claude Code on this computer is managed by your organisation and cannot be used this way. Switch me to an API key or the local model under Brain.');
+  assert.deepEqual([claudeLogin(servers.cli.status()).ok, claudeLogin(servers.cli.status()).chip], [false, 'managed Claude Code']);
+
+  // the same when only the CLI's refusal gives it away: first from the parked process, at launch …
+  const exits = (child) => {
+    child.stderr.emit('data', 'You cannot use --strict-mcp-config when an enterprise MCP config is present\n');
+    child.emit('close', 1, null);
+    throw new Error('Claude Code process exited with code 1');
+  };
+  const parked = makeCli(script);
+  parked.sdk.starting = exits;
+  await parked.cli.prewarm(turn());
+  await tick();
+  assert.equal(parked.cli.status().state, 'managed');
+  assert.deepEqual(parked.statuses, ['ready', 'managed']);
+  await parked.cli.prewarm(turn());
+  assert.equal(parked.sdk.spares.length, 1, 'it is not started over and over');
+  assert.equal((await parked.cli.runTurn(turn()).catch((e) => e)).kind, 'managed');
+  assert.equal(parked.sdk.runs.length, 0);
+  // … and from a turn
+  const cold = makeCli(async function* (run) { exits(run.child); yield done(); });
+  await cold.cli.check();
+  const spoken = describeCliError(await cold.cli.runTurn(turn()).catch((e) => e));
+  assert.match(spoken, /managed by your organisation/);
+  assert.doesNotMatch(spoken, /stderr|strict-mcp-config|exited with code/);
+  assert.equal(cold.cli.status().state, 'managed');
+  assert.equal(await cold.cli.extractJson({ system: 'Extract.', user: 'x', schema: { type: 'object' } }).catch((e) => e.kind), 'managed');
+  // any other early exit still says what the CLI said
+  const other = makeCli(async function* (run) {
+    run.child.stderr.emit('data', 'error: unknown option --frobnicate\n');
+    run.child.emit('close', 1, null);
+    throw new Error('Claude Code process exited with code 1');
+    yield done(); // eslint-disable-line no-unreachable
+  });
+  assert.match(describeCliError(await other.cli.runTurn(turn()).catch((e) => e)), /returned an error: Claude Code process exited with code 1\. error: unknown option --frobnicate/);
+
+  assert.equal(managedMcpFile({ platform: 'linux' }), '/etc/claude-code/managed-mcp.json');
+  assert.equal(managedMcpFile({ platform: 'darwin' }), '/Library/Application Support/ClaudeCode/managed-mcp.json');
+  assert.equal(managedMcpFile({ platform: 'win32', env: { ProgramFiles: 'D:\\Programs' } }), 'D:\\Programs\\ClaudeCode\\managed-mcp.json');
+});
+
+test('claude cli: what a killed process left among Claude Code\'s running sessions is removed, and only that', () => {
+  const dir = tmp();
+  const work = path.join(tmp(), 'claude');
+  const sock = path.join(dir, '111.sock');
+  const put = (name, body) => fs.writeFileSync(path.join(dir, name), typeof body === 'string' ? body : JSON.stringify(body));
+  put('111.json', { pid: 111, cwd: work, name: 'Jarvis', messagingSocketPath: sock }); // Jarvis's, killed
+  put('111.0fa54e.key', 'k');
+  put('111.sock', '');
+  put('222.json', { pid: 222, cwd: work, name: 'Jarvis' }); // Jarvis's, still running
+  put('222.aa.key', 'k');
+  put('333.json', { pid: 333, cwd: '/home/ana/code', name: 'my project' }); // the user's own session, long gone: not Jarvis's to touch
+  put('333.bb.key', 'k');
+  put('1111.json', { pid: 1111, cwd: '/home/ana/code' });
+  put('444.json', 'not json');
+  assert.deepEqual(sweepSessions({ dir, cwd: work, alive: (pid) => pid === 222 }), [111]);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['1111.json', '222.aa.key', '222.json', '333.bb.key', '333.json', '444.json']);
+  assert.deepEqual(sweepSessions({ dir: path.join(dir, 'nope'), cwd: work }), []);
 });
 
 test('claude cli: background filing asks for JSON on the quickest model the login has', async () => {
@@ -572,5 +782,10 @@ test('controls: what the brain chip and the sign-in line say', () => {
   assert.match(claudeLogin({ state: 'missing', path: '/nope/claude' }).line, /Nothing I can run at that path/);
   assert.match(claudeLogin({ state: 'old', version: '2.1.100' }).line, /too old\. Run claude update/);
   assert.equal(claudeLogin({ state: 'checking' }).line, 'Looking for Claude Code…');
+  assert.deepEqual(brainChip(state({}, { claude: { state: 'provider', provider: 'vertex' } })), { text: 'Cloud · not a Claude login', off: true });
+  assert.deepEqual(brainChip(state({}, { claude: { state: 'managed' } })), { text: 'Cloud · managed Claude Code', off: true });
+  assert.deepEqual(brainChip(state({}, { claude: { state: 'ready', policy: true } })), { text: 'Cloud · Opus 5.5', off: false });
+  assert.match(claudeLogin({ state: 'provider', provider: 'vertex', version: '2.1.332' }).toast, /set up for Google Vertex AI rather than a Claude login/);
+  assert.match(claudeLogin({ state: 'managed', version: '2.1.332' }).line, /your organisation manages it .* Use an API key or Local instead/);
   assert.doesNotMatch(Object.values(claudeLogin({ state: 'missing' })).join(' '), /API key before|add an Anthropic API key/i);
 });

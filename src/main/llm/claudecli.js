@@ -10,7 +10,7 @@
 // time and parked (the "spare"). A spare knows only the binary, model, effort, the stable half of
 // the system prompt and the tool list; it is thrown away when any of those change, when the brain
 // is switched away from the CLI and on quit, and it serves exactly one turn.
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -94,6 +94,8 @@ export function describeCliError(err) {
     case 'model': return 'That model is not available on your Claude login. Pick another under Brain.';
     case 'busy': return 'The cloud model is having trouble right now. Give it a moment.';
     case 'offline': return 'I could not reach the cloud model. Check the internet connection, or switch me to the local model.';
+    case 'provider': return `Claude Code on this computer is set up to use ${detail || 'another provider'} rather than a Claude login, so I will not send anything through it. Switch me to an API key or the local model under Brain.`;
+    case 'managed': return 'Claude Code on this computer is managed by your organisation and cannot be used this way. Switch me to an API key or the local model under Brain.';
     case 'unsafe': return 'Claude Code offered tools I did not ask for, so I stopped. Update Claude Code, or switch me to an API key.';
     case 'missing_package': return 'A part of me is not installed yet. Run npm install in the Jarvis folder, then start me again.';
     default: return `The cloud model returned an error: ${detail || err?.message || String(err)}`;
@@ -101,13 +103,17 @@ export function describeCliError(err) {
 }
 
 /**
- * The child's environment. The login must win, so no inherited key; and when Jarvis is started
- * from a Claude Code terminal, that session's markers must not make the child think it is nested.
+ * The child's environment. The login the CLI keeps must be what answers and what is billed, so
+ * nothing inherited may say otherwise: no key or token, no other endpoint (it would be handed the
+ * login's own token), no switch to Bedrock, Vertex or Foundry. Every ANTHROPIC_* and CLAUDE*
+ * variable goes — which also covers the markers of a Claude Code terminal Jarvis was started
+ * from — except where the login is kept and where Windows finds its shell.
  * The switches turn off the parts of Claude Code that reach beyond a single answer.
  */
+const INHERITED = new Set(['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_GIT_BASH_PATH']);
 export function claudeEnv(base = process.env) {
-  const env = { ...base };
-  for (const k of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SESSION_ID']) delete env[k];
+  const env = {};
+  for (const [k, v] of Object.entries(base)) if (INHERITED.has(k.toUpperCase()) || !/^(ANTHROPIC_|CLAUDE_|CLAUDECODE$)/i.test(k)) env[k] = v;
   return {
     ...env,
     CLAUDE_AGENT_SDK_CLIENT_APP: 'jarvis',
@@ -181,6 +187,49 @@ async function askShell({ env = process.env, platform = process.platform } = {})
   return prefix ? (platform === 'win32' ? path.join(prefix, 'claude.cmd') : path.join(prefix, 'bin', 'claude')) : '';
 }
 
+/** Where an organisation puts the MCP servers it imposes on Claude Code. While that file is there, the CLI will not start without them. */
+export function managedMcpFile({ env = process.env, platform = process.platform } = {}) {
+  if (platform === 'darwin') return '/Library/Application Support/ClaudeCode/managed-mcp.json';
+  if (platform === 'win32') return path.win32.join(env.ProgramFiles || 'C:\\Program Files', 'ClaudeCode', 'managed-mcp.json');
+  return '/etc/claude-code/managed-mcp.json';
+}
+
+/**
+ * A Claude Code process lists itself under <config>/sessions while it runs and removes the entry
+ * when it exits. One that was killed leaves it behind; those of Jarvis's own processes (they run in
+ * `cwd`) that are no longer alive are removed here. Returns the pids tidied away.
+ */
+export function sweepSessions({ dir, cwd, alive = pidAlive }) {
+  const gone = [];
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return gone; }
+  const same = (a, b) => { try { return fs.realpathSync(a) === fs.realpathSync(b); } catch { return a === b; } };
+  for (const name of names) {
+    const pid = /^(\d+)\.json$/.exec(name)?.[1];
+    if (!pid) continue;
+    try {
+      const entry = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      if (!entry.cwd || !same(entry.cwd, cwd) || alive(Number(pid))) continue;
+      const sock = entry.messagingSocketPath;
+      if (sock && path.basename(sock) === `${pid}.sock`) fs.rmSync(sock, { force: true });
+      for (const other of names) if (other === name || (other.startsWith(`${pid}.`) && other.endsWith('.key'))) fs.rmSync(path.join(dir, other), { force: true });
+      gone.push(Number(pid));
+    } catch {
+      /* not an entry this can read: leave it */
+    }
+  }
+  return gone;
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
 /** The copy of Claude Code that ships inside the Agent SDK package. It reads the same login. */
 function bundledBinary() {
   const require = createRequire(import.meta.url);
@@ -250,6 +299,8 @@ export function sessionOptions({ bin, model, effort, system, defs = [], webSearc
     mcpServers: defs.length ? { [SERVER]: { type: 'sdk', name: SERVER, instance: server } } : {},
     strictMcpConfig: true, // none of the user's own MCP servers
     settingSources: [], // no user, project or local settings: no CLAUDE.md, hooks, permissions, plugins
+    settings: { crossSessionInbound: 'refuse' }, // the user's other Claude Code sessions cannot message this one
+    includeHookEvents: true, // Jarvis sets no hooks, so one that runs is an organisation's (see pump)
     skills: [],
     plugins: [],
     permissionMode: 'dontAsk', // never asks; what is not allowed above is refused
@@ -278,19 +329,26 @@ function apiFailure(code, text, limit) {
   }
 }
 
-function spawnFailure(err) {
+/** @param stderr what the child wrote before it went: Jarvis starts the child itself, so the SDK's error does not carry it */
+function spawnFailure(err, stderr = '') {
   if (err instanceof CliError) return err;
   if (err?.errorClass === 'executable_not_found' || err?.errorClass === 'executable_launch_failed' || err?.code === 'ENOENT' || err?.code === 'EACCES') return new CliError('not_installed');
-  if (/not logged in|\/login/i.test(err?.message || '')) return new CliError('not_logged_in');
-  return new CliError('error', String(err?.message || err).slice(0, 300));
+  const said = stderr.trim().slice(-200);
+  const text = `${err?.message || err} ${said}`;
+  // An organisation's MCP configuration. Jarvis must not load those servers, and the CLI will not start without them.
+  if (/enterprise MCP config/i.test(text)) return new CliError('managed');
+  if (/not logged in|\/login/i.test(text)) return new CliError('not_logged_in');
+  return new CliError('error', (said && !String(err?.message).includes(said) ? `${err?.message || err}. ${said}` : String(err?.message || err)).slice(0, 300));
 }
+
+const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 export class ClaudeCli {
   /**
-   * @param o {workDir, configuredPath(), onStatus(status), sdk, log(line), env, locate(), exec(file, args)}
-   * `sdk` ({query, startup}), `locate` and `exec` can be replaced in tests.
+   * @param o {workDir, configuredPath(), onStatus(status), sdk, log(line), env, locate(), exec(file, args), spawn(file, args, options), policy()}
+   * `sdk` ({query, startup}), `locate`, `exec`, `spawn` and `policy` can be replaced in tests.
    */
-  constructor({ workDir, configuredPath = () => '', onStatus = () => {}, sdk = null, log = () => {}, env = null, locate = null, exec = null } = {}) {
+  constructor({ workDir, configuredPath = () => '', onStatus = () => {}, sdk = null, log = () => {}, env = null, locate = null, exec = null, spawn: start = spawn, policy = null } = {}) {
     this.workDir = workDir || path.join(os.tmpdir(), 'jarvis-claude');
     this.configuredPath = configuredPath;
     this.onStatus = onStatus;
@@ -299,8 +357,12 @@ export class ClaudeCli {
     this.env = env || claudeEnv();
     this.locate = locate || (() => this.find());
     this.exec = exec || ((file, args) => run(file, args, { env: this.env }));
+    this.spawn = start;
+    this.policy = policy || (() => this.managed());
     this.state = { state: 'checking', path: '', source: '', version: '', loggedIn: false };
     this.checking = null;
+    this.refused = false; // Claude Code would not start under an organisation's MCP configuration
+    this.hooked = false; // a hook ran that Jarvis did not set: an organisation's policy is in force
     this.spare = null;
     this.running = new Set();
     this.extractModel = 0;
@@ -357,8 +419,35 @@ export class ClaudeCli {
     return old;
   }
 
-  /** Is Claude Code there, new enough and signed in? About a third of a second; no model call. */
+  /**
+   * What an organisation imposes on Claude Code on this computer, which no app can switch off:
+   * `settings` (its hooks see every prompt and reply; its `env` can turn on logging) and `mcp`
+   * (servers the CLI insists on loading — Jarvis will not run it with those).
+   */
+  async managed() {
+    const found = { settings: false, mcp: fs.existsSync(managedMcpFile()) };
+    try {
+      const { resolveSettings } = await this.load();
+      const resolved = await resolveSettings?.({ cwd: this.workDir, settingSources: [] });
+      found.settings = Boolean(resolved?.sources?.some((s) => s.source === 'managed' && Object.keys(s.settings || {}).length));
+    } catch (err) {
+      this.log(`could not read the managed settings: ${err?.message || err}`);
+    }
+    return found;
+  }
+
+  /** The sign-in as a turn will see it: without the user's settings files, whose `env` (a Bedrock switch, say) a turn never loads. */
+  async signIn(file) {
+    for (const args of [['--setting-sources=', 'auth', 'status'], ['auth', 'status']]) {
+      const res = await this.exec(file, args);
+      try { return JSON.parse(res.stdout); } catch { /* a CLI that does not take the flag there, or no answer at all */ }
+    }
+    return null; // counts as signed out
+  }
+
+  /** Is Claude Code there, new enough, signed in, and Jarvis's to use? About a third of a second; no model call. */
   check({ again = false } = {}) {
+    if (again) this.refused = false;
     if (again && this.checking) return this.checking.then(() => this.check()); // what was being looked at may have changed
     if (!this.checking) {
       this.checking = (async () => {
@@ -369,11 +458,13 @@ export class ClaudeCli {
           if (found?.version) {
             if (!newer(found.version, MIN_VERSION)) next.state = 'old';
             else {
-              const auth = await this.exec(found.path, ['auth', 'status']);
-              let info = null;
-              try { info = JSON.parse(auth.stdout); } catch { /* an unexpected answer counts as signed out */ }
+              const [info, policy] = await Promise.all([this.signIn(found.path), this.policy()]);
               next.loggedIn = Boolean(info?.loggedIn);
-              next.state = next.loggedIn ? 'ready' : 'signed_out';
+              // Signed in, but to Bedrock, Vertex or a gateway (an organisation's doing; nothing inherited gets this far): not the Claude login.
+              const elsewhere = info?.apiProvider && info.apiProvider !== 'firstParty';
+              if (elsewhere) next.provider = info.apiProvider;
+              next.state = !next.loggedIn ? 'signed_out' : elsewhere ? 'provider' : policy?.mcp || this.refused ? 'managed' : 'ready';
+              if (policy?.settings || this.hooked) next.policy = true;
             }
           }
         } catch (err) {
@@ -396,6 +487,8 @@ export class ClaudeCli {
     if (s.state === 'checking' || s.state === 'missing' || s.state === 'old') s = await this.check(); // it may have been installed since
     if (s.state === 'missing') throw new CliError('not_installed');
     if (s.state === 'old') throw new CliError('old', s.version);
+    if (s.state === 'provider') throw new CliError('provider', s.provider);
+    if (s.state === 'managed') throw new CliError('managed');
     return s.path;
   }
 
@@ -413,14 +506,50 @@ export class ClaudeCli {
     return {
       ...sessionOptions({ bin: plan.bin, model: plan.model, effort: plan.effort, system: plan.stable, defs: plan.defs, webSearch: plan.webSearch, cwd: this.workDir, env: this.env, server: plan.defs.length ? toolServer(plan.defs, live) : null }),
       abortController: ac,
-      stderr: (text) => { live.stderr = (live.stderr + text).slice(-600); },
+      spawnClaudeCodeProcess: this.starter(live),
     };
+  }
+
+  /**
+   * The child is started here rather than by the SDK, so that Jarvis holds it and can stop it dead
+   * (`live.child.kill`). The SDK's own abort closes the child's input and gives it two seconds, in
+   * which a turn already under way carries on.
+   */
+  starter(live) {
+    return ({ command, args, cwd, env, signal }) => {
+      const child = this.spawn(command, args, { cwd, env, signal, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      child.stderr?.on('data', (text) => { live.stderr = (live.stderr + text).slice(-600); });
+      live.gone = new Promise((resolve) => { child.once('close', resolve); child.once('error', resolve); });
+      child.once('exit', (_code, killed) => { if (killed) this.sweep(); }); // it had no chance to tidy up after itself
+      live.child = child;
+      return child;
+    };
+  }
+
+  /** What went wrong with a child, once it has had a moment to finish saying so. */
+  async failure(err, live) {
+    if (!(err instanceof CliError) && live.gone) await Promise.race([live.gone, pause(300)]);
+    return spawnFailure(err, live.stderr);
+  }
+
+  /** Remove what killed processes of Jarvis's left in Claude Code's list of running sessions. */
+  sweep() {
+    try {
+      const gone = sweepSessions({ dir: path.join(this.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'sessions'), cwd: this.workDir });
+      if (gone.length) this.log(`removed the session entries of ${gone.join(', ')}`);
+    } catch (err) {
+      this.log(`sweep failed: ${err?.message || err}`);
+    }
+  }
+
+  closeSpare(spare) {
+    spare?.ready.then((warm) => { try { warm?.close(); } catch { /* already gone */ } });
   }
 
   dropSpare() {
     const s = this.spare;
     this.spare = null;
-    s?.ready.then((warm) => { try { warm?.close(); } catch { /* already gone */ } });
+    this.closeSpare(s);
   }
 
   /**
@@ -440,9 +569,11 @@ export class ClaudeCli {
       const live = { tools: new Map(), stderr: '' };
       const ac = new AbortController();
       const spare = { key: plan.key, live, ac, ready: null };
-      spare.ready = startup({ options: this.options(plan, live, ac) }).catch((err) => {
-        this.log(`spare failed to start: ${err?.message || err}`);
+      spare.ready = startup({ options: this.options(plan, live, ac) }).catch(async (err) => {
+        const failure = await this.failure(err, live);
+        this.log(`spare failed to start (${failure.kind}): ${err?.message || err} ${live.stderr.trim().slice(-200)}`);
         if (this.spare === spare) this.spare = null;
+        if (failure.kind === 'managed') this.failed(failure);
         return null;
       });
       this.spare = spare;
@@ -468,12 +599,13 @@ export class ClaudeCli {
   async runTurn(o) {
     if (o.signal?.aborted) throw abortError();
     const since = Date.now();
+    const aborted = new Promise((resolve) => o.signal?.addEventListener('abort', () => resolve(ABORTED), { once: true }));
     const bin = await this.binary();
     const { query } = await this.load();
+    if (o.signal?.aborted) throw abortError(); // interrupted while Claude Code was being looked for: start nothing
     const plan = this.plan(bin, o);
     const prompt = composePrompt({ volatile: o.system.volatile, history: o.history, userText: o.userText });
     const tools = new Map(plan.defs.map((d) => [d.name, d.tool]));
-    const aborted = new Promise((resolve) => o.signal?.addEventListener('abort', () => resolve(ABORTED), { once: true }));
 
     for (let attempt = 0; ; attempt++) {
       let q = null;
@@ -485,6 +617,7 @@ export class ClaudeCli {
         const warm = await Promise.race([spare.ready, aborted]);
         if (warm === ABORTED) {
           if (!this.spare) this.spare = spare; // never used: it will do for the next turn
+          else this.closeSpare(spare); // another was started meanwhile, and nobody else holds this one
           throw abortError();
         }
         if (warm) {
@@ -500,21 +633,21 @@ export class ClaudeCli {
         try {
           q = query({ prompt, options: this.options(plan, live, ac) });
         } catch (err) {
-          throw this.failed(spawnFailure(err));
+          throw this.failed(await this.failure(err, live));
         }
       }
       this.prewarm(o); // the one for the next turn starts while this one is thinking
       const seen = { emitted: false, since, warmed };
       try {
-        const spoken = await this.pump(q, ac, aborted, plan, o.emit || (() => {}), seen);
+        const spoken = await this.pump(q, ac, aborted, plan, o.emit || (() => {}), seen, live);
         if (this.state.state !== 'ready') this.check(); // it worked, so whatever the status said is out of date
         return spoken;
       } catch (err) {
         if (isAbort(err)) throw err;
-        const failure = spawnFailure(err);
+        const failure = await this.failure(err, live);
         this.log(`turn failed (${failure.kind}${warmed ? ', spare' : ''}): ${failure.message} ${live.stderr.trim().slice(-200)}`);
         // A parked process can die or go stale. If it had said nothing yet, the user only notices a pause.
-        if (warmed && !seen.emitted && !['rate_limit', 'account', 'model', 'unsafe'].includes(failure.kind)) continue;
+        if (warmed && !seen.emitted && !['rate_limit', 'account', 'model', 'unsafe', 'managed'].includes(failure.kind)) continue;
         throw this.failed(failure);
       }
     }
@@ -522,10 +655,23 @@ export class ClaudeCli {
 
   failed(failure) {
     if (failure.kind === 'not_installed' || failure.kind === 'not_logged_in') this.check(); // let the controls show it
+    if (failure.kind === 'managed' && !this.refused) {
+      this.refused = true; // it will refuse every time: say so in the controls and start no more
+      this.dropSpare();
+      this.note({ state: 'managed' });
+    }
     return failure;
   }
 
-  async pump(q, ac, aborted, plan, emit, seen) {
+  /** Something learned from a running process, rather than from a check, that the controls should show. */
+  note(patch) {
+    if (this.state.state !== 'ready') return; // the next check works it in
+    this.state = { ...this.state, ...patch };
+    this.log(`status ${JSON.stringify(this.state)}`);
+    this.onStatus(this.state);
+  }
+
+  async pump(q, ac, aborted, plan, emit, seen, live) {
     const allowed = new Set([...plan.defs.map((d) => PREFIX + d.name), ...(plan.webSearch ? Object.keys(WEB) : [])]);
     const names = new Map(plan.defs.map((d) => [PREFIX + d.name, d.tool.name]));
     const it = q[Symbol.asyncIterator]();
@@ -551,7 +697,16 @@ export class ClaudeCli {
         if (m.type === 'system' && m.subtype === 'init') {
           this.log(`init ${JSON.stringify({ model: m.model, tools: m.tools, mcp: m.mcp_servers, permissionMode: m.permissionMode, apiKeySource: m.apiKeySource, version: m.claude_code_version, spare: seen.warmed, ms: Date.now() - seen.since })}`);
           const extra = [...(m.tools || []).filter((t) => !allowed.has(t)), ...(m.mcp_servers || []).filter((s) => s.name !== SERVER).map((s) => `mcp server ${s.name}`)];
-          if (extra.length) throw new CliError('unsafe', extra.join(', '));
+          if (extra.length) {
+            live.child?.kill('SIGKILL'); // now: told only to stop, it would run on for two seconds, tools and all
+            throw new CliError('unsafe', extra.join(', '));
+          }
+        } else if (m.type === 'system' && (m.subtype === 'hook_started' || m.subtype === 'hook_response')) {
+          if (!this.hooked) {
+            this.hooked = true;
+            this.log(`a hook ran that is not Jarvis's: ${m.hook_event || m.hook_name || m.subtype}`);
+            if (!this.state.policy) this.note({ policy: true });
+          }
         } else if (m.type === 'stream_event') {
           if (m.parent_tool_use_id) continue;
           const e = m.event;
@@ -609,6 +764,7 @@ export class ClaudeCli {
     for (; this.extractModel < models.length; this.extractModel++) {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 90000);
+      const live = { stderr: '' };
       this.running.add(ac);
       let result = null;
       let failure = null;
@@ -618,16 +774,19 @@ export class ClaudeCli {
           options: {
             ...sessionOptions({ bin, model: models[this.extractModel], effort: 'low', system, cwd: this.workDir, env: this.env }),
             includePartialMessages: false, thinking: { type: 'disabled' }, maxTurns: 4,
-            outputFormat: { type: 'json_schema', schema }, abortController: ac,
+            outputFormat: { type: 'json_schema', schema }, abortController: ac, spawnClaudeCodeProcess: this.starter(live),
           },
         });
         for await (const m of q) {
-          if (m.type === 'system' && m.subtype === 'init' && (m.tools || []).some((t) => t !== 'StructuredOutput')) throw new CliError('unsafe', m.tools.join(', '));
+          if (m.type === 'system' && m.subtype === 'init' && (m.tools || []).some((t) => t !== 'StructuredOutput')) {
+            live.child?.kill('SIGKILL');
+            throw new CliError('unsafe', m.tools.join(', '));
+          }
           if (m.type === 'assistant' && m.error) failure = m.error;
           if (m.type === 'result') result = m;
         }
       } catch (err) {
-        if (!failure && !result) throw spawnFailure(err);
+        if (!failure && !result) throw this.failed(await this.failure(err, live));
       } finally {
         clearTimeout(timer);
         this.running.delete(ac);

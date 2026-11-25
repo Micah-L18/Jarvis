@@ -6,7 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { Orb } from './orb.js';
 import { Stage, screenPass, steadyBloom, setCaptionBand, easeCaptionBand } from './stage.js';
 import { Graph3D } from './graph.js';
-import { Voice } from './voice.js';
+import { Voice, speechStatus } from './voice.js';
 import { Panel, h } from './panel.js';
 import { claudeLogin, brainChip } from './brain.js';
 
@@ -621,9 +621,8 @@ api.on('memory', (snapshot) => {
 api.on('settings', (next) => { state = next; renderChips(); panel.render(); voice.syncDevices(); });
 api.on('mcp', (status) => { state.mcp = status; panel.render(); });
 api.on('speech', (msg) => {
-  const what = msg.what === 'voice' ? 'voice' : msg.what === 'faster voice' ? 'faster voice' : 'speech recognition';
-  if (msg.done) setStatus(`${what} ready`, 2500);
-  else if (msg.total) setStatus(`Downloading ${what} model (one time) — ${Math.round((msg.loaded / msg.total) * 100)}%`);
+  const line = speechStatus(msg);
+  if (line) setStatus(line.text, line.ttl);
 });
 
 // ---------------------------------------------------------------------------
@@ -728,8 +727,8 @@ window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, pane
     api.invoke('claude:status').then((claude) => {
       state.claude = claude;
       renderChips();
-      const { toast: problem } = claudeLogin(claude);
-      if (problem) toast(problem, true);
+      const { toast: problem, ok } = claudeLogin(claude);
+      if (problem) toast(problem, !ok);
     });
   }
   const micOk = await voice.startMic();
