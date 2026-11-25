@@ -21,7 +21,10 @@
     "@huggingface/transformers": "^3.8.1",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "d3-force-3d": "^3.0.6",
+    "dompurify": "^3.5.0",
     "kokoro-js": "^1.2.1",
+    "marked": "^18.3.0",
+    "pdfjs-dist": "^6.5.438",
     "three": "^0.187.0"
   }
 }
