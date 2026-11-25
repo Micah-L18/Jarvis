@@ -4,7 +4,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { Orb } from './orb.js';
-import { Stage, screenPass, setCaptionBand } from './stage.js';
+import { Stage, screenPass, steadyBloom, setCaptionBand, easeCaptionBand } from './stage.js';
 import { Graph3D } from './graph.js';
 import { Voice } from './voice.js';
 import { Panel, h } from './panel.js';
@@ -38,7 +38,7 @@ controls.maxDistance = 6000;
 
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.5, 0.45, 0.1);
+const bloom = steadyBloom(new UnrealBloomPass(new THREE.Vector2(1, 1), 0.5, 0.45, 0.1));
 composer.addPass(bloom);
 const screen = screenPass(); // room backdrop + scan lines + sRGB, in place of the stock output pass
 composer.addPass(screen);
@@ -60,6 +60,15 @@ const mind = new Graph3D({ labelLayer: $('labels'), hud: HUD_CLEAR, linkOpacity:
 const files = new Graph3D({ labelLayer: $('labels'), hud: HUD_CLEAR, linkOpacity: 0.34, charge: -34, maxLabels: 70, beamWidth: 0.9, flatten: 0.02 });
 scene.add(mind.group, files.group);
 
+// The band the table's light fades out in is as tall as the caption: measured from the top of its
+// first line of words (the user's line when there is one, else Jarvis's), whenever the caption
+// block changes size or the user's line comes or goes — never per frame.
+function fitCaptionBand() {
+  const first = $('said-user').textContent ? $('said-user') : $('said-jarvis');
+  setCaptionBand(window.innerWidth, window.innerHeight, renderer.getPixelRatio(), window.innerHeight - first.getBoundingClientRect().top);
+}
+new ResizeObserver(fitCaptionBand).observe($('talk'));
+
 function resize() {
   const w = window.innerWidth;
   const hgt = window.innerHeight;
@@ -73,7 +82,7 @@ function resize() {
   screen.uniforms.uRes.value.set(w * pr, hgt * pr);
   screen.uniforms.uPixel.value = Math.max(1, Math.round(pr));
   screen.uniforms.uDpr.value = pr;
-  setCaptionBand(w, hgt, pr);
+  fitCaptionBand();
   camera.aspect = w / hgt;
   camera.updateProjectionMatrix();
   placeCallout();
@@ -205,7 +214,8 @@ const tableY = (graph) => graph.keel - Math.max(14, tableRadius(graph) * FLOOR.g
 const tableRadius = (graph) => Math.max(50, graph.spread * FLOOR.radius);
 
 // Framing a map: the band of the window it must sit in (clear of the top bar, the caption and the
-// edges), with the table's near rim just above the caption. The HUD is a fixed size in CSS pixels,
+// edges), with the table's near rim just above a one-line caption (behind a taller one the table
+// fades out; the map is not re-framed every time a reply wraps). The HUD is sized in CSS pixels,
 // so the band is worked out from the window's height: FRAME is px from the top for the highest
 // node, px from the foot for the lowest node and for the table's rim.
 const FRAME = { top: 117, bottom: 171, rim: 153 };
@@ -334,6 +344,8 @@ function select(node, graph) {
   const card = $('card');
   mind.setFocus(null);
   files.setFocus(null);
+  mind.keepClear();
+  files.keepClear();
   selected = node ? { node, graph } : null;
   if (!node) {
     card.hidden = true;
@@ -391,6 +403,7 @@ function placeCallout() {
   callout.x = box.right + 5;
   callout.y = box.top - 5;
   callout.ax = NaN; // redraw the line
+  selected.graph.keepClear(box.left - 4, box.top - 8, box.right + 10, box.bottom + 4); // no label prints under the card
 }
 
 function trackSelection(w, hgt) {
@@ -503,6 +516,7 @@ function showUser(text, live = false) {
   $('said-user').textContent = text;
   $('said-user').classList.toggle('live', live);
   $('said-user').classList.remove('fade');
+  fitCaptionBand(); // the user's line coming or going does not change the caption block's size
 }
 function showJarvis(text) {
   // Captions follow the voice: keep the most recent couple of lines.
@@ -654,6 +668,9 @@ function frame(now = performance.now()) {
   }
   if (follow) keepFramed(dt);
   controls.update();
+  // controls.update() turns the camera but leaves its world matrices a frame behind; bring them up
+  // to date so labels, picking and the selection brackets are placed with this frame's view
+  camera.updateMatrixWorld();
 
   const hearing = voiceState === 'hearing';
   orb.setState(hearing ? 'listening' : voice.speaking ? 'speaking' : generating || voiceState === 'transcribing' ? 'thinking' : 'idle');
@@ -667,6 +684,7 @@ function frame(now = performance.now()) {
   orb.update(dt, (hgt / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * orbPose.scale * pr); // in drawing-buffer pixels
   orb.group.scale.setScalar(orbPose.scale * (orb.pulse || 1));
 
+  easeCaptionBand(dt);
   stage.update(dt, stageTarget(), camera.position);
   mind.floorY = view === 'mind' ? stage.cur.y : null;
   files.floorY = view === 'files' ? stage.cur.y : null;

@@ -72,7 +72,13 @@ const FRAG = /* glsl */ `
 // Links are beams: thin camera-facing ribbons, one instanced quad per link (a single draw call
 // however many there are). The quad is a little wider than the beam and the fragment shader draws
 // the line inside it from the distance to its centre, so even a hairline stays smooth.
+// The core is drawn as plain pixel coverage and never narrower than BEAM_MIN device pixels: a
+// thinner beam is drawn that wide and as much fainter. Its light is then the same wherever it falls
+// on the pixel grid, so a beam at a shallow slope is one even line (a sharper hairline is bright
+// where it runs along a pixel row and faint where it straddles two, which reads as a row of beads).
 const BEAM_PAD = 1.5;
+const BEAM_MIN = 1.8;
+const BEAM_HOT = 1.6; // how much brighter the selected node's own links are
 const BEAM_VERT = /* glsl */ `
   attribute vec3 aStart; attribute vec3 aEnd; attribute vec3 aColStart; attribute vec3 aColEnd;
   uniform vec2 uView; uniform float uWidth;                 // uView: the viewport in CSS pixels
@@ -97,14 +103,16 @@ const BEAM_VERT = /* glsl */ `
     gl_Position = c;
   }`;
 const BEAM_FRAG = /* glsl */ `
-  uniform float uOpacity; uniform float uWidth;
+  uniform float uOpacity; uniform float uWidth; uniform float uPr;
   varying vec3 vColor; varying float vD;
   ${CAPTION_MASK}
   void main(){
     float x = abs(vD);                                      // CSS pixels from the centre of the beam
-    float core = 1.0 - smoothstep(uWidth * 0.5 - 0.5, uWidth * 0.5 + 0.5, x);
-    float glow = max(0.0, 1.0 - x / (uWidth * 0.5 + ${BEAM_PAD.toFixed(1)}));
-    gl_FragColor = vec4(vColor, (core + glow * glow * 0.22) * uOpacity * captionMask());
+    float w = uWidth * uPr;                                 // the beam's width in device pixels
+    float wide = max(w, ${BEAM_MIN.toFixed(1)});
+    float core = clamp(wide * 0.5 + 0.5 - x * uPr, 0.0, 1.0) * (w / wide);
+    float glow = 1.0 - smoothstep(0.0, uWidth * 0.5 + ${BEAM_PAD.toFixed(1)}, x);
+    gl_FragColor = vec4(vColor, (core + glow * 0.16) * uOpacity * captionMask());
   }`;
 
 function beamGeometry(count) {
@@ -133,12 +141,14 @@ for (let j = 0; j <= FOOT; j++) {
   CIRCLE[j * 2 + 1] = Math.sin((j / FOOT) * Math.PI * 2);
 }
 
-// Labels that would print over one another (or over the selected marker) step aside: each tries
-// its own line to the right of its marker, then one line below, one above, then the left of its
-// marker; if all are taken by more important labels it fades out until there is room again.
+// Labels that would print over one another, or over a marker (their own node's or any other
+// labelled node's: a hub's rings would swallow the words), step aside: each tries its own line to
+// the right of its marker, then one line below, one above, then the same three places to the left
+// of its marker; if all are taken it fades out until there is room again. The node card is kept
+// clear in the same way.
 const LABEL_LINE = 12;
-const LABEL_DY = [0, LABEL_LINE, -LABEL_LINE, 0];
-const LABEL_LEFT = 3; // the slot that puts the text to the left of its marker
+const LABEL_DY = [0, LABEL_LINE, -LABEL_LINE, 0, LABEL_LINE, -LABEL_LINE];
+const LABEL_LEFT = 3; // from this slot on, the text is to the left of its marker
 const LABEL_STICK = 4; // a label only moves when the other place is clear by this much (no dithering)
 
 // A plumb line fades behind the caption too.
@@ -207,7 +217,7 @@ export class Graph3D {
     this.points = new THREE.Points(new THREE.BufferGeometry(), this.pointsMat);
     this.points.frustumCulled = false;
     this.lineMat = new THREE.ShaderMaterial({
-      uniforms: { uView: { value: new THREE.Vector2(1, 1) }, uWidth: { value: this.opts.beamWidth }, uOpacity: { value: 0 }, uRes: CAPTION.uRes, uCaption: CAPTION.uCaption },
+      uniforms: { uView: { value: new THREE.Vector2(1, 1) }, uWidth: { value: this.opts.beamWidth }, uPr: { value: 1 }, uOpacity: { value: 0 }, uRes: CAPTION.uRes, uCaption: CAPTION.uCaption },
       vertexShader: BEAM_VERT, fragmentShader: BEAM_FRAG, side: THREE.DoubleSide, ...light,
     });
     this.lines = new THREE.Mesh(beamGeometry(0), this.lineMat);
@@ -238,10 +248,10 @@ export class Graph3D {
     // A gentle pull toward the horizontal plane: the map settles wider than tall, like an object
     // hovering over the table, while staying a volume.
     if (this.opts.flatten) this.sim.force('flatten', forceY(0).strength(this.opts.flatten));
-    this.labels = new Map(); // id -> {id, el, w, rank, slot, dx, dy, fade, fresh, x0, x1, y, h, op, tx, ty}
+    this.labels = new Map(); // id -> {id, el, w, rank, slot, dx, dy, fade, fresh, x0, x1, y, h, op, tx, ty, on, sx, sy, dist, ring, block}
     this.labelOrder = []; // the same records, most important first
-    this.labelKept = []; // scratch: what has been placed so far this frame
-    this.labelBlock = { x0: 0, x1: 0, y: 0, h: 0 }; // the selected marker and its brackets: nothing prints over them
+    this.labelKept = []; // scratch: the boxes no label may print over — markers, then labels as they are placed
+    this.cardBox = { x0: 0, x1: 0, y: 0, h: -1 }; // the node card, while it is up (see keepClear)
   }
 
   /** True while the layout is still moving. */
@@ -347,7 +357,7 @@ export class Graph3D {
       const a = typeof l.source === 'object' ? l.source : this.byId.get(l.source);
       const b = typeof l.target === 'object' ? l.target : this.byId.get(l.target);
       const hot = focus && (a.id === focus || b.id === focus);
-      const k = focus ? (hot ? 1.4 : 0.12) : 1;
+      const k = focus ? (hot ? BEAM_HOT : 0.12) : 1;
       const o = i * 6;
       lcol[o] = a.color.r * k; lcol[o + 1] = a.color.g * k; lcol[o + 2] = a.color.b * k;
       lcol[o + 3] = b.color.r * k; lcol[o + 4] = b.color.g * k; lcol[o + 5] = b.color.b * k;
@@ -590,7 +600,10 @@ export class Graph3D {
         const el = document.createElement('div');
         el.className = 'node-label';
         this.opts.labelLayer.appendChild(el);
-        rec = { id, el, text: null, mode: -1, w: 0, rank: 0, slot: 0, dx: 0, dy: 0, fade: 1, fresh: true, x0: 0, x1: 0, y: 0, h: LABEL_LINE / 2, op: 0, tx: NaN, ty: NaN };
+        rec = {
+          id, el, text: null, mode: -1, w: 0, rank: 0, slot: 0, dx: 0, dy: 0, fade: 1, fresh: true, x0: 0, x1: 0, y: 0, h: LABEL_LINE / 2, op: 0, tx: NaN, ty: NaN,
+          on: false, sx: 0, sy: 0, dist: 0, ring: 0, block: { x0: 0, x1: 0, y: 0, h: 0 }, // where its marker is this frame, and the box that keeps it clear
+        };
         this.labels.set(id, rec);
       }
       const major = Boolean(node.showLabel);
@@ -611,11 +624,38 @@ export class Graph3D {
     order.sort((a, b) => b.rank - a.rank);
   }
 
+  /** Labels keep out of this part of the window (CSS pixels): the node card. Call with no arguments to lift it. */
+  keepClear(left, top, right, bottom) {
+    const box = this.cardBox;
+    if (left === undefined) { box.h = -1; return; }
+    box.x0 = left; box.x1 = right; box.y = (top + bottom) / 2; box.h = (bottom - top) / 2;
+  }
+
   _placeLabels(camera, width, height, dt) {
     const visible = this.labelsOn && this.opacity > 0.5;
     const order = this.labelOrder;
     const kept = this.labelKept;
     kept.length = 0;
+    if (this.cardBox.h >= 0) kept.push(this.cardBox);
+    // First, where every labelled node's marker is: no label may print over any of them. The selected
+    // marker's box takes in its brackets.
+    for (let i = 0; i < order.length; i++) {
+      const rec = order[i];
+      const node = this.byId.get(rec.id);
+      rec.on = false;
+      if (!node || !visible || (this.focusId && !node.lit)) continue; // gone from the data (its label goes at the next sync), hidden, or dimmed
+      rec.dist = camera.position.distanceTo(tmp.set(node.x, node.y, node.z));
+      tmp.project(camera);
+      if (tmp.z > 1) continue;
+      rec.on = true;
+      rec.sx = (tmp.x * 0.5 + 0.5) * width;
+      rec.sy = (-tmp.y * 0.5 + 0.5) * height;
+      rec.ring = this._markRadius(node, rec.dist, height);
+      const reach = rec.ring + (rec.id === this.focusId ? 9 : 2);
+      const box = rec.block;
+      box.x0 = rec.sx - reach; box.x1 = rec.sx + reach; box.y = rec.sy; box.h = reach;
+      kept.push(box);
+    }
     const ease = 1 - Math.exp(-dt * 10);
     const hud = this.opts.hud;
     // labels dim with depth: full strength at the near side of the map, well legible still at the far side
@@ -623,54 +663,44 @@ export class Graph3D {
     for (let i = 0; i < order.length; i++) {
       const rec = order[i];
       const el = rec.el;
-      const node = this.byId.get(rec.id);
-      if (!node) { // gone from the data; its label goes at the next sync
-        if (rec.op !== 0) el.style.opacity = rec.op = 0;
-        continue;
-      }
-      const dim = this.focusId && !node.lit;
-      const dist = camera.position.distanceTo(tmp.set(node.x, node.y, node.z));
-      tmp.project(camera);
-      if (!visible || tmp.z > 1 || dim) {
+      if (!rec.on) {
         if (rec.op !== 0) el.style.opacity = rec.op = 0;
         continue;
       }
       const focus = rec.id === this.focusId;
       const marked = focus || rec.id === this.hoverId;
-      const sx = (tmp.x * 0.5 + 0.5) * width;
-      const sy = (-tmp.y * 0.5 + 0.5) * height;
+      const sx = rec.sx, sy = rec.sy;
       // the text starts just outside the marker's outermost ring (and outside the selection's
       // brackets), however large the marker is drawn
-      const ring = this._markRadius(node, dist, height);
-      const clear = ring + (focus ? 14 : 5);
+      const clear = rec.ring + (focus ? 14 : 5);
       let slot = -1, x = 0;
       for (let t = 0; t < LABEL_DY.length && slot < 0; t++) {
         const pad = t === rec.slot ? 0 : LABEL_STICK;
-        const xx = t === LABEL_LEFT ? sx - clear - rec.w : sx + clear;
+        const xx = t >= LABEL_LEFT ? sx - clear - rec.w : sx + clear;
         const yy = sy + LABEL_DY[t];
         let free = true;
         for (let j = 0; j < kept.length; j++) {
           const o = kept[j];
-          if (xx - pad < o.x1 && xx + rec.w + pad > o.x0 && Math.abs(yy - o.y) < o.h + LABEL_LINE / 2 - 1 + pad * 0.5) { free = false; break; }
+          if (o !== rec.block && xx - pad < o.x1 && xx + rec.w + pad > o.x0 && Math.abs(yy - o.y) < o.h + LABEL_LINE / 2 - 1 + pad * 0.5) { free = false; break; }
         }
         if (free) { slot = t; x = xx; }
       }
+      if (slot < 0 && marked) { slot = 0; x = sx + clear; } // the selected or hovered node is always named
+      // a label changing sides does not slide across its own marker: it fades in at the new place
+      const flip = !rec.fresh && slot >= 0 && (slot >= LABEL_LEFT) !== (rec.slot >= LABEL_LEFT);
+      const jump = rec.fresh || flip;
       if (slot >= 0) {
         rec.slot = slot;
         rec.x0 = x; rec.x1 = x + rec.w; rec.y = sy + LABEL_DY[slot];
         kept.push(rec);
-        const dx = slot === LABEL_LEFT ? -(clear * 2 + rec.w) : 0;
-        rec.dx = rec.fresh ? dx : rec.dx + (dx - rec.dx) * ease;
-        rec.dy = rec.fresh ? LABEL_DY[slot] : rec.dy + (LABEL_DY[slot] - rec.dy) * ease;
+        const dx = slot >= LABEL_LEFT ? -(clear * 2 + rec.w) : 0;
+        rec.dx = jump ? dx : rec.dx + (dx - rec.dx) * ease;
+        rec.dy = jump ? LABEL_DY[slot] : rec.dy + (LABEL_DY[slot] - rec.dy) * ease;
       }
-      rec.fade = rec.fresh ? (slot >= 0 ? 1 : 0) : rec.fade + ((slot >= 0 ? 1 : 0) - rec.fade) * ease;
+      const shown = slot >= 0 ? 1 : 0;
+      rec.fade = rec.fresh ? shown : flip ? 0 : rec.fade + (shown - rec.fade) * ease;
       rec.fresh = false;
-      if (focus) {
-        const block = this.labelBlock;
-        block.x0 = sx - ring - 9; block.x1 = sx + ring + 9; block.y = sy; block.h = ring + 9;
-        kept.push(block);
-      }
-      let fade = marked ? 1 : 0.95 - 0.55 * THREE.MathUtils.clamp((dist - nearest) / (this.radius * 2), 0, 1);
+      let fade = marked ? 1 : 0.95 - 0.55 * THREE.MathUtils.clamp((rec.dist - nearest) / (this.radius * 2), 0, 1);
       // the HUD's words always win: under the top bar a label fades out; behind the caption it
       // fades exactly as its marker does (and wherever its own text would reach the caption)
       if (hud && !marked) fade *= THREE.MathUtils.clamp((sy - hud.top + 30) / 30, 0, 1);
@@ -729,6 +759,7 @@ export class Graph3D {
     this.pointsMat.uniforms.uOpacity.value = this.opacity;
     this.pointsMat.uniforms.uSpin.value = (this.time * 0.4) % (Math.PI * 4); // the selected marker's ring turns slowly
     this.lineMat.uniforms.uView.value.set(width, height);
+    this.lineMat.uniforms.uPr.value = pixelRatio;
     this.lineMat.uniforms.uOpacity.value = this.opts.linkOpacity * this.opacity;
     this._placeLabels(camera, width, height, dt);
   }

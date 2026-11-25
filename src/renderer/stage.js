@@ -14,8 +14,9 @@ const TAU = Math.PI * 2;
 // ---------------------------------------------------------------------------
 
 // Where the caption and the hint sit (bottom centre of the window): the table's light is faded out
-// behind them, so the words stand on clean dark background. The band is a fixed size in CSS pixels,
-// like the caption itself; every material that fades behind it shares these two uniforms.
+// behind them, so the words stand on clean dark background. The band is sized in CSS pixels, like
+// the caption itself, and is as tall as the caption: it grows when a reply runs to several lines
+// or the type box opens. Every material that fades behind it shares these two uniforms.
 // uCaption: half-width where the fade is complete / where it ends, then the height above the
 // window's foot where it is complete / where it ends — all in drawing-buffer pixels.
 export const CAPTION = { uRes: { value: new THREE.Vector2(1, 1) }, uCaption: { value: new THREE.Vector4(-2, -1, -2, -1) } };
@@ -25,15 +26,33 @@ export const CAPTION_MASK = /* glsl */ `
     return 1.0 - 0.96 * (1.0 - smoothstep(uCaption.z, uCaption.w, gl_FragCoord.y)) * (1.0 - smoothstep(uCaption.x, uCaption.y, abs(gl_FragCoord.x - 0.5 * uRes.x)));
   }`;
 
-const BAND = { ramp: 144, full: 122, end: 171 }; // CSS pixels: the fade's width at each side, and its two heights above the foot
-const band = { mid: 0, height: 1e9, half: 0 }; // the band as last set, in CSS pixels (for captionFade)
+// CSS pixels: the fade's width at each side; the least height above the foot at which it is
+// complete (a one-line caption); how far it clears the top of the words; how much higher it ends.
+const BAND = { ramp: 144, full: 122, clear: 14, rise: 49 };
+const band = { mid: 0, height: 1e9, half: 0, pr: 1, full: BAND.full, aim: BAND.full }; // the band as it stands, in CSS pixels
 
-/** Call when the window or its pixel ratio changes. width and height are CSS pixels. */
-export function setCaptionBand(width, height, pixelRatio) {
-  const half = Math.min(432, width * 0.36);
-  band.mid = width / 2; band.height = height; band.half = half;
+function writeBand() {
+  CAPTION.uCaption.value.set(band.half, band.half + BAND.ramp, band.full, band.full + BAND.rise).multiplyScalar(band.pr);
+}
+
+/**
+ * Call when the window, its pixel ratio or the caption changes. width and height are CSS pixels;
+ * captionTop is how far above the window's foot the caption's words begin. The band's height then
+ * eases to its new size (see easeCaptionBand).
+ */
+export function setCaptionBand(width, height, pixelRatio, captionTop = 0) {
+  band.mid = width / 2; band.height = height; band.half = Math.min(432, width * 0.36); band.pr = pixelRatio;
+  band.aim = Math.max(BAND.full, Math.min(captionTop + BAND.clear, height * 0.5)); // never more than the lower half of the window
   CAPTION.uRes.value.set(width * pixelRatio, height * pixelRatio);
-  CAPTION.uCaption.value.set(half, half + BAND.ramp, BAND.full, BAND.end).multiplyScalar(pixelRatio);
+  writeBand();
+}
+
+/** Each frame: the band follows the caption as it grows or shrinks, without a step. */
+export function easeCaptionBand(dt) {
+  if (band.full === band.aim) return;
+  band.full += (band.aim - band.full) * (1 - Math.exp(-dt * 9));
+  if (Math.abs(band.aim - band.full) < 0.5) band.full = band.aim;
+  writeBand();
 }
 
 /**
@@ -42,7 +61,7 @@ export function setCaptionBand(width, height, pixelRatio) {
  */
 export function captionFade(x0, x1, y) {
   const dx = Math.max(0, x0 - band.mid, band.mid - x1);
-  const low = 1 - THREE.MathUtils.smoothstep(band.height - y, BAND.full, BAND.end);
+  const low = 1 - THREE.MathUtils.smoothstep(band.height - y, band.full, band.full + BAND.rise);
   return 1 - 0.96 * low * (1 - THREE.MathUtils.smoothstep(dx, band.half, band.half + BAND.ramp));
 }
 
@@ -375,4 +394,46 @@ const SCREEN = {
 
 export function screenPass() {
   return new ShaderPass(SCREEN);
+}
+
+// ---------------------------------------------------------------------------
+// Bloom: which light glows
+// ---------------------------------------------------------------------------
+
+// The bloom pass decides what is bright enough to glow at half resolution, from the average of each
+// 2x2 block of pixels. A hairline lies inside one block or is split between two depending on where
+// it falls on the pixel grid, so along a beam at a shallow slope the glow would switch on and off
+// every couple of rows: beads of light that crawl as the view turns. Here a block is also judged by
+// the light in the 6x6 pixels around it — as bright as it would be if the line ran squarely through
+// it, though never brighter than the brightest pixel next to it — so a thin line glows along its
+// whole length or not at all. A broad area of light glows exactly as before, and nothing glows less
+// than it did. Only a block that holds some light, but not enough to glow by itself, takes the
+// wider look (eight more bilinear samples), and the brightest pixel is only searched for where
+// that look finds enough light: the dark room and the bright cores cost what they always did.
+const BLOOM_GATE = /* glsl */ `
+  uniform sampler2D tDiffuse; uniform float luminosityThreshold; uniform float smoothWidth;
+  varying vec2 vUv;
+  float luma(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+  void main(){
+    vec2 px = 1.0 / vec2(textureSize(tDiffuse, 0));
+    vec3 block = textureLod(tDiffuse, vUv, 0.0).rgb;        // this 2x2 block: what goes on to be blurred
+    float v = luma(block);
+    if (v > 0.002 && v < luminosityThreshold + smoothWidth) {
+      float around = 0.0;                                   // the 6x6 pixels around it, as nine 2x2 averages
+      for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) around += luma(textureLod(tDiffuse, vUv + vec2(float(i), float(j)) * 2.0 * px, 0.0).rgb);
+      float line = around / 3.0;                            // a line's light across its width, as one block would hold it
+      if (line > v && line > luminosityThreshold) {
+        float peak = 0.0;
+        for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) peak = max(peak, luma(textureLod(tDiffuse, vUv + (vec2(float(i), float(j)) - 1.5) * px, 0.0).rgb));
+        v = max(v, min(peak, line));
+      }
+    }
+    gl_FragColor = vec4(block * smoothstep(luminosityThreshold, luminosityThreshold + smoothWidth, v), 1.0);
+  }`;
+
+/** Swaps the steadier bright-pass in on an UnrealBloomPass (same pass, same uniforms). */
+export function steadyBloom(bloom) {
+  bloom.materialHighPassFilter.fragmentShader = BLOOM_GATE;
+  bloom.materialHighPassFilter.needsUpdate = true;
+  return bloom;
 }

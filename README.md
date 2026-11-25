@@ -1,6 +1,6 @@
 # J.A.R.V.I.S.
 
-A voice-first personal AI for your desktop. Full screen, an orange hologram you talk to, and two 3D maps floating in space: one of everything it knows, one of your files.
+A voice-first personal AI for your desktop. Full screen, an orange hologram you talk to, and two 3D maps projected above a holographic table: one of everything it knows, one of your files.
 
 ![The hologram in the Core view](docs/core.png)
 
@@ -45,8 +45,12 @@ Speech recognition (Whisper) and the voice (Kokoro, a British male voice by defa
 ## What's on screen
 
 - **Core** — the hologram. It breathes when idle, tightens its rings when it hears you, spins up while thinking, and its surface follows the voice when it speaks.
-- **Mind** — a 3D map of what it knows. Projects are the gold hubs; people, topics, facts, tasks and documents hang off them. Click any dot to see it, and **Forget** to delete it.
-- **Files** — a 3D map of your folders (your home folder by default; change it under Files in the controls). Click a folder to open it further; click a file to open or reveal it.
+- **Mind** — a 3D map of what it knows. Projects are the double-ringed gold hubs; people, topics, facts, tasks and documents hang off them. Click any marker to see it, and **Forget** to delete it.
+- **Files** — a 3D map of your folders (your home folder by default; change it under Files in the controls). Folders are diamonds, files are dots. Click a folder to open it further; click a file to open or reveal it.
+
+![The Mind view](docs/mind.png)
+
+![The Files view](docs/files.png)
 
 You can also ask for these by voice: "show me my files", "pull up the volleyball project".
 
