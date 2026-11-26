@@ -14,6 +14,8 @@ npm install
 npm start
 ```
 
+`npm stop` closes a running Jarvis from another terminal (`npm stop -- --force` if it has stopped responding). Starting it a second time brings the running one to the front instead of opening another.
+
 `npm run dev` opens it in a window instead of full screen. F11 (or `F`) toggles full screen.
 
 Requires Node 20+. The first launch downloads the speech models (about 105 MB, once: Whisper to hear you, tiny-voca to speak) — you'll see progress in the top-left corner. `npm install` also brings the Claude Agent SDK with its own copy of Claude Code (about 400 MB); Jarvis prefers the `claude` you already have and falls back to that copy.

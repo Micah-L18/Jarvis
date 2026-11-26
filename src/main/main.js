@@ -15,10 +15,20 @@ import { listOllamaModels } from './llm/ollama.js';
 import { ClaudeCli } from './llm/claudecli.js';
 import { registerScheme, serveFiles, allowedPath } from './fileproto.js';
 import { SelfChange, editInstructions } from './selfchange.js';
+import { listen as listenForStop } from './control.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const windowed = process.argv.includes('--windowed');
 if (process.env.JARVIS_DATA_DIR) app.setPath('userData', path.resolve(process.env.JARVIS_DATA_DIR));
+// One Jarvis per data folder: starting it again brings the running one to the front.
+if (!app.requestSingleInstanceLock()) app.exit(0);
+app.on('second-instance', () => {
+  const w = BrowserWindow.getAllWindows()[0];
+  if (w) { if (w.isMinimized()) w.restore(); w.show(); w.focus(); }
+});
+// `npm stop` and a plain `kill` close it the same way the window does.
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => app.quit());
+let stopListener = () => {};
 // Jarvis greets you and speaks without waiting for a click.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 registerScheme(protocol); // jarvis-file:// for the file viewer; must happen before ready
@@ -322,6 +332,7 @@ async function createWindow() {
 
 app.whenReady().then(async () => {
   const dataDir = app.getPath('userData');
+  stopListener = listenForStop(dataDir, () => app.quit());
   settings = new Settings(dataDir);
   memory = new Memory(dataDir);
   skills = new Skills(dataDir);
@@ -383,6 +394,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', () => {
+  stopListener();
   globalShortcut.unregisterAll();
   sizer.dispose();
   speech?.kill();
