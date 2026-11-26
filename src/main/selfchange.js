@@ -156,16 +156,22 @@ export const VOICE_SETTINGS = {
     },
   },
   files_folder: {
-    help: 'an existing folder the user names, as a full path or starting with ~',
-    set(value, _s, env) {
+    help: 'an existing folder inside the home folder (or inside the current files folder), as a full path or starting with ~; anywhere else is chosen with Change folder in the controls',
+    set(value, s, env) {
       let p = String(value ?? '').trim();
       if (!p) return { error: 'files_folder needs a folder path.' };
-      if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) p = path.join(env.home || os.homedir(), p.slice(1));
+      const home = env.home || os.homedir();
+      if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) p = path.join(home, p.slice(1));
       if (!path.isAbsolute(p)) return { error: 'files_folder needs a full path (or one starting with ~).' };
-      p = path.resolve(p);
-      if (path.parse(p).root === p) return { error: 'I won\'t take the whole disk as the files folder; name a folder.' };
-      if (!env.isDir(p)) return { error: `There is no folder at ${p}.` };
-      return { patch: { fsRoot: p }, said: `files folder set to ${p}`, rescan: true };
+      if (!env.isDir(p)) return { error: `There is no folder at ${path.resolve(p)}.` };
+      // Where it really is, links followed (/proc/self/root, a link to /, a volume alias): that is what file access would reach.
+      const real = (x) => { try { return (env.realpath || fs.realpathSync.native)(x); } catch { return null; } };
+      const at = real(p);
+      if (!at || path.parse(at).root === at) return { error: 'I won\'t take the whole disk as the files folder; name a folder.' };
+      // By voice it only moves within the home folder or within the folder it already has: wider is a choice made in the controls.
+      const within = [home, s?.fsRoot].filter(Boolean).map(real).filter((r) => r && path.parse(r).root !== r);
+      if (!within.some((r) => inside(r, at))) return { error: `By voice I can only move the files folder within your home folder; for ${at}, use Change folder under Files in the controls.` };
+      return { patch: { fsRoot: at }, said: `files folder set to ${at}`, rescan: true };
     },
   },
   files_depth: {
@@ -323,152 +329,62 @@ const inside = (root, p) => {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 };
 
-/**
- * A shell command as words, split at && (and a final `| tail`/`| head`), or null when it uses anything else the
- * shell would interpret: ; | & redirection, $ and backtick expansion, subshells, newlines, ~.
- */
-export function splitCommand(command) {
-  const segments = [[]];
-  let word = null;
-  let quote = '';
-  const push = () => { if (word !== null) segments.at(-1).push(word); word = null; };
-  const s = String(command);
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (quote === "'") {
-      if (c === "'") quote = ''; else word += c;
-      continue;
-    }
-    if (quote === '"') {
-      if (c === '"') quote = '';
-      else if (c === '$' || c === '`') return null;
-      else if (c === '\\' && i + 1 < s.length && '"\\'.includes(s[i + 1])) word += s[++i];
-      else word += c;
-      continue;
-    }
-    if (c === "'" || c === '"') { quote = c; word = word ?? ''; continue; }
-    if (c === '\\') { if (i + 1 >= s.length || s[i + 1] === '\n') return null; word = (word ?? '') + s[++i]; continue; }
-    if (c === ' ' || c === '\t') { push(); continue; }
-    if (s.startsWith('&&', i)) { push(); segments.push([]); i++; continue; }
-    if (s.startsWith('2>&1', i) && word === null) { i += 3; continue; } // harmless: errors into the same output
-    if (c === '|' && s[i + 1] !== '|') { push(); segments.push(['|']); continue; }
-    if (';&|<>$`(){}\n\r'.includes(c)) return null;
-    if (c === '~' && word === null) return null;
-    word = (word ?? '') + c;
-  }
-  if (quote) return null;
-  push();
-  // A pipe is allowed only into a final tail or head with a line count.
-  for (let k = 0; k < segments.length; k++) {
-    const seg = segments[k];
-    if (seg[0] !== '|') continue;
-    const [, cmd, ...args] = seg;
-    if (k !== segments.length - 1 || !['tail', 'head'].includes(cmd) || !args.every((a) => /^-n$|^-?\d+$|^-n\d+$/.test(a))) return null;
-  }
-  if (segments.some((seg) => !seg.length)) return null;
-  return segments.filter((seg) => seg[0] !== '|');
-}
-
-const GIT_OK = new Set(['status', 'diff', 'log', 'show', 'add', 'commit', 'rm', 'mv', 'ls-files', 'rev-parse', 'branch']);
-const READERS = new Set(['ls', 'pwd', 'cat', 'head', 'tail', 'wc', 'diff']);
-const looksLikePath = (a) => a === '.' || a === '..' || /[\\/]/.test(a);
-
-/**
- * May the self-change agent run this Bash command? Only builds, tests, the repo's own scripts and tools, a few readers,
- * and git status/diff/log/show/add/commit — everything inside the worktree. `allowInstall`: packages the user agreed to.
- * @returns {{ok: true} | {ok: false, reason: string}}
- */
-export function bashAllowed(command, { worktree, readRoots = [], allowInstall = [], binExists = () => false } = {}) {
-  const deny = (reason) => ({ ok: false, reason });
-  const segments = splitCommand(command);
-  if (!segments) return deny('Only plain commands, joined with && if need be: no ; | > < $ ` ~ or subshells (a final "2>&1 | tail -n N" is fine).');
-  const root = realish(worktree);
-  const reads = [root, ...readRoots.map(realish)];
-  let cwd = root;
-  const at = (p) => realish(path.resolve(cwd, p));
-  const within = (p, roots = [root]) => roots.some((r) => inside(r, at(p)));
-  // Every argument that names a file must be inside the worktree (or, to read, the packages it uses).
-  const pathsOk = (args, roots = [root]) => args.every((a) => {
-    if (/:\/\//.test(a)) return false;
-    const v = a.startsWith('-') ? (a.includes('=') ? a.slice(a.indexOf('=') + 1) : '') : a;
-    return !v || !looksLikePath(v) || within(v, roots);
-  });
-  for (const [cmd, ...args] of segments) {
-    if (cmd === 'cd') {
-      if (args.length !== 1 || !within(args[0])) return deny('cd only to a folder inside this worktree.');
-      cwd = at(args[0]);
-      continue;
-    }
-    if (cmd === 'npm') {
-      const [sub, ...rest] = args;
-      if (['test', 't'].includes(sub) || (sub === 'run' && ['test', 'build'].includes(rest[0]))) {
-        if (!pathsOk(rest)) return deny('Paths must be inside this worktree.');
-        continue;
-      }
-      if (['install', 'i', 'add'].includes(sub)) {
-        const pkgs = rest.filter((a) => !a.startsWith('-'));
-        const flags = rest.filter((a) => a.startsWith('-'));
-        if (!pkgs.length || !pkgs.every((p) => allowInstall.includes(p.replace(/@[^@/]*$/, '') || p)) || !flags.every((f) => ['--save', '--save-dev', '-D', '--save-exact', '-E', '--prefer-offline'].includes(f))) {
-          return deny('Installing packages needs the user\'s permission. Stop, and say which package you need and why; they will be asked.');
-        }
-        continue;
-      }
-      return deny('npm: only npm test, npm run test and npm run build.');
-    }
-    if (cmd === 'node') {
-      if (args.some((a) => /^(-e|--eval|-p|--print|-r|--require|--import|--loader|--experimental-loader|-i|--interactive|--inspect.*)$/.test(a.split('=')[0]))) return deny('node: run the repo\'s own files, not inline code.');
-      const files = args.filter((a) => !a.startsWith('-'));
-      if (!args.includes('--version') && !args.includes('-v') && !files.length) return deny('node needs a script file from this repo.');
-      if (!files.every((f) => within(f.replace(/\*.*$/, '') || '.'))) return deny('node: only files inside this worktree.');
-      continue;
-    }
-    if (cmd === 'npx') {
-      const [bin, ...rest] = args;
-      if (!bin || bin.startsWith('-') || /[@/\\]/.test(bin) || !binExists(bin)) return deny('npx: only tools already installed in this repo (node_modules/.bin), with no options before the tool name.');
-      if (!pathsOk(rest)) return deny('Paths must be inside this worktree.');
-      continue;
-    }
-    if (cmd === 'git') {
-      const [sub, ...rest] = args;
-      if (!sub || sub.startsWith('-')) return deny('git: no options before the subcommand (no -C, -c, --git-dir, --work-tree).');
-      if (!GIT_OK.has(sub)) return deny(`git ${sub} is not allowed here: only status, diff, log, show, add, commit, rm, mv, ls-files, rev-parse and branch --show-current. Never push, fetch, pull, reset, checkout, merge, rebase, stash or change config or remotes.`);
-      if (sub === 'branch' && rest.some((a) => !['--show-current', '--list', '-a', '-v', '-vv'].includes(a))) return deny('git branch: only to look (no creating, deleting or switching).');
-      if (rest.some((a) => /^--(no-index|output|exec|upload-pack|receive-pack|git-dir|work-tree)/.test(a))) return deny('That git option is not allowed here.');
-      if (sub === 'add' && rest.some((a) => ['-A', '--all', '.', ':/', '-f', '--force', '*'].includes(a) || /(^|[\\/])node_modules([\\/]|$)/.test(a))) return deny('git add the files you changed by name (not -A, ., or node_modules).');
-      const checked = rest.filter((a, k) => !/^(-[a-zA-Z]*m|--message)$/.test(rest[k - 1] || '') && !/^(-[a-zA-Z]*m|--message)$/.test(a) && !a.startsWith('--message=')); // a commit message is not a path
-      if (!pathsOk(checked)) return deny('Paths must be inside this worktree.');
-      continue;
-    }
-    if (READERS.has(cmd)) {
-      if (!pathsOk(args.filter((a) => !a.startsWith('-')).map((a) => (looksLikePath(a) ? a : `./${a}`)), reads)) return deny('Only files inside this worktree.');
-      continue;
-    }
-    return deny(`${cmd} is not allowed here. Use Read, Glob and Grep to look at files and Edit or Write to change them; Bash runs only node build.mjs, npm test, node or npx for this repo's own scripts and tools, and git status, diff, log, show, add and commit.`);
-  }
-  return { ok: true };
-}
-
 const FILE_TOOLS = { Read: 'read', Glob: 'read', Grep: 'read', Edit: 'write', Write: 'write', MultiEdit: 'write', NotebookEdit: 'write' };
+const hasDotDot = (p) => String(p).split(/[\\/]+/).includes('..');
 
-/** The whole policy for the self-change agent's tools. */
+/**
+ * The whole policy for the self-change agent's tools: reading, searching and editing files inside its worktree, nothing else.
+ * It runs no commands at all (no Bash): anything it could run, it could also have written, so nothing it writes runs before
+ * the user has said yes. Paths with ".." are refused rather than resolved, since a ".." after a link (node_modules) leads
+ * somewhere else on disk than it does on paper.
+ */
 export function toolAllowed(name, input = {}, opts = {}) {
   const deny = (reason) => ({ ok: false, reason });
-  if (name === 'Bash') return bashAllowed(input.command, opts);
+  if (name === 'Bash') return deny('This job runs no commands. Read, Glob and Grep to look, Edit and Write to change files; Jarvis builds, tests and commits it once the user agrees.');
   if (name === 'TodoWrite') return { ok: true };
   const mode = FILE_TOOLS[name];
   if (!mode) return deny(`${name} is not available for this job.`);
   const root = realish(opts.worktree);
-  if (name === 'Glob' && typeof input.pattern === 'string' && (path.isAbsolute(input.pattern) || /(^|[\\/])\.\.([\\/]|$)|^~/.test(input.pattern))) {
+  if (name === 'Glob' && typeof input.pattern === 'string' && (path.isAbsolute(input.pattern) || hasDotDot(input.pattern) || /^~/.test(input.pattern))) {
     const fixed = input.pattern.split(/[*?[{]/)[0];
-    if (/^~|\.\./.test(input.pattern) || !inside(realish(opts.worktree), realish(fixed || '/'))) return deny('Only files inside this worktree.');
+    if (/^~/.test(input.pattern) || hasDotDot(input.pattern) || !inside(root, realish(fixed || '/'))) return deny('Only files inside this worktree.');
   }
   const p = input.file_path ?? input.notebook_path ?? input.path;
   if (p === undefined || p === '') return mode === 'read' && name !== 'Read' ? { ok: true } : deny('A file path is needed.');
+  if (hasDotDot(p) || /^~/.test(String(p))) return deny('No ".." or ~ in paths: name the file by its path inside this worktree.');
   const full = realish(path.resolve(root, String(p)));
   const roots = mode === 'read' ? [root, ...(opts.readRoots || []).map(realish)] : [root];
   if (!roots.some((r) => inside(r, full))) return deny(`Only files inside this worktree (${root}).`);
   if (mode === 'write' && (inside(path.join(root, '.git'), full) || /(^|[\\/])node_modules([\\/]|$)/.test(path.relative(root, full)))) return deny('Not inside .git or node_modules.');
   return { ok: true };
+}
+
+// ---- consent ---------------------------------------------------------------------------
+// What changes Jarvis's code or its standing instructions is decided by what the user said, never by the model alone:
+// text it reads (a web page, a file, a tool result, the coding agent's own summary) cannot stand in for a yes.
+
+const NEGATION = /\b(no|nope|nah|not|don'?t|do not|never|stop|wait|hold|cancel|discard|later|isn'?t|won'?t|shouldn'?t|wouldn'?t)\b/i;
+const YES = /\b(yes|yeah|yep|yup|yea|sure|ok|okay|alright|all right|go ahead|go for it|do it|please do|proceed|absolutely|definitely|certainly|of course|sounds good|affirmative|ship it|make it so|apply it|let'?s do it)\b/i;
+const plainWords = (t) => String(t || '').toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, ' ').trim().split(/\s+/).filter(Boolean);
+
+/** A short yes from the user ("yes", "go ahead", "sure, do it"), and no "no" or "wait" in it. `verb` also counts as a yes ("apply the change"). */
+export function isYes(text, verb = null, maxWords = 8) {
+  const w = plainWords(text);
+  const t = w.join(' ');
+  if (!w.length || w.length > (verb ? Math.max(maxWords, 14) : maxWords) || NEGATION.test(t) || /^(how|what|why|when|where|who|which)\b/.test(t)) return false;
+  return (w.length <= maxWords && YES.test(t)) || Boolean(verb && verb.test(t));
+}
+
+const FILLER = new Set(['the', 'and', 'you', 'your', 'yours', 'user', 'users', 'them', 'their', 'they', 'from', 'now', 'with', 'for', 'that', 'this',
+  'always', 'please', 'jarvis', 'should', 'would', 'could', 'will', 'want', 'like', 'dont', 'any', 'all', 'are', 'about', 'when', 'what', 'into', 'its']);
+const content = (t) => plainWords(t).map((x) => x.replace(/'/g, '')).filter((x) => x.length > 2 && !FILLER.has(x)).map((x) => x.slice(0, 5));
+
+/** Is `candidate` (an instruction, a change request) in the user's own words — at least half its words are in what they said? */
+export function inTheirWords(candidate, said) {
+  const want = [...new Set(content(candidate))];
+  if (!want.length) return false;
+  const have = new Set(content(said));
+  return want.filter((x) => have.has(x)).length * 2 >= want.length;
 }
 
 /** What the agent is doing, in a few words for the status line. */
@@ -477,14 +393,6 @@ export function progressLine(name, input = {}) {
   if (name === 'Read') return file ? `reading ${file}` : 'reading the code';
   if (name === 'Glob' || name === 'Grep') return 'looking through the code';
   if (name === 'Edit' || name === 'MultiEdit' || name === 'Write') return file ? `editing ${file}` : 'editing';
-  if (name === 'Bash') {
-    const c = String(input.command || '');
-    if (/npm (run )?t(est)?\b|node --test/.test(c)) return 'running tests';
-    if (/build\.mjs|npm run build/.test(c)) return 'building';
-    if (/git commit/.test(c)) return 'committing';
-    if (/npm (install|i|add)\b/.test(c)) return 'installing a package';
-    return 'checking';
-  }
   return 'working';
 }
 
@@ -498,15 +406,14 @@ The codebase
 
 Rules
 - Do what was asked with the smallest change that does it well. Match the code style around it, and the short, plain wording of user-facing text. No unrelated refactors or clean-ups.
-- No new dependencies unless the request cannot be done without one. Installing needs the user's permission: if you need a package you have not been allowed, stop and say which and why in your SUMMARY line.
-- Use Read, Glob and Grep to find your way and Edit or Write to change files. Bash runs only: node build.mjs, npm test, node or npx for this repo's own scripts and installed tools, a few readers (ls, cat, head, tail, wc), and git status, diff, log, show, add <files>, commit. No pipes or redirection except a final "2>&1 | tail -n 40". Stay inside this folder.
+- Your tools are Read, Glob and Grep to find your way and Edit and Write to change files, all inside this folder (node_modules can be read, not changed; never .git). There is no shell: you cannot run the build, the tests, git or anything else. Nothing you write runs until the user agrees; then Jarvis builds it, runs the tests and commits it. So read the code you touch and its callers carefully, and get it right on paper.
+- No new dependencies: you cannot install packages. If the request cannot be done without one, change nothing and say which package and why in your SUMMARY line.
 - Update or add tests in test/ when you change behaviour they cover.
-- When it is done: run node build.mjs and npm test and fix anything you broke; then git add the files you changed, by name, and git commit with a short message.
 - End your final message with one line starting "SUMMARY:" — one or two plain spoken sentences for the user on what you changed (no file paths, no code, nothing about builds or tests; Jarvis reports those itself). If you could not do it, say why on that line.`;
 
-const NEVER_TOOLS = ['WebFetch', 'WebSearch', 'Task', 'Agent', 'TaskStop', 'ListAgents', 'SendMessage', 'Workflow', 'Skill', 'SlashCommand', 'ToolSearch', 'NotebookEdit',
+const NEVER_TOOLS = ['Bash', 'WebFetch', 'WebSearch', 'Task', 'Agent', 'TaskStop', 'ListAgents', 'SendMessage', 'Workflow', 'Skill', 'SlashCommand', 'ToolSearch', 'NotebookEdit',
   'CronCreate', 'CronDelete', 'CronList', 'ScheduleWakeup', 'RemoteTrigger', 'PushNotification', 'EnterWorktree', 'ExitWorktree', 'BashOutput', 'KillShell', 'Monitor', 'LS'];
-const CODER_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'TodoWrite'];
+const CODER_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'TodoWrite'];
 export const TIME_CAP = 15 * 60_000;
 export const MAX_TURNS = 80;
 
@@ -556,6 +463,13 @@ export function coderEnv(base = process.env) {
   return { ...env, GIT_TERMINAL_PROMPT: '0', CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: '1' };
 }
 
+/** The environment for node running code from a change: no keys or tokens, nothing pointing at Jarvis's data. */
+export function nodeEnv(base = process.env) {
+  const env = { ...base };
+  for (const k of Object.keys(env)) if (/^(JARVIS_.*|ELECTRON_RUN_AS_NODE|NODE_TEST_CONTEXT|NODE_OPTIONS)$/i.test(k) || /(TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL)/i.test(k)) delete env[k];
+  return env;
+}
+
 const gitEnv = () => {
   const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
   for (const k of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|INDEX_FILE)$/.test(k)) delete env[k];
@@ -571,9 +485,7 @@ function exec(file, args, { cwd, env, timeout = 120_000 } = {}) {
 export const defaultGit = (args, cwd) => exec('git', args, { cwd, env: gitEnv() });
 /** node on the PATH, or Electron's own Node when the app was started without one on the PATH. */
 export async function defaultNode(args, cwd) {
-  const env = { ...process.env };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.NODE_TEST_CONTEXT; // started from a test run, a nested node --test would report to it instead of failing
+  const env = nodeEnv(); // NODE_TEST_CONTEXT goes too: started from a test run, a nested node --test would report to it instead of failing
   const r = await exec('node', args, { cwd, env, timeout: 10 * 60_000 });
   if (!r.missing || !process.versions.electron) return r;
   return exec(process.execPath, args, { cwd, env: { ...env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 10 * 60_000 });
@@ -614,20 +526,41 @@ export class SelfChange {
     return {
       available: this.repo.ok,
       reason: this.repo.ok ? '' : this.repo.reason,
-      job: j && { state: j.state, request: j.request, step: j.step, summary: j.summary, testsOk: j.testsOk, buildOk: j.buildOk, diffFile: j.diffFile, branch: j.branch, error: j.error, files: j.files || [] },
+      job: j && { state: j.state, request: j.request, step: j.step, summary: j.summary, checked: Boolean(j.checked), testsOk: j.testsOk, buildOk: j.buildOk, diffFile: j.diffFile, branch: j.branch, error: j.error, files: j.files || [] },
       history: (this.o.settings.get().selfChanges || []).slice(-8),
     };
   }
 
-  /** One line for the per-turn prompt, so the conversation knows about a change in flight. */
+  /**
+   * One line for the per-turn prompt, so the conversation knows about a change in flight. Only Jarvis's own words and the
+   * user's request: never the coding agent's summary, which is its text, not the user's or Jarvis's.
+   */
   note() {
     const j = this.job;
     if (!j) return '';
-    if (j.state === 'checking') return `Change to your own code ("${j.request}"): the coding is done; you are building and testing it — ${j.step}.`;
+    if (j.state === 'checking') return `Change to your own code ("${j.request}"): the coding is done; you are writing up the diff — ${j.step}.`;
     if (j.state === 'working') return `Change to your own code in progress (in the background): "${j.request}" — ${j.step}.`;
-    if (j.state === 'ready') return `Change to your own code waiting for their yes or no: ${j.summary} ${j.testsOk ? 'It builds and the tests pass.' : 'The tests FAIL on it.'} apply_change on an explicit yes, discard_change on a no.`;
-    if (j.state === 'applying') return 'Applying the change to your own code now; you will restart in a moment.';
+    if (j.state === 'ready') {
+      const files = j.files || [];
+      const checked = j.checked ? (j.testsOk ? 'It builds and the tests pass.' : `It was built and tested after their yes and ${j.buildOk ? 'the tests FAIL' : 'the build FAILS'}, so it was not applied.`) : 'It has not been built or tested yet: that runs its code, so it happens after their yes, before anything is applied.';
+      return `Change to your own code ("${j.request}") waiting for their yes or no: ${files.length} file${files.length === 1 ? '' : 's'} changed (${files.slice(0, 4).join(', ')}${files.length > 4 ? '…' : ''}), the diff on screen. ${checked} apply_change only once they say yes (it will refuse otherwise); discard_change on a no.`;
+    }
+    if (j.state === 'applying') return `Applying the change to your own code now (${j.step || 'applying'}); you will restart in a moment if it goes through.`;
     return '';
+  }
+
+  /**
+   * Something the user said (typed or spoken), at the start of each turn. A yes to the waiting change, or to an undo Jarvis
+   * asked about, is only ever taken from here or from the window's buttons; tool calls check it (see apply, undo).
+   */
+  heard(text) {
+    this.turn = (this.turn || 0) + 1;
+    const said = String(text || '');
+    const j = this.job;
+    this.consent = null;
+    if (j?.state === 'ready' && (j.readyTurn ?? Infinity) < this.turn && isYes(said, /\bapply\b/)) this.consent = 'apply';
+    else if (this.undoAsked === this.turn - 1 && isYes(said, /\b(undo|revert)\b/)) this.consent = 'undo';
+    else if (/\b(undo|revert|roll back)\b/i.test(said) && isYes(said, /\b(undo|revert|roll back)\b/)) this.consent = 'undo'; // "undo that last change"
   }
 
   update(patch) {
@@ -662,7 +595,7 @@ export class SelfChange {
   // ---- making a change ---------------------------------------------------------------
 
   /** Start a change in the background. Resolves at once with what to tell the user. */
-  async start(request, { allowInstall = [] } = {}) {
+  async start(request) {
     request = String(request || '').trim();
     if (!request) return 'change_myself needs the request, in the user\'s words.';
     if (!this.repo.ok) return `I can only change my settings and standing instructions in this build: I'm ${this.repo.reason}, so there is no code of mine to edit.`;
@@ -693,7 +626,7 @@ export class SelfChange {
       try { fs.symlinkSync(modules, path.join(worktree, 'node_modules'), 'junction'); } catch (err) { this.o.log(`node_modules link failed: ${err.message}`); }
     }
     const ac = new AbortController();
-    this.job = { request, branch, worktree, base, state: 'working', step: 'reading the code', started: Date.now(), ac, allowInstall };
+    this.job = { request, branch, worktree, base, state: 'working', step: 'reading the code', started: Date.now(), ac };
     this.update({ step: 'reading the code' });
     this.running = this.run(this.job, sdk).catch((err) => this.o.log(`self-change failed: ${err?.stack || err}`));
     return `Started on a separate copy of my code (branch ${branch}). It runs in the background, usually a few minutes; I'll say when it is ready and show the diff. Tell the user that in a few words and carry on with the conversation.`;
@@ -704,10 +637,7 @@ export class SelfChange {
     const model = /^claude-/.test(s.cloudModel) ? s.cloudModel : 'claude-opus-5-5';
     const readRoots = [path.join(this.repo.dir, 'node_modules')];
     const policy = (name, input) => {
-      const r = toolAllowed(name, input, {
-        worktree: job.worktree, readRoots, allowInstall: job.allowInstall,
-        binExists: (b) => fs.existsSync(path.join(job.worktree, 'node_modules', '.bin', b)),
-      });
+      const r = toolAllowed(name, input, { worktree: job.worktree, readRoots });
       if (!r.ok) this.o.log(`denied ${name} ${JSON.stringify(input).slice(0, 200)}: ${r.reason}`);
       return r;
     };
@@ -718,7 +648,7 @@ export class SelfChange {
     let lastText = '';
     try {
       const q = sdk.query({
-        prompt: `The user asked for this change, in their own words (spoken, so it went through speech recognition):\n\n"${job.request}"${job.allowInstall.length ? `\n\nThey agreed to installing: ${job.allowInstall.join(', ')}.` : ''}`,
+        prompt: `The user asked for this change, in their own words (spoken, so it went through speech recognition):\n\n"${job.request}"`,
         options: coderOptions({ bin, model, worktree: job.worktree, env: coderEnv(), policy, abortController: job.ac }),
       });
       for await (const m of q) {
@@ -749,14 +679,17 @@ export class SelfChange {
     await this.finish(job, result, lastText);
   }
 
-  /** The agent is done: commit what it left, build and test it independently, write the diff, and report. */
+  /**
+   * The agent is done: commit what it left, write the diff, and report. Nothing it wrote is run here — not the build, not
+   * the tests, not a git hook: that waits for the user's yes (see apply).
+   */
   async finish(job, result, lastText) {
     const wt = job.worktree;
     job.summary = summaryOf(result?.result || lastText);
     const left = await this.git(['status', '--porcelain'], wt);
     if (left.ok && left.out.split('\n').some((l) => l.trim() && !/node_modules$/.test(l.trim()))) {
       await this.git(['add', '-A', '--', '.', ':(exclude)node_modules', ':(exclude)dist'], wt);
-      await this.git(['commit', '-q', '-m', `Jarvis: ${job.request.slice(0, 60)}`], wt);
+      await this.git(['-c', `core.hooksPath=${os.devNull}`, 'commit', '--no-verify', '-q', '-m', `Jarvis: ${job.request.slice(0, 60)}`], wt); // hooks could be files the agent wrote
     }
     const names = await this.git(['diff', '--name-only', job.base, job.branch]);
     job.files = names.ok ? names.out.split('\n').filter(Boolean) : [];
@@ -770,29 +703,40 @@ export class SelfChange {
       return this.o.say(`I couldn't make that change to my code. ${why}`);
     }
     if (this.job !== job) return;
-    this.update({ step: 'building' });
-    const build = await this.o.node(['build.mjs'], wt);
-    if (this.job !== job) return;
-    this.update({ step: 'running tests' });
-    const testDir = path.join(wt, 'test');
-    const tests = fs.existsSync(testDir) ? fs.readdirSync(testDir).filter((f) => f.endsWith('.test.js')).map((f) => path.join('test', f)) : [];
-    const test = tests.length ? await this.o.node(['--test', ...tests], wt) : { ok: true, out: '' };
-    if (this.job !== job) return;
-    const diff = await this.git(['diff', job.base, job.branch]);
-    const stat = await this.git(['diff', '--stat', job.base, job.branch]);
-    fs.mkdirSync(this.o.diffDir, { recursive: true });
-    const diffFile = path.join(this.o.diffDir, `${job.branch.replace(/^jarvis\//, '').replace(/[^\w.-]+/g, '-')}.diff`);
-    const header = `# ${job.request}\n# branch ${job.branch}\n# ${job.summary}\n# build: ${build.ok ? 'ok' : 'FAILED'} · tests: ${test.ok ? 'pass' : 'FAIL'}\n${build.ok ? '' : `# ${tail(build.err || build.out, 600).replace(/\n/g, '\n# ')}\n`}${test.ok ? '' : `# ${tail(test.out + test.err, 900).replace(/\n/g, '\n# ')}\n`}#\n${stat.out.replace(/^/gm, '# ')}\n`;
-    fs.writeFileSync(diffFile, `${header}\n${diff.out}`);
-    job.buildOk = build.ok;
-    job.testsOk = build.ok && test.ok;
+    job.checked = false;
+    job.buildOk = null;
+    job.testsOk = null;
+    const diffFile = await this.writeDiff(job);
+    job.readyTurn = this.turn || 0; // a yes counts only from the next thing the user says
     this.update({ state: 'ready', step: '', diffFile });
     this.o.ui({ type: 'status', text: '', ttl: 1 });
     this.o.ui({ type: 'show_file', path: diffFile });
     const what = job.summary || `I changed ${job.files.length} file${job.files.length === 1 ? '' : 's'}.`;
-    this.o.say(job.testsOk
-      ? `The change is ready. ${what} It builds and the tests pass; the diff is on screen. Shall I apply it? I'll restart to do so.`
-      : `The change is ready, but ${build.ok ? 'the tests fail on it' : 'it does not build'}. ${what} The diff is on screen; I wouldn't apply it as it is.`);
+    this.o.say(`The change is ready. ${what} The diff is on screen. I haven't run it yet: if you say yes, I build it and run the tests first, and apply it only if they pass. Shall I?`);
+  }
+
+  /** The diff file the viewer shows, with what is known about the build and the tests at its top. */
+  async writeDiff(job, { build, test } = {}) {
+    const diff = await this.git(['diff', job.base, job.branch]);
+    const stat = await this.git(['diff', '--stat', job.base, job.branch]);
+    fs.mkdirSync(this.o.diffDir, { recursive: true });
+    const diffFile = path.join(this.o.diffDir, `${job.branch.replace(/^jarvis\//, '').replace(/[^\w.-]+/g, '-')}.diff`);
+    const checks = !build
+      ? '# not built or tested yet: that runs the new code, so it happens only after you say yes\n'
+      : `# build: ${build.ok ? 'ok' : 'FAILED'} · tests: ${test.ok ? 'pass' : 'FAIL'}\n${build.ok ? '' : `# ${tail(build.err || build.out, 600).replace(/\n/g, '\n# ')}\n`}${test.ok ? '' : `# ${tail(test.out + test.err, 900).replace(/\n/g, '\n# ')}\n`}`;
+    const header = `# ${job.request}\n# branch ${job.branch}\n# ${job.summary}\n${checks}#\n${stat.out.replace(/^/gm, '# ')}\n`;
+    fs.writeFileSync(diffFile, `${header}\n${diff.out}`);
+    return diffFile;
+  }
+
+  /** Build the change and run its tests, in its worktree, without keys or tokens in the environment. Only after the user's yes. */
+  async check(job) {
+    const wt = job.worktree;
+    const build = await this.o.node(['build.mjs'], wt);
+    const testDir = path.join(wt, 'test');
+    const tests = fs.existsSync(testDir) ? fs.readdirSync(testDir).filter((f) => f.endsWith('.test.js')).map((f) => path.join('test', f)) : [];
+    const test = build.ok && tests.length ? await this.o.node(['--test', ...tests], wt) : { ok: build.ok, out: '', err: '' };
+    return { build, test };
   }
 
   async cleanup(job, { keepBranch = true } = {}) {
@@ -818,15 +762,38 @@ export class SelfChange {
     return wasWorking ? 'Stopped, and nothing was changed.' : 'Discarded; nothing was changed.';
   }
 
-  /** Merge the waiting change into the running checkout, rebuild, and restart. Only on the user's explicit yes. */
-  async apply({ anyway = false } = {}) {
+  /**
+   * Build and test the waiting change, then merge it into the running checkout, rebuild, and restart. Only on the user's
+   * yes: `button` when it comes from the window's Apply button, otherwise (a tool call) the yes must be in what the user said
+   * this turn (see heard).
+   */
+  async apply({ anyway = false, button = false } = {}) {
     const job = this.job;
     if (!job) return 'There is no change waiting to be applied.';
     if (job.state === 'working' || job.state === 'checking') return `It is still working on it (${job.step}).`;
     if (job.state !== 'ready') return 'There is no change waiting to be applied.';
-    if (!job.testsOk && !anyway) return `The ${job.buildOk ? 'tests fail' : 'build fails'} on that change, so I have not applied it. Only if the user insists, call apply_change again with anyway true.`;
+    if (!button && this.consent !== 'apply') return 'Not applied: I apply a change to my own code only right after the user says yes to it, or presses Apply on its card. Ask them in a few words whether to apply it, and call apply_change again once they say yes.';
+    const sawFailure = job.checked && !job.testsOk; // "anyway" only means something once they have heard it fails
+    if (sawFailure && !anyway) return `The ${job.buildOk ? 'tests fail' : 'build fails'} on that change, so I have not applied it. Only if the user insists, call apply_change again with anyway true.`;
     const edits = await this.localEdits();
     if (edits.length) return `There are edits in my code that are not committed (${edits.slice(0, 4).join(', ')}${edits.length > 4 ? '…' : ''}), so I left everything as it is. Commit or put those away first, then ask again.`;
+    if (!job.checked) {
+      this.update({ state: 'applying', step: 'building and testing it first' });
+      this.o.ui({ type: 'status', text: 'Changing myself — building and testing it first', ttl: 0 });
+      const { build, test } = await this.check(job);
+      if (this.job !== job) return 'It was put aside meanwhile.';
+      job.checked = true;
+      job.buildOk = build.ok;
+      job.testsOk = build.ok && test.ok;
+      try { await this.writeDiff(job, { build, test }); } catch (err) { this.o.log(`diff rewrite failed: ${err.message}`); }
+      this.o.ui({ type: 'status', text: '', ttl: 1 });
+      if (!job.testsOk) {
+        job.readyTurn = this.turn || 0; // applying it anyway takes a fresh yes
+        this.consent = null;
+        this.update({ state: 'ready', step: '' });
+        return `I built and tested it first, and ${build.ok ? 'the tests fail' : 'it does not build'} (${firstLine(build.ok ? tail(test.out + test.err, 300) : build.err || build.out) || 'see the diff'}), so I have not applied it; the output is at the top of the diff. Only if the user then insists, call apply_change again with anyway true.`;
+      }
+    }
     this.update({ state: 'applying', step: 'applying' });
     const before = (await this.git(['rev-parse', 'HEAD'])).out.trim();
     let mode = 'ff';
@@ -841,12 +808,16 @@ export class SelfChange {
       }
     }
     const after = (await this.git(['rev-parse', 'HEAD'])).out.trim();
+    if (after === before) { // already in my history (applied before, or reverted since): nothing was applied
+      await this.putAside(job);
+      return 'That change is already part of my code\'s history, so there was nothing to apply and nothing changed. I put it aside.';
+    }
     const build = await this.o.node(['build.mjs'], this.repo.dir);
     if (!build.ok) {
       await this.revert({ before, after, mode }, `Jarvis: undo ${job.branch} (build failed)`);
       await this.o.node(['build.mjs'], this.repo.dir);
-      this.update({ state: 'ready', step: '' });
-      return `It merged, but my build failed (${firstLine(build.err || build.out)}), so I reverted it. Nothing changed.`;
+      await this.putAside(job); // not offered again: a second merge of the same branch would change nothing
+      return `It merged, but my build failed (${firstLine(build.err || build.out)}), so I reverted it and put the change aside (its branch is kept). Nothing changed.`;
     }
     const entry = { branch: job.branch, request: job.request, summary: job.summary, date: this.o.now().toISOString(), before, after, mode, testsOk: job.testsOk };
     const history = [...(this.o.settings.get().selfChanges || []), entry].slice(-20);
@@ -856,6 +827,13 @@ export class SelfChange {
     this.update({});
     this.restartSoon();
     return 'Applied. I restart in a few seconds to load it; say so in a few words.';
+  }
+
+  /** Drop the waiting job without applying it, keeping its branch. */
+  async putAside(job) {
+    await this.cleanup(job);
+    if (this.job === job) this.job = null;
+    this.update({});
   }
 
   /** Revert `before..after` with new commits; never a reset. */
@@ -871,14 +849,19 @@ export class SelfChange {
     return r;
   }
 
-  /** Revert the last applied change with a revert commit, rebuild and restart. */
-  async undo() {
+  /** Revert the last applied change with a revert commit, rebuild and restart. Only on the user's say (see apply). */
+  async undo({ button = false } = {}) {
     if (!this.repo.ok) return 'There is no code change of mine to undo in this build.';
     if (this.job && this.job.state !== 'ready') return 'A change is in progress; stop it first.';
     const history = this.o.settings.get().selfChanges || [];
-    const i = history.findLastIndex((e) => !e.undone);
+    const i = history.findLastIndex((e) => !e.undone && e.before !== e.after); // an entry that changed nothing has nothing to revert
     if (i < 0) return 'There is no applied change to undo.';
     const entry = history[i];
+    if (!button && this.consent !== 'undo') {
+      this.undoAsked = this.turn || 0;
+      return `Not undone yet: I undo a change to my own code only when the user asks for it or says yes to it. Ask them whether to undo "${entry.request}", and call undo_last_change again once they say yes.`;
+    }
+    this.consent = null;
     const edits = await this.localEdits();
     if (edits.length) return `There are uncommitted edits in my code (${edits.slice(0, 4).join(', ')}), so I left everything as it is.`;
     const r = await this.revert(entry, `Jarvis: undo ${entry.branch}`);
@@ -889,7 +872,7 @@ export class SelfChange {
     this.update({});
     if (!build.ok) return `Reverted, but the build failed afterwards (${firstLine(build.err || build.out)}). I have not restarted.`;
     this.restartSoon();
-    return `Undone: ${entry.summary || entry.request}. I restart in a few seconds; say so in a few words.`;
+    return `Undone: ${(entry.summary || entry.request).replace(/[.!?]+$/, '')}. I restart in a few seconds; say so in a few words.`;
   }
 
   /** Restart once the current turn has been answered (or at most twenty seconds from now). */
@@ -908,7 +891,8 @@ export class SelfChange {
 // ---- the tools ---------------------------------------------------------------------------
 
 /**
- * @param ctx {settings, setSettings(patch) -> Promise, env() -> {claudeReady, hasApiKey}, selfChange (SelfChange), rescanFiles?()}
+ * @param ctx {settings, setSettings(patch) -> Promise, env() -> {claudeReady, hasApiKey}, selfChange (SelfChange), rescanFiles?(),
+ *   heard() -> what the user said this turn (consent for instructions and code changes is checked against it)}
  */
 export function selfTools(ctx) {
   const who = () => ctx.settings.get().userName || 'the user';
@@ -939,6 +923,8 @@ export function selfTools(ctx) {
         which: str('For remove and replace: the number of the instruction, or words from it'),
       }, ['action']),
       run: async ({ action, text, which }) => {
+        // Saved for good and put above the defaults: only what the user said themselves, not what a page or a file says.
+        if ((action === 'add' || action === 'replace') && !inTheirWords(text, ctx.heard?.() || '')) return 'Not saved: a standing instruction has to come from what the user just said to you, in their words. Use their own words (lightly tidied), or ask them what exactly to save.';
         const before = ctx.settings.get().instructions || [];
         const r = editInstructions(before, { action, text, which });
         if (r.error) return `Not changed: ${r.error}`;
@@ -948,16 +934,17 @@ export function selfTools(ctx) {
     },
     {
       name: 'change_myself',
-      description: 'Change your own code, for what a setting or a standing instruction cannot do: how you look, a new feature, how something works ("make the orb blue", "add a timer", "make the captions bigger"). Ask first and call this only after they said yes. A coding agent on their Claude login edits a separate copy of your source on a new branch, builds and tests it, in the background; you are told when the diff is ready. Nothing changes until they approve it with apply_change.',
-      schema: obj({
-        request: str('What they asked for, in their own words'),
-        install_ok: str('Only if they explicitly agreed to it: the npm package the change may install'),
-      }, ['request']),
-      run: async ({ request, install_ok: ok }) => ctx.selfChange.start(request, { allowInstall: ok ? [String(ok).trim()] : [] }),
+      description: 'Change your own code, for what a setting or a standing instruction cannot do: how you look, a new feature, how something works ("make the orb blue", "add a timer", "make the captions bigger"). Ask first and call this only after they said yes. A coding agent on their Claude login edits a separate copy of your source on a new branch, in the background, and cannot run anything; you are told when the diff is ready. Nothing is built, run or changed until they approve it with apply_change.',
+      schema: obj({ request: str('What they asked for, in their own words') }, ['request']),
+      run: async ({ request }) => {
+        const said = ctx.heard?.() || '';
+        if (!isYes(said) && !inTheirWords(request, said)) return 'Not started: I change my own code only when the user asks for it themselves. Ask them whether they want this change, and call change_myself on their yes, with their request in their words.';
+        return ctx.selfChange.start(request);
+      },
     },
     {
       name: 'apply_change',
-      description: 'Apply the change to your own code that is waiting — only after the user explicitly said yes to it. Merges it, rebuilds and restarts you.',
+      description: 'Apply the change to your own code that is waiting — only right after the user said yes to it (it refuses otherwise). Builds and tests it first if that has not been done, then merges it, rebuilds and restarts you.',
       schema: obj({ anyway: { type: 'boolean', description: 'True only if the tests failed and the user insists on applying it regardless' } }),
       run: async ({ anyway }) => ctx.selfChange.apply({ anyway: anyway === true }),
     },
@@ -969,7 +956,7 @@ export function selfTools(ctx) {
     },
     {
       name: 'undo_last_change',
-      description: 'Undo the last change to your own code that was applied, with a revert commit; rebuilds and restarts you. Ask first.',
+      description: 'Undo the last change to your own code that was applied, with a revert commit; rebuilds and restarts you. Only when the user asks for it or says yes to it (it refuses otherwise).',
       schema: obj({}),
       run: async () => ctx.selfChange.undo(),
     },
@@ -980,6 +967,7 @@ export function selfTools(ctx) {
 export const noSelfChange = {
   available: false,
   note: () => '',
+  heard: () => {},
   start: async () => 'I can only change my settings and standing instructions in this build; there is no code of mine to edit.',
   apply: async () => 'There is no change waiting to be applied.',
   discard: async () => 'There is no change in progress or waiting.',

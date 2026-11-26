@@ -123,7 +123,7 @@ test('recall: same scorer, more results, documents found by what they say', asyn
   assert.match(await tools.recall.run({ query: 'drills' }), /\[fact\] Drill Decision \(Volleyball\): Decided to drop the butterfly drill/);
   assert.match(await tools.recall.run({ query: 'serve ladder' }), /\[document\] Practice Plan \(Volleyball\).*Saved document; read_document opens it\./);
   assert.match(await tools.recall.run({ query: 'my son' }), /\[person\] Leo/);
-  assert.match(await tools.recall.run({ query: 'submarines' }), /^Nothing in memory matches "submarines"\. Projects: General, Volleyball, Lisbon Trip, Family\.$/);
+  assert.match(await tools.recall.run({ query: 'submarines' }), /^Nothing in memory matches "submarines"\. Projects: General, Volleyball, Lisbon Trip, Family\. For a list .* use list_memory\.$/);
   // remember can mark a standing preference
   await tools.remember.run({ label: 'Short Answers', type: 'preference', summary: 'Keep answers short.', standing: true });
   assert.equal(m.find('Short Answers').standing, true);
@@ -168,4 +168,87 @@ test('agent: an instruction saved or a setting changed this turn is not filed in
   await new Promise((r) => setTimeout(r, 20));
   assert.match(asked[0], /saved a standing instruction; that is kept elsewhere/);
   assert.doesNotMatch(asked[1], /kept elsewhere/);
+});
+
+test('relevance: tastes are not standing preferences, an explicit false sticks, and the name is never pushed out', () => {
+  const m = new Memory(tmp());
+  let t = Date.now() - 1e9;
+  for (const [label, summary] of [['Preferred Name', 'The user likes to be called Tom.'], ['Short Layovers', 'The user prefers short layovers when flying.'],
+    ['Casual Restaurants', 'The user prefers casual restaurants over fine dining.'], ['Calls Mum', 'The user likes to call her mum on Sundays.'],
+    ['Football Talk', 'The user loves to talk about football.'], ['Comedy', 'The user enjoys stand-up comedy and jokes.'],
+    ['Detailed Maps', 'The user prefers detailed hiking maps.'], ['Spanish', 'The user wants to speak Spanish one day.']]) {
+    m.upsert({ label, type: 'preference', summary }, { save: false }).updated = (t += 1e6);
+  }
+  m.merge({ nodes: [{ label: 'Short Flights', type: 'preference', summary: 'The user prefers short direct flights.', standing: false }] });
+  assert.equal(m.find('Short Flights').standing, false, 'the extractor said no');
+  assert.deepEqual(m.standing().map((n) => n.label), ['Preferred Name']);
+  for (const [summary, want] of [['Keep answers short.', true], ['Prefers short, concise answers.', true], ['Uses metric units.', true], ['Goes by Mick.', true],
+    ['Prefers to be spoken to in French.', true], ['Prefers short layovers.', false], ['Likes a casual tone.', true], ['Likes casual clothes.', false]]) {
+    assert.equal(isStanding({ type: 'preference', label: 'x', summary }), want, summary);
+  }
+  assert.match(m.notes({ text: "what's my name?" }), /- The user likes to be called Tom\./);
+  // past the cap, a standing preference can still come up as a note when the turn is about it
+  for (let i = 0; i < 7; i++) m.upsert({ label: `Rule ${i}`, type: 'preference', summary: `Rule ${i} for answers.`, standing: true });
+  assert.ok(!m.standing().some((n) => n.label === 'Preferred Name'));
+  assert.deepEqual(labels(m.relevant({ text: 'what name do I like to be called, Tom?' })), ['Preferred Name']);
+});
+
+test('relevance: ordinals meet day numbers, and "may", "set", single digits and weekdays do not pull in memories', () => {
+  const m = new Memory(tmp());
+  m.merge({ project: 'Trip', nodes: [
+    { label: 'Lisbon Flights', type: 'fact', summary: 'Flights to Lisbon are booked for May 3 to May 10.' },
+    { label: 'Main Panel', type: 'task', summary: 'The main panel may need an upgrade.' },
+    { label: 'Atlas Deadline', type: 'fact', summary: 'The Atlas migration must be finished by December 12.' },
+    { label: 'Regional Tournament', type: 'task', summary: 'The regional tournament is on March 14.' },
+    { label: 'Rotation 5-1', type: 'topic', summary: 'Maya setting in a 5-1 rotation.' },
+    { label: 'Pasta Lunch', type: 'fact', summary: 'Had pasta for lunch on Tuesday.' },
+  ] });
+  assert.deepEqual(terms('the 14th, the third, December 12th'), ['14', '3', 'december', '12']);
+  assert.deepEqual(terms('may I ask'), []);
+  assert.deepEqual(terms('flying in May, booked May 3'), ['fly', 'may', 'book', 'may', '3']);
+  assert.deepEqual(labels(m.relevant({ text: "what's on the 14th?" })), ['Regional Tournament']);
+  assert.equal(labels(m.relevant({ text: 'what is on December 12th?' }))[0], 'Atlas Deadline');
+  assert.equal(labels(m.relevant({ text: 'when do we fly, the 3rd?' }))[0], 'Lisbon Flights');
+  for (const t of ['may I ask you something?', 'you may want to sit down for this', 'set a timer for 5 minutes', 'set a timer for 12 minutes']) {
+    assert.deepEqual(labels(m.relevant({ text: t })), [], t);
+  }
+  assert.deepEqual(labels(m.relevant({ text: 'what did we have on Tuesday for lunch?' })), ['Pasta Lunch'], 'a weekday still helps alongside other words');
+});
+
+test('recall: folded letters, split names, prefixes and slips; list_memory for briefings and "about me"', async () => {
+  const m = new Memory(tmp());
+  m.merge({ project: 'Home', nodes: [
+    { label: 'Søren', type: 'person', summary: 'Søren is the electrician.' },
+    { label: 'Łukasz', type: 'person', summary: 'Łukasz fixed the roof.' },
+    { label: 'SunPeak Solar', type: 'topic', summary: 'SunPeak Solar quoted the install.' },
+    { label: 'Powerwall Quote', type: 'fact', summary: 'The battery quote was 14,200.' },
+    { label: 'Kenji', type: 'person', summary: 'Kenji runs the migration.' },
+    { label: 'Battery Permit', type: 'task', summary: 'File the battery permit by Friday.' },
+  ] });
+  m.merge({ project: 'Team', nodes: [{ label: 'Parent Volunteers', type: 'task', summary: 'Find two parent volunteers.' }] });
+  m.merge({ nodes: [{ label: 'Metric', type: 'preference', summary: 'Prefers metric units.', standing: true }, { label: 'Allergy', type: 'fact', summary: 'The user is allergic to peanuts.' }] });
+  m.setActiveProject('Home');
+  assert.deepEqual(labels(m.relevant({ text: 'Soren called' })), ['Søren']);
+  assert.deepEqual(labels(m.relevant({ text: 'did Lukasz send the bill' })), ['Łukasz']);
+  assert.equal(labels(m.relevant({ text: 'what did sun peak say' }))[0], 'SunPeak Solar');
+  assert.equal(m.search('power')[0]?.label, 'Powerwall Quote');
+  assert.equal(m.search('Kenjy')[0]?.label, 'Kenji');
+  assert.deepEqual(labels(m.relevant({ text: 'Kenjy wants an update' })), [], 'no loose matching per turn');
+  assert.deepEqual(m.search('tasks').map((n) => n.label).sort(), ['Battery Permit', 'Parent Volunteers']);
+  const tools = Object.fromEntries(builtinTools({ memory: m, skills: new Skills(tmp()), settings: new Settings(tmp()), ui: () => {}, fsRoot: () => tmp(), openPath: async () => '' }).map((t) => [t.name, t]));
+  assert.match(await tools.list_memory.run({ kind: 'tasks' }), /^Home \(active\)\n- \[task\] Battery Permit: File the battery permit by Friday\.\nTeam\n- \[task\] Parent Volunteers/);
+  const about = await tools.list_memory.run({ kind: 'about_user' });
+  assert.match(about, /allergic to peanuts/);
+  assert.match(about, /Prefers metric units/);
+  assert.match(about, /Søren/);
+  assert.match(await tools.list_memory.run({ kind: 'tasks', project: 'Team' }), /^Team\n- \[task\] Parent Volunteers[^\n]*$/);
+  assert.match(m.notes({ text: 'give me a briefing' }), /list_memory/);
+  // The built-in briefing skill uses it, and an old copy of the skill is brought up to date.
+  const dir = tmp();
+  const skills = new Skills(dir);
+  assert.match(skills.get('daily-briefing').body, /list_memory with kind tasks/);
+  fs.writeFileSync(path.join(dir, 'skills', 'daily-briefing', 'SKILL.md'), "---\nname: daily-briefing\ndescription: x\n---\n\n# Daily briefing\n\nUse when the user asks what's on, where things stand, or for a briefing.\n\nLook at the active project and tasks in memory. In under five sentences: what is in flight, what is waiting on the user, and one suggestion for what to do next. No lists, no preamble.\n");
+  assert.match(new Skills(dir).get('daily-briefing').body, /list_memory/);
+  fs.writeFileSync(path.join(dir, 'skills', 'daily-briefing', 'SKILL.md'), '---\nname: daily-briefing\ndescription: mine\n---\n\nMy own briefing.\n');
+  assert.equal(new Skills(dir).get('daily-briefing').body, 'My own briefing.', 'an edited skill is left alone');
 });

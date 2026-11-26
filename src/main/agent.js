@@ -44,7 +44,7 @@ Memory
 - Your long-term memory is a mind map they can see and edit. A background process files what lasts from each conversation into it automatically, so you don't need to call remember for ordinary talk — only when asked to remember something specific.
 - "What you know" below holds their standing preferences, which you always follow, the names of their projects, and only the notes that looked related to what was just said. The notes are picked by matching words, so some may be off the point: use one only when it bears directly on what they just said or asked.
 - Never volunteer remembered details, projects or people they didn't bring up, and don't steer the conversation toward things you know about them. A sum, a joke or small talk needs no memory at all. If you're not sure a note is relevant, leave it out.
-- If they refer to something you don't see in the notes — "that thing we discussed", a name, an earlier decision — call recall before answering. If it isn't in memory, say you don't have it rather than inventing it.
+- If they refer to something you don't see in the notes — "that thing we discussed", a name, an earlier decision — call recall before answering; if the name may have been misheard, try how it might be spelled. For a briefing, their open tasks, or "what do you know about me", use list_memory. If it isn't in memory, say you don't have it rather than inventing it.
 - If they ask you to forget something, use forget and confirm briefly.`;
 }
 
@@ -116,6 +116,7 @@ export class Agent {
     this.active = null;
     this.turnId = 0;
     this.forgotMark = 0; // how much had been forgotten when the latest turn began
+    this.heard = ''; // what the user said in the latest turn
   }
 
   /** Which brain a turn runs on: 'local' (Ollama), 'cli' (Claude on the Claude Code login) or 'key' (Claude on an API key). */
@@ -177,7 +178,10 @@ export class Agent {
     const s = this.d.settings.get();
     const { memory, skills, settings, ui, fsRoot, openPath, media, transcribe, transcribeSpeed } = this.d;
     const ctx = { memory, skills, settings, ui, fsRoot, openPath, media, transcribe, transcribeSpeed, signal: () => this.active?.signal };
-    const self = selfTools({ settings, setSettings: this.d.setSettings || ((p) => settings.set(p)), env: this.d.selfEnv, selfChange: this.d.selfChange || noSelfChange, rescanFiles: this.d.rescanFiles });
+    const self = selfTools({
+      settings, setSettings: this.d.setSettings || ((p) => settings.set(p)), env: this.d.selfEnv, selfChange: this.d.selfChange || noSelfChange, rescanFiles: this.d.rescanFiles,
+      heard: () => this.heard, // what the user said this turn: the only place a yes to changing Jarvis itself can come from
+    });
     const tools = [...builtinTools(ctx, { localWeb: s.webSearch && s.provider === 'local' }), ...self, ...this.d.mcp.tools()];
     return tools.sort((a, b) => a.name.localeCompare(b.name));
   }
@@ -209,6 +213,8 @@ export class Agent {
     let modelText = userText;
     if (history.at(-1)?.role === 'user') modelText = `${history.pop().text}\n${userText}`;
     memory.logTurn('user', userText);
+    this.heard = userText;
+    this.d.selfChange?.heard?.(userText);
     const system = this.buildSystem({ text: modelText, context: history });
     const tools = this.tools();
     this.d.emit({ type: 'start', turn: id });

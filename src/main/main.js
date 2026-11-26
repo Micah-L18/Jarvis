@@ -185,9 +185,10 @@ function registerIpc() {
     return { list: r.list };
   });
   // Changes to Jarvis's own code (see selfchange.js): the controls' buttons and the change card.
-  handle('selfchange:apply', (opts) => selfChange.apply(opts || {}));
+  // A press of the button is the user's own yes; the model's apply_change and undo_last_change need theirs in what they said.
+  handle('selfchange:apply', (opts) => selfChange.apply({ anyway: opts?.anyway === true, button: true }));
   handle('selfchange:discard', () => selfChange.discard());
-  handle('selfchange:undo', () => selfChange.undo());
+  handle('selfchange:undo', () => selfChange.undo({ button: true }));
   handle('selfchange:show', () => {
     const file = selfChange.status().job?.diffFile;
     if (file) send('ui', { type: 'show_file', path: file });
@@ -245,7 +246,10 @@ function registerIpc() {
 
   handle('ollama:models', () => listOllamaModels(settings.get().ollamaUrl).catch(() => null));
 
-  handle('fs:scan', () => scan(fsRoot(), { maxDepth: settings.get().fsDepth, maxNodes: 3500, bytes: true }));
+  handle('fs:scan', () => {
+    sizer.clear(); // a fresh map (first look, Rescan, a new folder): folder sizes are measured afresh too
+    return scan(fsRoot(), { maxDepth: settings.get().fsDepth, maxNodes: 3500, bytes: true });
+  });
   handle('fs:expand', (dir, depth) => (isInside(fsRoot(), dir) ? expand(dir, depth) : []));
   // Folder sizes for the Files map, measured in the background and sent back a batch at a time.
   handle('fs:sizes', (dirs) => {
@@ -256,7 +260,7 @@ function registerIpc() {
     sizer.measure((Array.isArray(dirs) ? dirs : []).filter((d) => typeof d === 'string' && isInside(root, d)), (id, r) => {
       out.push({ id, ...r });
       if (!timer) timer = setTimeout(flush, 120);
-    }).then(() => { clearTimeout(timer); flush(); });
+    }, { root: path.resolve(root) }).then(() => { clearTimeout(timer); flush(); });
     return true;
   });
   // Sizes of a few files Jarvis may show (its own documents on the Mind map).
@@ -268,7 +272,7 @@ function registerIpc() {
   handle('fs:pickRoot', async () => {
     const res = await dialog.showOpenDialog(win, { title: 'Choose the folder Jarvis can see', defaultPath: fsRoot(), properties: ['openDirectory'] });
     if (res.canceled || !res.filePaths[0]) return null;
-    sizer.stop();
+    sizer.clear();
     settings.set({ fsRoot: res.filePaths[0] });
     send('settings', publicState());
     return res.filePaths[0];
@@ -380,6 +384,7 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', () => {
   globalShortcut.unregisterAll();
+  sizer.dispose();
   speech?.kill();
   claude?.dispose();
   mcp?.closeAll();

@@ -12,13 +12,14 @@ const SKIP = new Set([
 export { kindOf };
 
 // Children shown on the map, folders first, and how many files and folders were left out (dot files,
-// SKIP): a folder with any left out is not wholly listed, so its size has to be measured.
+// SKIP): a folder with any left out is not wholly listed, so its size has to be measured. One that
+// cannot be read at all (no permission) is marked so: nothing listed is not the same as nothing there.
 async function readChildren(dir) {
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return { list: [], hidden: 0 };
+  } catch (err) {
+    return { list: [], hidden: 0, unreadable: err.code !== 'ENOENT' };
   }
   let hidden = 0;
   const list = entries.filter((e) => {
@@ -39,9 +40,9 @@ async function addBytes(files) {
 }
 
 /**
- * @returns {{root:string, nodes:Array<{id,name,parent,dir,kind,depth,more,hidden?,bytes?}>, truncated:boolean}}
+ * @returns {{root:string, nodes:Array<{id,name,parent,dir,kind,depth,more,hidden?,unreadable?,bytes?}>, truncated:boolean}}
  * `more` on a folder = number of children that were not included (depth or count limit); `hidden` =
- * files and folders inside it that the map never shows (dot files, SKIP). With `bytes`, files carry their size
+ * files and folders inside it that the map never shows (dot files, SKIP); `unreadable`: it could not be listed. With `bytes`, files carry their size
  * (a stat each: the Files map wants it, a search through thousands of files does not).
  */
 export async function scan(root, { maxDepth = 3, maxNodes = 3500, perDir = 60, baseDepth = 0, includeRoot = true, bytes = false } = {}) {
@@ -55,9 +56,10 @@ export async function scan(root, { maxDepth = 3, maxNodes = 3500, perDir = 60, b
   while (queue.length) {
     const next = [];
     for (const { dir, depth } of queue) {
-      const { list: children, hidden } = await readChildren(dir);
+      const { list: children, hidden, unreadable } = await readChildren(dir);
       const parent = byId.get(dir);
       if (parent && hidden) parent.hidden = hidden;
+      if (parent && unreadable) parent.unreadable = true;
       if (depth - baseDepth >= maxDepth) {
         if (parent) parent.more = children.length;
         continue;

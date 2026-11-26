@@ -3,7 +3,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { scan, isInside } from './fsscan.js';
-import { NODE_TYPES } from './memory.js';
+import { NODE_TYPES, LIST_KINDS } from './memory.js';
 import { kindOf } from './filekind.js';
 import { extractText, canExtract, loadImage, imageSize, describeModel, stripHtml, isPlainText, readTextWindow, BIG_TEXT } from './extract.js';
 import { locate, describeHit, pointEvent } from './pointer.js';
@@ -165,7 +165,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
       schema: obj({ query: str('Words to look for, e.g. "drills decision" or "Ana"') }, ['query']),
       run: async ({ query }) => {
         const hits = memory.search(query, 12);
-        if (!hits.length) return `Nothing in memory matches "${query}". Projects: ${memory.projects().map((p) => p.label).join(', ')}.`;
+        if (!hits.length) return `Nothing in memory matches "${query}". Projects: ${memory.projects().map((p) => p.label).join(', ')}. For a list — their tasks, the people in their life, what you know about them — use list_memory.`;
         if (hits.length === 1) pointAtNode(hits[0]);
         return hits.map((n) => {
           const links = memory.neighbors(n.id).filter((x) => x.node.type !== 'core' && x.node.type !== 'project').map((x) => x.node.label).slice(0, 6);
@@ -173,6 +173,26 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
           const doc = n.type === 'document' ? ' Saved document; read_document opens it.' : '';
           return `[${n.type}] ${n.label}${project ? ` (${project})` : ''}: ${n.summary || '(no detail)'}${doc}${links.length ? ` Linked to: ${links.join(', ')}.` : ''}`;
         }).join('\n');
+      },
+    },
+    {
+      name: 'list_memory',
+      description: 'List memories of one kind, for what a search by words cannot find: their open tasks for a briefing or "what\'s on", what you know about them ("what do you know about me": their preferences, facts about them and the people in their life), the people, facts or topics on record. The active project comes first. Optionally only one project.',
+      schema: obj({
+        kind: { type: 'string', enum: Object.keys(LIST_KINDS), description: 'tasks, people, preferences, facts, topics, documents, about_user, or everything' },
+        project: str('Only this project (its name). Omit for all.'),
+      }, ['kind']),
+      run: async ({ kind, project }) => {
+        const items = memory.list({ kind, project });
+        if (!items.length) return `Nothing of that kind in memory${project ? ` for ${project}` : ''}.`;
+        const groups = new Map();
+        for (const n of items) {
+          const p = memory.nodes.get(n.project);
+          const head = p && p.id !== 'project:general' ? `${p.label}${p.id === memory.activeProject ? ' (active)' : ''}` : 'Not in a project';
+          if (!groups.has(head)) groups.set(head, []);
+          groups.get(head).push(`- [${n.type}] ${n.label}${n.summary ? `: ${n.summary}` : ''}`);
+        }
+        return [...groups].map(([head, lines]) => `${head}\n${lines.join('\n')}`).join('\n');
       },
     },
     {

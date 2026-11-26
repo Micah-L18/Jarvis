@@ -4,7 +4,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { readJson, writeJson, slugify } from './store.js';
-import { buildIndex, rank, isStanding } from './relevance.js';
+import { buildIndex, rank, isStanding, nearTerms } from './relevance.js';
 
 export const NODE_TYPES = ['project', 'topic', 'person', 'fact', 'preference', 'task', 'document'];
 const CORE = 'core';
@@ -34,6 +34,12 @@ export function mentions(text, words) {
     return false;
   });
 }
+
+// What list() can list, by the node types each kind covers.
+export const LIST_KINDS = {
+  tasks: ['task'], people: ['person'], preferences: ['preference'], facts: ['fact'], topics: ['topic'], documents: ['document'],
+  about_user: ['preference', 'fact', 'person'], everything: ['task', 'person', 'preference', 'fact', 'topic', 'document'],
+};
 
 export class Memory {
   constructor(dataDir) {
@@ -92,7 +98,10 @@ export class Memory {
   /** Memories matching a query, best first — the recall tool. Saved documents are searched by their text too. */
   search(query, limit = 12) {
     this._fullIndex ||= buildIndex(this, { content: true });
-    return rank(this, { text: query, index: this._fullIndex, min: 0.25, ratio: 0.15, limit }).map((h) => h.node);
+    const opts = { text: query, index: this._fullIndex, min: 0.25, ratio: 0.15, limit };
+    const hits = rank(this, opts);
+    // Nothing as said: try what the words begin or are a slip away from (a misheard name, part of a word).
+    return (hits.length ? hits : rank(this, { ...opts, extra: nearTerms(this._fullIndex, query) })).map((h) => h.node);
   }
 
   neighbors(id) {
@@ -157,7 +166,10 @@ export class Memory {
       this.nodes.set(node.id, node);
       this._link(proj.id, node.id, 'contains');
     }
-    if (standing === true) node.standing = true; // honoured in every reply; never unset by a later passing mention
+    // Honoured in every reply, and never unset by a later passing mention; an explicit "not standing" sticks on anything else,
+    // so a taste the extractor marked false is not taken for a standing preference by its wording.
+    if (standing === true) node.standing = true;
+    else if (standing === false && node.standing !== true) node.standing = false;
     for (const other of relatedTo) {
       const target = typeof other === 'string' ? this.find(other) : this.find(other.label);
       if (target && target.type !== 'core') this._link(node.id, target.id, other.relation || 'related to');
@@ -272,15 +284,34 @@ export class Memory {
     return text || '(nothing remembered yet)';
   }
 
-  /** Standing preferences: how they want to be addressed and spoken to, honoured whatever the subject. */
+  /**
+   * Standing preferences: how they want to be addressed and spoken to, honoured whatever the subject. Marked ones first,
+   * then the most confirmed, then the newest.
+   */
   standing(max = 6) {
-    return [...this.nodes.values()].filter(isStanding).sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, max);
+    return [...this.nodes.values()].filter(isStanding)
+      .sort((a, b) => Number(b.standing === true) - Number(a.standing === true) || (b.weight || 1) - (a.weight || 1) || (b.updated || 0) - (a.updated || 0))
+      .slice(0, max);
+  }
+
+  /**
+   * Memories of a kind, for what a word match cannot find: a briefing (open tasks), "what do you know about me", who is in
+   * their life. The active project first, then the newest. `project` narrows it to one project.
+   */
+  list({ kind = 'tasks', project = '' } = {}, max = 40) {
+    const types = LIST_KINDS[kind] || LIST_KINDS.tasks;
+    const proj = project ? this.findProject(project) : null;
+    return [...this.nodes.values()]
+      .filter((n) => types.includes(n.type) && (!proj || n.project === proj.id))
+      .sort((a, b) => Number(b.project === this.activeProject) - Number(a.project === this.activeProject) || (b.updated || 0) - (a.updated || 0))
+      .slice(0, max);
   }
 
   /** The memories that bear on this turn: `text` is what was just said, `context` the turns before it. */
   relevant({ text = '', context = [], limit = 6 } = {}) {
     this._index ||= buildIndex(this);
-    return rank(this, { text, context, index: this._index, limit, exclude: isStanding });
+    const shown = new Set(this.standing().map((n) => n.id)); // those are in the prompt already; one past the cap can still come up as a note
+    return rank(this, { text, context, index: this._index, limit, exclude: (n) => shown.has(n.id) });
   }
 
   /**
@@ -306,7 +337,7 @@ export class Memory {
     }
     out.push(lines.length
       ? `Notes that may bear on this:\n${lines.join('\n')}`
-      : 'Notes that may bear on this: none. Nothing in memory looks related, so leave memory out of it.');
+      : 'Notes that may bear on this: none. Nothing in memory matched what was said, so leave memory out of it — unless they asked about what you know (a briefing, their tasks, themselves, someone by name): then look it up with list_memory or recall.');
     return out.join('\n');
   }
 }

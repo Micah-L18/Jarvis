@@ -20,9 +20,9 @@ export function changeCard(api, { toast }) {
       card.replaceChildren(
         h('div', { class: 'cc-head' }, 'Change ready'),
         h('div', { class: 'cc-body', title: job.summary || job.request }, job.summary || job.request),
-        h('div', { class: `cc-sub ${job.testsOk ? '' : 'bad'}` }, job.testsOk ? 'Builds · tests pass' : job.buildOk ? 'Tests fail' : 'Build fails'),
+        h('div', { class: `cc-sub ${!job.checked || job.testsOk ? '' : 'bad'}` }, !job.checked ? 'Not run yet · Apply builds and tests it first' : job.testsOk ? 'Builds · tests pass' : job.buildOk ? 'Tests fail' : 'Build fails'),
         h('div', { class: 'row' },
-          h('button', { class: 'btn solid', onclick: () => act('apply', { anyway: !job.testsOk }) }, job.testsOk ? 'Apply' : 'Apply anyway'),
+          h('button', { class: 'btn solid', onclick: () => act('apply', { anyway: job.checked && !job.testsOk }) }, !job.checked || job.testsOk ? 'Apply' : 'Apply anyway'),
           h('button', { class: 'btn', onclick: () => act('show') }, 'Diff'),
           h('button', { class: 'btn danger', onclick: () => act('discard') }, 'Discard')),
       );

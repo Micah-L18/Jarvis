@@ -29,17 +29,18 @@ export function formatBytes(bytes) {
 /**
  * Totals for every folder on the map. Files carry `bytes` from the scan; a folder's total is what
  * the scan listed under it, unless a background walk has measured the whole folder (`walked`:
- * Map id -> {bytes, files, complete}). A folder is exact when the walk finished, or when the scan
- * listed all of it (nothing more inside, nothing hidden, every subfolder exact too); otherwise its
- * total is a lower bound ("at least").
- * @param nodes [{id, parent, dir, bytes?, more?, hidden?}]
+ * Map id -> {bytes, files, complete, exact}). A folder is exact when the walk finished with nothing
+ * left out, or when the scan listed all of it (nothing more inside, nothing hidden, nothing unreadable,
+ * every subfolder exact too); otherwise its total is a lower bound ("at least"). A finished walk that
+ * counted less than the scan just listed is out of date, so the larger figure wins, as a lower bound.
+ * @param nodes [{id, parent, dir, bytes?, more?, hidden?, unreadable?}]
  * @returns Map id -> {bytes, files, exact} for folders
  */
 export function folderTotals(nodes, walked = new Map()) {
   const out = new Map();
   const kids = new Map();
   for (const n of nodes) {
-    if (n.dir) out.set(n.id, { bytes: 0, files: 0, exact: !(n.more > 0) && !(n.hidden > 0) });
+    if (n.dir) out.set(n.id, { bytes: 0, files: 0, exact: !(n.more > 0) && !(n.hidden > 0) && !n.unreadable });
   }
   for (const n of nodes) {
     if (n.parent == null || !out.has(n.parent)) continue;
@@ -73,8 +74,10 @@ export function folderTotals(nodes, walked = new Map()) {
       }
     }
     const w = walked.get(d.id);
-    if (w?.complete) Object.assign(t, { bytes: w.bytes, files: w.files, exact: true });
-    else if (w && !t.exact) { t.bytes = Math.max(t.bytes, w.bytes); t.files = Math.max(t.files, w.files); }
+    if (w?.complete) {
+      const stale = w.bytes < t.bytes || w.files < t.files;
+      Object.assign(t, { bytes: Math.max(t.bytes, w.bytes), files: Math.max(t.files, w.files), exact: w.exact !== false && !stale });
+    } else if (w && !t.exact) { t.bytes = Math.max(t.bytes, w.bytes); t.files = Math.max(t.files, w.files); }
   }
   return out;
 }

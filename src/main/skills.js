@@ -42,9 +42,13 @@ Use for open-ended research, comparisons, or building a dataset by talking.
 
 Use when the user asks what's on, where things stand, or for a briefing.
 
-Look at the active project and tasks in memory. In under five sentences: what is in flight, what is waiting on the user, and one suggestion for what to do next. No lists, no preamble.`,
+Call list_memory with kind tasks to see their open tasks, the active project's first (add a project to narrow it). In under five sentences: what is in flight, what is waiting on the user, and one suggestion for what to do next. No lists, no preamble.`,
   },
 ];
+// Bodies of built-in skills as earlier versions wrote them: a copy still saying exactly that is brought up to date.
+const OUTDATED = {
+  'daily-briefing': ["# Daily briefing\n\nUse when the user asks what's on, where things stand, or for a briefing.\n\nLook at the active project and tasks in memory. In under five sentences: what is in flight, what is waiting on the user, and one suggestion for what to do next. No lists, no preamble."],
+};
 
 function parse(text, fallbackName) {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
@@ -62,6 +66,11 @@ export class Skills {
     if (!fs.existsSync(this.dir)) {
       fs.mkdirSync(this.dir, { recursive: true });
       for (const s of BUILTIN) this.save(s);
+    }
+    for (const s of BUILTIN) {
+      const id = slugify(s.name);
+      const have = this.list().find((k) => k.id === id);
+      if (have && (OUTDATED[id] || []).includes(have.body)) this.save({ ...s, id });
     }
   }
 
