@@ -110,6 +110,41 @@ test('point_to resolution: close calls, ties, a forced map, misses and the outsi
   assert.equal((await at('linked/secret.txt')).outside, true);
 });
 
+test('point_to resolution: a name said with the kind of file it is ("the budget spreadsheet") is that file', async () => {
+  const { root, memory } = world();
+  put(root, 'club/2026/budget.csv', 'item,cost');
+  put(root, 'club/2026/budget-notes.md', '# notes');
+  put(root, 'cottage.png');
+  put(root, 'models/knot.glb');
+  put(root, 'media/clip.mp4');
+  memory.upsert({ label: 'Budget', type: 'fact', summary: 'Battery budget.', project: 'Home Battery Research' });
+  memory.upsert({ label: 'Battery Model', type: 'topic', summary: 'Which battery.', project: 'Home Battery Research' });
+  const at = (target, map) => locate(target, { map, memory, root });
+  for (const [t, file] of [['budget spreadsheet', 'club/2026/budget.csv'], ['the budget spreadsheet', 'club/2026/budget.csv'], ['cottage picture', 'cottage.png'], ['the knot model', 'models/knot.glb'], ['fox recording', 'media/fox.wav'], ['clip video', 'media/clip.mp4']]) {
+    const hit = await at(t);
+    assert.equal(hit.map, 'files', t);
+    assert.equal(hit.path, path.join(root, file), t);
+  }
+  assert.equal((await at('budget')).map, 'mind', 'the bare name is still the memory');
+  assert.equal((await at('the battery model')).node.label, 'Battery Model', 'a memory with a kind word in its name keeps it');
+});
+
+test('point_to never looks at a path outside the root, even to see whether it exists', async () => {
+  const { root, memory } = world();
+  const fsp = (await import('node:fs/promises')).default;
+  const { stat, realpath } = fsp;
+  const seen = [];
+  fsp.stat = (p, ...a) => { seen.push(String(p)); return stat(p, ...a); };
+  fsp.realpath = (p, ...a) => { seen.push(String(p)); return realpath(p, ...a); };
+  try {
+    for (const t of ['/etc/attacker-probe/x', '//attacker.example/share/x', '../elsewhere/x']) assert.equal((await locate(t, { memory, root })).outside, true, t);
+  } finally {
+    fsp.stat = stat;
+    fsp.realpath = realpath;
+  }
+  assert.deepEqual(seen.filter((p) => !p.startsWith(root)), [], 'only paths inside the root were looked at');
+});
+
 test('tools: point_to, show_view focus, show_file and memory tools send the window to the right place', async () => {
   const { data, root, memory } = world();
   const ui = [];

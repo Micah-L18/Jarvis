@@ -2,9 +2,9 @@
 // PDFs, markdown, code and text, tables, audio and video — and a Text tab for what Jarvis reads
 // out of a file (a transcription). Everything is loaded through jarvis-file://, which only serves
 // files inside the folders Jarvis may see.
-import { kindOf, extOf, kindLabel } from '../main/filekind.js';
+import { kindOf, extOf, kindLabel, decodeText } from '../main/filekind.js';
 import { h } from './panel.js';
-import { fileUrl, nameOf, dirOf, formatBytes, middle, looksBinary, parseCsv } from './viewkit.js';
+import { fileUrl, nameOf, dirOf, formatBytes, middle, parseCsv } from './viewkit.js';
 
 export { fileUrl };
 
@@ -26,7 +26,7 @@ export class Viewer {
     this.cleanup = [];
     this.api.on('ui', (e) => {
       if (e.type === 'show_file' && e.path) this.open(e.path, { focus: e.focus });
-      else if (e.type === 'viewer_text') this.showText(e.path, e.title, e.text);
+      else if (e.type === 'viewer_text' && (!e.ifOpen || e.path === this.current?.path)) this.showText(e.path, e.title, e.text); // ifOpen: not brought back once closed
     });
   }
 
@@ -370,13 +370,16 @@ export class Viewer {
   }
 
   async _text(url, seq) {
+    this.truncated = false;
+    if (this.current.size === 0) return ''; // no bytes to ask a range of: an empty file is empty text
     const res = await fetch(url, { headers: { Range: `bytes=0-${TEXT_CAP - 1}` } });
     if (!res.ok) throw new Error('I could not read that file.');
     const bytes = new Uint8Array(await res.arrayBuffer());
     if (seq !== this.seq) return '';
-    if (looksBinary(bytes)) return null;
+    const text = decodeText(bytes); // UTF-8, or UTF-16 by its byte-order mark or its NULs
+    if (text == null) return null;
     this.truncated = this.current.size > bytes.length;
-    return new TextDecoder().decode(bytes);
+    return text;
   }
 
   _pretty(text) {

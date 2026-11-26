@@ -524,9 +524,12 @@ function pointAt(req) {
   return guard.run(() => applyPoint(req));
 }
 
-async function applyPoint({ map, id, chain, quiet }) {
+async function applyPoint({ map, id, chain, quiet, soft }) {
   const seq = ++pointSeq;
   const graph = map === 'files' ? files : mind;
+  // Asked where something is while a file is open: the viewer would hide the answer, so it gives way.
+  // (Marks of what is in the viewer, the file in it, and bookkeeping nudges stay behind it.)
+  if (!quiet && !soft && viewer.isOpen && viewer.current?.path !== id) viewer.close();
   if (view !== map) setView(map);
   if (map === 'files') {
     await loadFiles();
@@ -551,15 +554,16 @@ async function applyPoint({ map, id, chain, quiet }) {
 
 /**
  * After a reply in which Jarvis did not point anywhere: if the user's own words named exactly one
- * thing on the maps, show it — when the view is free, nothing is open over it, and not more than
+ * thing on the map on screen, show it — when the view is free, nothing is open over it, and not more than
  * once every few seconds or twice running for the same thing.
  */
 function assistPoint(userText) {
   if (pointedIn === turn || viewer.isOpen || guard.busy() || voiceState === 'hearing') return null;
+  if (view !== 'mind' && view !== 'files') return null; // only on a map already on screen: ordinary words name folders too
   if (performance.now() - lastPoint.at < 6000) return null;
   const candidates = [];
-  for (const n of state.memory.nodes) if (n.type !== 'core' && n.id !== 'project:general') candidates.push({ key: n.id, label: n.label, map: 'mind' });
-  for (const n of fileNodes) if (n.parent) candidates.push({ key: n.id, label: n.name, map: 'files' });
+  if (view === 'mind') for (const n of state.memory.nodes) if (n.type !== 'core' && n.id !== 'project:general') candidates.push({ key: n.id, label: n.label, map: 'mind' });
+  if (view === 'files') for (const n of fileNodes) if (n.parent) candidates.push({ key: n.id, label: n.name, map: 'files' });
   const hit = pickMention(userText, candidates);
   if (!hit || hit.key === lastPoint.key || selected?.node.id === hit.key) return null;
   guard.run(() => applyPoint({ map: hit.map, id: hit.key }));
@@ -712,11 +716,13 @@ function interrupt() {
   const unfinished = generating && !replyLogged;
   if (generating) api.invoke('chat:abort');
   generating = false;
+  toolRunning = '';
   $('tool-line').textContent = '';
   return unfinished ? heard : '';
 }
 
 let pendingInterrupted = '';
+let toolRunning = ''; // the tool the reply is waiting on, if any
 /** Interrupt, and keep what was heard of an unfinished reply so the next turn can record it as cut off. */
 function cutOff() {
   pendingInterrupted = interrupt() || pendingInterrupted;
@@ -744,9 +750,11 @@ api.on('chat', (e) => {
     replyText += e.text;
     showJarvis(replyText);
     voice.say(e.text);
+    toolRunning = '';
     $('tool-line').textContent = '';
   } else if (e.type === 'tool') {
-    $('tool-line').textContent = String(e.name || '').replace(/^mcp__/, '').replace(/_+/g, ' ');
+    toolRunning = String(e.name || '');
+    $('tool-line').textContent = toolRunning.replace(/^mcp__/, '').replace(/_+/g, ' ');
   } else if (e.type === 'notice') {
     toast(e.text);
   } else if (e.type === 'error') {
@@ -758,6 +766,7 @@ api.on('chat', (e) => {
     replyLogged = true;
     if (!generating) return;
     generating = false;
+    toolRunning = '';
     $('tool-line').textContent = '';
     voice.flush();
     if (!voice.speaking) { allSpoken(); restCaptions(); }
@@ -805,6 +814,7 @@ window.addEventListener('keydown', (e) => {
     if (typing()) document.activeElement.blur();
     if (!form.hidden) form.hidden = true;
     else if (panel.open) panel.toggle(false);
+    else if (generating && /^transcribe_/.test(toolRunning)) cutOff(); // Esc stops a transcription before it closes the file it is of
     else if (viewer.isOpen) viewer.close();
     else if (selected) select(null);
     else if (generating || voice.speaking) cutOff();

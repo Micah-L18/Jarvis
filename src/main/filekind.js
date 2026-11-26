@@ -69,3 +69,39 @@ export function mimeOf(p) {
   if (MIME[ext]) return MIME[ext];
   return TEXTUAL.has(kindOf(p)) ? 'text/plain' : 'application/octet-stream';
 }
+
+/**
+ * How the text in some bytes from the start of a file is encoded: by its byte-order mark, or, when
+ * `sniff` is set and there is none, by the NULs between the letters of UTF-16 text (what Excel's
+ * "Unicode Text" and Windows PowerShell 5 write).
+ */
+export function textEncoding(b, { sniff = true } = {}) {
+  if (b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) return 'utf-8';
+  if (b.length >= 2 && b[0] === 0xff && b[1] === 0xfe) return 'utf-16le';
+  if (b.length >= 2 && b[0] === 0xfe && b[1] === 0xff) return 'utf-16be';
+  const n = Math.min(b.length, 8192) & ~1;
+  if (sniff && n >= 8) {
+    let even = 0;
+    let odd = 0;
+    for (let i = 0; i < n; i += 2) {
+      if (b[i] === 0) even++;
+      if (b[i + 1] === 0) odd++;
+    }
+    if (odd >= n * 0.15 && even === 0) return 'utf-16le';
+    if (even >= n * 0.15 && odd === 0) return 'utf-16be';
+  }
+  return 'utf-8';
+}
+
+/** Bytes as text, in whatever encoding textEncoding finds; null if they are not text (NULs, or many control characters). */
+export function decodeText(bytes, { sniff = true } = {}) {
+  const text = new TextDecoder(textEncoding(bytes, { sniff })).decode(bytes);
+  const n = Math.min(text.length, 8192);
+  let odd = 0;
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0) return null;
+    if (c < 32 && c !== 9 && c !== 10 && c !== 13 && c !== 12 && c !== 27) odd++;
+  }
+  return n > 0 && odd / n > 0.1 ? null : text;
+}

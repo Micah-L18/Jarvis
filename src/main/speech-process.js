@@ -21,9 +21,10 @@ const progress = (what) => (p) => {
 let asr;
 const getAsr = () => (asr ||= pipeline('automatic-speech-recognition', 'onnx-community/whisper-base.en', { dtype: 'q8', device: 'cpu', progress_callback: progress('listening') }));
 
-// Live captions use the tiny Whisper, fetched the first time they are wanted (124 MB, once).
-// Integer encoder, full-precision decoder: on a CPU that mix was the quickest of the four.
-// Until it is ready, captions are simply not shown — nothing waits for it.
+// Live captions use the tiny Whisper (124 MB, fetched once). Integer encoder, full-precision decoder:
+// on a CPU that mix was the quickest of the four. Until it is ready, captions are simply not shown.
+// It is loaded ahead of time, once the recognizer and voice are up and nothing is going on: making
+// its session holds this process for a second or more, which must not land in the user's first remark.
 let tiny = null;
 let tinyLoading = null;
 let tinyFailedAt = -Infinity;
@@ -36,6 +37,9 @@ function getTiny() {
     post({ type: 'status', what: 'captions', failed: true });
   }).finally(() => { tinyLoading = null; });
   return null;
+}
+function preloadTiny(delay = 3000) {
+  setTimeout(() => chain.then(() => (waiting || talking ? preloadTiny(500) : getTiny())), delay);
 }
 
 // Kokoro comes in two sizes. The full-precision one speaks about 2.5 times faster on a CPU
@@ -96,6 +100,7 @@ async function warm(id, { voice }) {
       voices.warm(voice), // says "voice ready" itself, as it does when a voice is first chosen later
     ]);
     post({ type: 'result', id, value: true });
+    preloadTiny();
   } catch (err) {
     post({ type: 'result', id, error: err?.message || String(err) });
   }
@@ -115,7 +120,7 @@ const handlers = {
 // slice is its own job on the chain, so what the user says meanwhile is heard between slices.
 // Slices end at the quietest moment of their last five seconds so a word is not cut in two.
 // (Whisper's own chunking, and timestamps, both dropped whole sentences in testing.)
-// `abort_long` stops a job before its next slice.
+// `abort_long` stops a job before its next slice; the slices done by then are still returned.
 const RATE = 16000;
 const SLICE = 28 * RATE;
 const abortedLong = new Set();
@@ -136,20 +141,24 @@ function quietest(audio, from, to) {
 async function transcribeLong(id, { audio }) {
   audio = audio instanceof Float32Array ? audio : new Float32Array(audio);
   const chunks = [];
+  let start = 0;
+  let stopped = false;
   try {
-    for (let start = 0; start < audio.length;) {
-      if (abortedLong.has(id)) throw new Error('Transcription stopped.');
+    while (start < audio.length) {
+      if (abortedLong.has(id)) { stopped = true; break; }
       let end = Math.min(audio.length, start + SLICE);
       if (end < audio.length) end = quietest(audio, end - 5 * RATE, end);
       const piece = audio.slice(start, end);
       const out = await enqueue(async () => (abortedLong.has(id) ? null : (await getAsr())(piece)));
-      if (!out) throw new Error('Transcription stopped.');
+      if (!out) { stopped = true; break; }
       const text = (out.text || '').trim();
       if (text && !JUNK.test(text)) chunks.push({ text, timestamp: [start / RATE, end / RATE] });
       start = end;
       post({ type: 'status', what: 'transcript', job: id, at: start / RATE, of: audio.length / RATE });
     }
-    post({ type: 'result', id, value: { text: chunks.map((c) => c.text).join(' '), chunks } });
+    // Stopped part-way, what was done so far still comes back, so it is not lost.
+    if (stopped) post({ type: 'status', what: 'transcript', job: id, stopped: true });
+    post({ type: 'result', id, value: { text: chunks.map((c) => c.text).join(' '), chunks, stopped, at: start / RATE, of: audio.length / RATE } });
   } catch (err) {
     post({ type: 'status', what: 'transcript', job: id, stopped: true });
     post({ type: 'result', id, error: err?.message || String(err) });

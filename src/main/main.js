@@ -120,7 +120,7 @@ const media = {
   picture: (file) => mediaCall('picture', file, { timeout: 30_000 }),
 };
 
-/** A long recording through Whisper in slices; stops at the end of the current slice when `signal` fires. */
+/** A long recording through Whisper in slices; stops at the end of the current slice when `signal` fires, with what was done by then ({stopped: true, at, of}). */
 async function transcribe(audio, { signal } = {}) {
   const started = Date.now();
   const job = speechCall('transcribe_long', { audio });
@@ -129,7 +129,7 @@ async function transcribe(audio, { signal } = {}) {
   signal?.addEventListener('abort', onAbort);
   try {
     const out = await job;
-    if (audio.length >= 60 * 16000) transcribeSpeed = audio.length / 16000 / Math.max(1, (Date.now() - started) / 1000);
+    if (audio.length >= 60 * 16000 && !out?.stopped) transcribeSpeed = audio.length / 16000 / Math.max(1, (Date.now() - started) / 1000);
     return out;
   } finally {
     signal?.removeEventListener('abort', onAbort);

@@ -11,15 +11,26 @@ const FOUND = 50; // the weakest score that still counts as the thing meant
 const HINT = 15; // the weakest that is still worth offering as a near miss
 // Words that dress a name up in speech ("the notes file", "my U14 project") without being part of it.
 const DRESS = new Set(['the', 'a', 'an', 'my', 'our', 'your', 'his', 'her', 'their', 'that', 'this', 'file', 'folder', 'directory', 'project', 'document', 'doc', 'one']);
+// What kind of file something is, said in speech ("the budget spreadsheet", "the cottage picture"):
+// dressing as well, and a hint of the kinds meant.
+const KIND_WORDS = {
+  spreadsheet: ['csv', 'office'], spreadsheets: ['csv', 'office'], sheet: ['csv', 'office'], workbook: ['office'], table: ['csv'],
+  picture: ['image', 'svg'], photo: ['image'], photograph: ['image'], image: ['image', 'svg'], pic: ['image'], drawing: ['svg', 'image'],
+  video: ['video'], movie: ['video'], recording: ['audio', 'video'], audio: ['audio'], sound: ['audio'], song: ['audio'], podcast: ['audio'],
+  model: ['model'], pdf: ['pdf'], slides: ['office', 'pdf'], deck: ['office', 'pdf'], presentation: ['office', 'pdf'],
+};
+// Kind words that also say "a file", so the Files map has the say (not "model" or "deck": a memory is often called that).
+const FILE_KIND = new Set(Object.keys(KIND_WORDS).filter((w) => w !== 'model' && w !== 'deck' && w !== 'table'));
 
 const wordsOf = (s) => String(s || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
-const undressed = (ws) => {
-  const core = ws.filter((w) => !DRESS.has(w));
+const undressed = (ws, kinds = false) => {
+  const core = ws.filter((w) => !DRESS.has(w) && !(kinds && KIND_WORDS[w]));
   return core.length ? core : ws;
 };
+const kindsAsked = (t) => new Set(wordsOf(t).flatMap((w) => KIND_WORDS[w] || []));
 const stemOf = (name) => name.replace(/\.[^.]+$/, '');
-// A path, a file name, or a name called a file or folder ("the serve ladder file"): the Files map has the say.
-const looksLikePath = (t) => /[\\/]/.test(t) || t.startsWith('~') || /\.[a-z0-9]{1,6}$/i.test(t) || /\b(file|folder|directory)\b/i.test(t);
+// A path, a file name, or a name called a file or folder ("the serve ladder file", "the budget spreadsheet"): the Files map has the say.
+const looksLikePath = (t) => /[\\/]/.test(t) || t.startsWith('~') || /\.[a-z0-9]{1,6}$/i.test(t) || /\b(file|folder|directory)\b/i.test(t) || wordsOf(t).some((w) => FILE_KIND.has(w));
 
 /** Edit distance, for a misheard or misspelt name; gives up early past `max`. */
 export function editDistance(a, b, max = 3) {
@@ -40,12 +51,16 @@ export function editDistance(a, b, max = 3) {
 
 /** How well a name (a memory's label, a file's name) fits what was asked for, 0-100. */
 function nameScore(name, target) {
+  const plain = wordScore(name, target, false);
+  return wordsOf(target).some((w) => KIND_WORDS[w]) ? Math.max(plain, wordScore(name, target, true)) : plain;
+}
+function wordScore(name, target, kinds) {
   const lname = name.toLowerCase();
   const lt = target.toLowerCase();
   if (lname === lt) return 95;
   if (slugify(name) && slugify(name) === slugify(target)) return 90;
   const nw = wordsOf(name);
-  const tw = undressed(wordsOf(target));
+  const tw = undressed(wordsOf(target), kinds);
   if (!nw.length || !tw.length) return 0;
   if (nw.join(' ') === tw.join(' ')) return 88;
   if (nw.every((w) => tw.includes(w))) return 75 + Math.min(10, nw.length * 3); // "the U14 volleyball project" names "U14 Volleyball"
@@ -92,10 +107,13 @@ export async function fileMatches(root, target) {
   if (!t) return [];
   const base = path.basename(t);
   const tail = t.includes('/') || t.includes('\\') ? path.normalize(t).replace(/^[\\/]+/, '') : '';
+  const core = undressed(wordsOf(base), true).join(' '); // "the budget spreadsheet" is after budget.*
+  const kinds = kindsAsked(base);
   const out = [];
   for (const n of await listing(root)) {
     let score = nameScore(n.name, base);
-    if (!n.dir && score < 80 && stemOf(n.name).toLowerCase() === stemOf(base).toLowerCase()) score = /\.[^.]+$/.test(base) ? 55 : 80; // "notes" means notes.md
+    if (!n.dir && score < 80 && (stemOf(n.name).toLowerCase() === stemOf(base).toLowerCase() || wordsOf(stemOf(n.name)).join(' ') === core)) score = /\.[^.]+$/.test(base) ? 55 : 80; // "notes" means notes.md
+    if (!n.dir && score >= HINT && kinds.has(kindOf(n.name))) score = Math.min(95, score + 4); // the spreadsheet, not the notes of the same name
     if (tail && n.id.endsWith(path.sep + tail)) score = 96;
     if (score >= HINT) out.push({ path: n.id, name: n.name, dir: n.dir, depth: n.depth, score });
   }
@@ -144,12 +162,11 @@ export async function locate(target, { map, memory, root }) {
     if (asPath) {
       const full = path.resolve(root, expanded);
       const inRoot = isInside(root, full) && isInside(await real(root), await real(full));
-      const exists = await fs.stat(full).then(() => true, () => false);
       if (!inRoot) {
         const doc = minds.find((m) => m.score === 100 && m.node.type === 'document');
         if (doc) return { map: 'mind', node: doc.node, also: [] };
         outside = true;
-      } else if (exists) {
+      } else if (await fs.stat(full).then(() => true, () => false)) { // never looked at outside the root: on Windows a UNC path connects to its host
         filesHit = [{ path: full, name: path.basename(full) || full, dir: false, score: 100 }];
       }
     }

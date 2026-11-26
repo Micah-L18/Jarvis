@@ -42,6 +42,25 @@ async function fetchOnce(dir, { name, sha256 }, onProgress) {
   return dest;
 }
 
+const PIECE = 240;
+/** A text cut into pieces of at most `max` characters: at sentence ends, else at commas or line breaks, else between words. */
+export function speechPieces(text, max = PIECE) {
+  const out = [];
+  let rest = String(text || '').trim();
+  while (rest.length > max) {
+    const head = rest.slice(0, max + 1);
+    const last = (re) => Math.max(-1, ...[...head.matchAll(re)].map((m) => m.index + m[0].length));
+    let cut = last(/[.!?…]["')\]]*\s+/g);
+    if (cut < max / 3) cut = Math.max(cut, last(/[,;:—–]\s+|\n+/g));
+    if (cut < max / 3) cut = Math.max(cut, last(/\s+/g));
+    if (cut <= 0) cut = max;
+    out.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) out.push(rest);
+  return out;
+}
+
 /**
  * A tiny-voca speaker. `cacheDir` is the app's models folder. `onProgress({loaded, total})` follows
  * the first download across both files. A file on disk that is not what was downloaded is deleted,
@@ -66,28 +85,40 @@ export async function loadTiny(cacheDir, onProgress) {
   const session = await ort.InferenceSession.create(model, { intraOpNumThreads: Math.max(1, Math.min(4, os.cpus().length)) });
   const one = (v) => new ort.Tensor('float32', Float32Array.of(v), [1]);
   const ints = (a) => BigInt64Array.from(a, (v) => BigInt(v));
+  const once = async (text, voice, speed) => {
+    let line = text.trim();
+    if (!/[.!?…]["')\]]*$/.test(line)) line += '.'; // without a closing mark the last word breaks off
+    let ids;
+    let stress;
+    try {
+      ({ ids, stress } = phonemizer.phonemize(line));
+    } catch (err) {
+      if (err instanceof ValueError) ids = []; // nothing to pronounce: "—", an emoji
+      else throw err;
+    }
+    if (!ids.length) return new Float32Array(0);
+    const out = await session.run({
+      tokens: new ort.Tensor('int64', ints(ids), [1, ids.length]),
+      stress: new ort.Tensor('int64', ints(stress), [1, stress.length]),
+      voice: new ort.Tensor('int64', BigInt64Array.of(BigInt(TINY_VOICES[voice] ?? 1)), [1]),
+      speed: one(speed),
+      pitch_shift: one(0),
+      pitch_range: one(1),
+    });
+    return out.audio.data;
+  };
   return {
     async generate(text, { voice = 'M2', speed = 1 } = {}) {
-      let line = text.trim();
-      if (!/[.!?…]["')\]]*$/.test(line)) line += '.'; // without a closing mark the last word breaks off
-      let ids;
-      let stress;
-      try {
-        ({ ids, stress } = phonemizer.phonemize(line));
-      } catch (err) {
-        if (err instanceof ValueError) ids = []; // nothing to pronounce: "—", an emoji
-        else throw err;
+      // The model's time and memory grow much faster than the length of what it is given (gigabytes
+      // past a thousand characters), so a long text is spoken a piece at a time and joined up.
+      const clips = [];
+      for (const piece of speechPieces(text)) clips.push(await once(piece, voice, speed));
+      const audio = new Float32Array(clips.reduce((n, c) => n + c.length, 0));
+      let at = 0;
+      for (const c of clips) {
+        audio.set(c, at);
+        at += c.length;
       }
-      if (!ids.length) return { audio: new Float32Array(0), sampling_rate: RATE };
-      const out = await session.run({
-        tokens: new ort.Tensor('int64', ints(ids), [1, ids.length]),
-        stress: new ort.Tensor('int64', ints(stress), [1, stress.length]),
-        voice: new ort.Tensor('int64', BigInt64Array.of(BigInt(TINY_VOICES[voice] ?? 1)), [1]),
-        speed: one(speed),
-        pitch_shift: one(0),
-        pitch_range: one(1),
-      });
-      const audio = Float32Array.from(out.audio.data);
       // Brought down to about Kokoro's loudness, so changing voice does not change the volume (or
       // how far the hologram swings), and kept below full scale: the model can peak above 1.
       let peak = 0;

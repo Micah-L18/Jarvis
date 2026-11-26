@@ -67,6 +67,10 @@ export function synthVoice(s) {
 }
 
 /** Make streamed model text safe to read aloud. */
+// The longest piece sent to the voice at once (the fast voice's time and memory grow faster than its length).
+const MAX_PIECE = 240;
+const openFence = (text) => (text.match(/```/g) || []).length % 2 === 1;
+
 export function speakable(text) {
   return text
     .replace(/```[\s\S]*?```/g, ' ')
@@ -435,6 +439,20 @@ export class Voice {
         const m = /^[\s\S]{18,}?[,;:—]\s+/.exec(this.textBuf);
         if (m) cut = m[0].length;
       }
+      // A list has no full stops: each line is a piece of its own (not inside a code block, which is never read out).
+      if (cut < 0) {
+        const nl = /\n+/g;
+        for (let m; (m = nl.exec(this.textBuf)); ) {
+          const end = m.index + m[0].length;
+          if (end >= 14 && !openFence(this.textBuf.slice(0, end))) { cut = end; break; }
+        }
+      }
+      // And no piece runs on and on: a long run without a stop is cut at a comma, or else between words.
+      if (cut < 0 && this.textBuf.length > MAX_PIECE && !openFence(this.textBuf)) {
+        const head = this.textBuf.slice(0, MAX_PIECE);
+        const soft = Math.max(...[...head.matchAll(/[,;:—–]\s+/g)].map((m) => m.index + m[0].length), -1);
+        cut = soft > MAX_PIECE / 3 ? soft : head.lastIndexOf(' ') > 0 ? head.lastIndexOf(' ') + 1 : MAX_PIECE;
+      }
       if (cut < 0) break;
       this._enqueue(this.textBuf.slice(0, cut), this.fed - this.textBuf.length + cut);
       this.textBuf = this.textBuf.slice(cut);
@@ -443,6 +461,7 @@ export class Voice {
 
   /** The reply is complete: speak whatever is left in the buffer. */
   flush() {
+    this.say(''); // lines and over-long runs still go in pieces
     if (this.textBuf.trim()) this._enqueue(this.textBuf, this.fed);
     this.textBuf = '';
     this.firstChunk = true;

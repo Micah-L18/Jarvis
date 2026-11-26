@@ -148,3 +148,18 @@ test('voice: a sentence with nothing to pronounce is skipped, not handed to the 
   delete globalThis.speechSynthesis;
   delete globalThis.SpeechSynthesisUtterance;
 });
+
+test('tiny voice: a long text goes to the model in pieces of bounded length, cut at stops, commas or spaces', async () => {
+  const { speechPieces } = await import('../src/main/tts-tiny.js');
+  assert.deepEqual(speechPieces('Short and sweet.'), ['Short and sweet.']);
+  assert.deepEqual(speechPieces(''), []);
+  const list = Array.from({ length: 40 }, (_, i) => `Survey photo ${i + 1} from the harbour slipway`).join(', ');
+  const pieces = speechPieces(list);
+  assert.ok(pieces.length > 5);
+  assert.ok(pieces.every((p) => p.length <= 240), 'none longer than the cap');
+  assert.ok(pieces.slice(0, -1).every((p) => p.endsWith(',')), 'cut at the commas');
+  assert.equal(pieces.join(' '), list, 'nothing lost');
+  const words = 'word '.repeat(200).trim();
+  assert.ok(speechPieces(words).every((p) => p.length <= 240 && !p.includes('wor d')));
+  assert.ok(speechPieces('x'.repeat(1000)).every((p) => p.length <= 240), 'even with nowhere to cut');
+});

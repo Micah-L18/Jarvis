@@ -2,7 +2,7 @@
 // and plain text. Long documents come back in parts (pages, sheets, slides) so they can be
 // read a piece at a time.
 import fs from 'node:fs/promises';
-import { kindOf, extOf, TEXTUAL } from './filekind.js';
+import { kindOf, extOf, TEXTUAL, textEncoding, decodeText } from './filekind.js';
 
 export function stripHtml(html) {
   return html
@@ -39,9 +39,27 @@ async function pdfParts(buf) {
   }
 }
 
+// A document is a zip, and a zip can unpack to far more than it weighs: past these it is not read.
+const ZIP_TOTAL = 512 * 1024 ** 2;
+const ZIP_ENTRY = 128 * 1024 ** 2;
+// What one workbook may come to as text, and the most columns a sheet can have (XFD).
+const SHEET_TEXT = 4_000_000;
+const MAX_COLUMNS = 16384;
+
 async function zip(buf) {
   const { default: JSZip } = await import('jszip');
-  return JSZip.loadAsync(buf);
+  const z = await JSZip.loadAsync(buf);
+  let total = 0;
+  for (const f of Object.values(z.files)) total += f._data?.uncompressedSize || 0;
+  if (total > ZIP_TOTAL) throw new Error('That file unpacks to far more than its size; I will not read it.');
+  return z;
+}
+/** One part of an unpacked document as text, or undefined if it is not there; refused if it unpacks too large. */
+async function partText(z, name) {
+  const f = z.file(name);
+  if (!f) return undefined;
+  if ((f._data?.uncompressedSize || 0) > ZIP_ENTRY) throw new Error('A part of that file is too large to read.');
+  return f.async('string');
 }
 
 const byNumber = (re) => (a, b) => Number(re.exec(a)?.[1] || 0) - Number(re.exec(b)?.[1] || 0);
@@ -49,24 +67,31 @@ const byNumber = (re) => (a, b) => Number(re.exec(a)?.[1] || 0) - Number(re.exec
 async function xlsxParts(buf) {
   const z = await zip(buf);
   const shared = [];
-  const sst = await z.file('xl/sharedStrings.xml')?.async('string');
+  const sst = await partText(z, 'xl/sharedStrings.xml');
   if (sst) {
     for (const si of sst.match(/<si>[\s\S]*?<\/si>/g) || []) {
       shared.push(decodeXml((si.match(/<t[^>]*>([\s\S]*?)<\/t>/g) || []).map((t) => t.replace(/<[^>]+>/g, '')).join('')));
     }
   }
-  const book = (await z.file('xl/workbook.xml')?.async('string')) || '';
+  const book = (await partText(z, 'xl/workbook.xml')) || '';
   const names = [...book.matchAll(/<sheet\b[^>]*name="([^"]*)"/g)].map((m) => decodeXml(m[1]));
   const files = Object.keys(z.files).filter((f) => /^xl\/worksheets\/sheet\d+\.xml$/.test(f)).sort(byNumber(/sheet(\d+)\.xml/));
   const parts = [];
+  let budget = SHEET_TEXT; // characters left for the whole workbook
   for (const [i, f] of files.entries()) {
-    const xml = await z.file(f).async('string');
+    const title = `Sheet "${names[i] || `Sheet ${i + 1}`}"`;
+    if (budget <= 0) {
+      parts.push(`${title}\n(left out: the workbook is too large to read whole)`);
+      continue;
+    }
+    const xml = await partText(z, f);
     const rows = [];
     for (const row of xml.match(/<row\b[\s\S]*?<\/row>/g) || []) {
       const cells = [];
       for (const c of row.match(/<c\b[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g) || []) {
-        const ref = /\br="([A-Z]+)\d+"/.exec(c)?.[1];
+        const ref = /\br="([A-Z]{1,3})\d+"/.exec(c)?.[1];
         const col = ref ? [...ref].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1 : cells.length;
+        if (col >= MAX_COLUMNS) continue; // no real sheet has a cell out there
         const type = /\bt="(\w+)"/.exec(c)?.[1];
         const v = /<v>([\s\S]*?)<\/v>/.exec(c)?.[1];
         const inline = /<is>([\s\S]*?)<\/is>/.exec(c)?.[1];
@@ -77,9 +102,15 @@ async function xlsxParts(buf) {
         while (cells.length < col) cells.push('');
         cells[col] = /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
       }
-      rows.push(cells.join(','));
+      const line = cells.join(',');
+      budget -= line.length + 1;
+      if (budget < 0) {
+        rows.push('… (the rest is left out: the workbook is too large to read whole)');
+        break;
+      }
+      rows.push(line);
     }
-    parts.push(`Sheet "${names[i] || `Sheet ${i + 1}`}"\n${rows.join('\n')}`);
+    parts.push(`${title}\n${rows.join('\n')}`);
   }
   return parts;
 }
@@ -89,7 +120,7 @@ async function pptxParts(buf) {
   const files = Object.keys(z.files).filter((f) => /^ppt\/slides\/slide\d+\.xml$/.test(f)).sort(byNumber(/slide(\d+)\.xml/));
   const parts = [];
   for (const f of files) {
-    const xml = await z.file(f).async('string');
+    const xml = await partText(z, f);
     const paras = (xml.match(/<a:p>[\s\S]*?<\/a:p>/g) || [])
       .map((p) => decodeXml((p.match(/<a:t>([\s\S]*?)<\/a:t>/g) || []).map((t) => t.replace(/<[^>]+>/g, '')).join('')))
       .filter(Boolean);
@@ -99,6 +130,11 @@ async function pptxParts(buf) {
 }
 
 async function docxText(buf) {
+  // mammoth unpacks the whole file itself, so the size checks run first.
+  const z = await zip(buf);
+  for (const f of Object.values(z.files)) {
+    if ((f._data?.uncompressedSize || 0) > ZIP_ENTRY) throw new Error('A part of that file is too large to read.');
+  }
   const { default: mammoth } = await import('mammoth');
   const { value } = await mammoth.extractRawText({ buffer: buf });
   return value.replace(/\n{3,}/g, '\n\n').trim();
@@ -121,12 +157,58 @@ export async function extractText(file) {
   else if (ext === 'pptx') parts = await pptxParts(buf);
   else if (ext === 'docx') return { text: await docxText(buf) };
   else if (kind === 'office') return { unreadable: `I can read .docx, .xlsx and .pptx, but not the older .${ext} format. Save it in the newer format and I can.` };
-  else if (kind === 'html') return { text: stripHtml(buf.toString('utf8')) };
-  else if (TEXTUAL.has(kind) || (kind === 'other' && !buf.subarray(0, 4000).includes(0))) return { text: buf.toString('utf8') };
+  else if (kind === 'html') return { text: stripHtml(decodeText(buf) ?? buf.toString('utf8')) };
+  else if (TEXTUAL.has(kind)) return { text: decodeText(buf) ?? buf.toString('utf8') }; // UTF-8, or UTF-16 by its mark or its NULs
+  else if (kind === 'other' && decodeText(buf.subarray(0, 4000), { sniff: false }) != null) return { text: decodeText(buf, { sniff: false }) ?? buf.toString('utf8') };
   else return { unreadable: `That is ${kind === 'other' ? 'a binary file' : `a${/^[aeiou]/.test(kind) ? 'n' : ''} ${kind} file`}, not text.` };
   const partName = PART_NAME[ext] || PART_NAME[kind];
   const text = parts.map((p, i) => `[${partName} ${i + 1}]\n${p}`).join('\n\n');
   return { text, parts, partName };
+}
+
+/** Plain text bigger than this is read a window at a time (readTextWindow), never whole. */
+export const BIG_TEXT = 8 * 1024 ** 2;
+/** Files whose bytes are their text (no markup to strip, no format to unpack), so a window of them can be read. */
+export const isPlainText = (file) => {
+  const kind = kindOf(file);
+  return kind === 'other' || (TEXTUAL.has(kind) && kind !== 'html');
+};
+
+/**
+ * Up to `maxChars` characters of a plain-text file from byte `from` on, reading only those bytes.
+ * @returns {Promise<{text, start, end, size, encoding} | {binary: true, size}>} — `start` and `end` are
+ *   byte offsets (end is where the next window starts), so a long log can be read page by page.
+ */
+export async function readTextWindow(file, from, maxChars) {
+  const fh = await fs.open(file, 'r');
+  try {
+    const { size } = await fh.stat();
+    const head = Buffer.alloc(Math.min(size, 8192));
+    await fh.read(head, 0, head.length, 0);
+    const mayBeBinary = kindOf(file) === 'other';
+    const encoding = textEncoding(head, { sniff: !mayBeBinary });
+    if (mayBeBinary && encoding === 'utf-8' && head.subarray(0, 4000).includes(0)) return { binary: true, size };
+    const unit = encoding === 'utf-8' ? 1 : 2;
+    const bom = encoding === 'utf-8' ? (head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf ? 3 : 0) : (head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff) ? 2 : 0;
+    let start = Math.max(bom, Math.min(Math.floor(Number(from) || 0), size));
+    if (unit === 2) start -= (start - bom) % 2;
+    const want = Math.min(size - start, maxChars * (unit === 1 ? 4 : 2));
+    const buf = Buffer.alloc(Math.max(0, want));
+    const { bytesRead } = await fh.read(buf, 0, buf.length, start);
+    let b = buf.subarray(0, bytesRead);
+    if (unit === 1) { // landed inside a character: start at the next one
+      let skip = 0;
+      while (skip < 3 && skip < b.length && (b[skip] & 0xc0) === 0x80) skip++;
+      b = b.subarray(skip);
+      start += skip;
+    }
+    let text = new TextDecoder(encoding, { ignoreBOM: true }).decode(b, { stream: true }); // an unfinished last character is left for the next window
+    if (text.length > maxChars) text = text.slice(0, /[\uD800-\uDBFF]/.test(text[maxChars - 1]) ? maxChars - 1 : maxChars);
+    const used = Math.min(b.length, unit === 1 ? Buffer.byteLength(text, 'utf8') : text.length * 2);
+    return { text, start, end: start + used, size, encoding };
+  } finally {
+    await fh.close();
+  }
 }
 
 /** Kinds extractText can get words out of. */

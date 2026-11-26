@@ -6,9 +6,9 @@ import path from 'node:path';
 import http from 'node:http';
 import JSZip from 'jszip';
 import sharp from 'sharp';
-import { kindOf, isTextual, mimeOf } from '../src/main/filekind.js';
-import { extractText, canExtract, describeModel, imageSize } from '../src/main/extract.js';
-import { toolResult, transcriptText } from '../src/main/tools.js';
+import { kindOf, isTextual, mimeOf, decodeText } from '../src/main/filekind.js';
+import { extractText, canExtract, describeModel, imageSize, readTextWindow } from '../src/main/extract.js';
+import { toolResult, transcriptText, builtinTools } from '../src/main/tools.js';
 import { resultContent } from '../src/main/llm/anthropic.js';
 import { mcpContent } from '../src/main/llm/claudecli.js';
 import { toolMessage } from '../src/main/llm/ollama.js';
@@ -123,6 +123,68 @@ test('extract: text out of PDFs (by page), Word, spreadsheets, slides, web pages
   assert.equal(canExtract('a.pdf') && canExtract('a.xlsx') && !canExtract('a.png') && !canExtract('a.doc'), true);
 });
 
+test('extract: a spreadsheet with far-off cell references, or one that unpacks huge, is read within bounds', async () => {
+  const dir = tmp();
+  const z = new JSZip();
+  z.file('xl/workbook.xml', '<workbook><sheets><sheet name="S" sheetId="1"/><sheet name="T" sheetId="2"/></sheets></workbook>');
+  // 15 KB on disk; read naively, 300 rows of 35 million empty cells
+  z.file('xl/worksheets/sheet1.xml', `<worksheet><sheetData>${Array.from({ length: 300 }, (_, i) => `<row r="${i + 1}"><c r="A${i + 1}"><v>${i}</v></c><c r="BZZZZZ${i + 1}"><v>1</v></c></row>`).join('')}</sheetData></worksheet>`);
+  z.file('xl/worksheets/sheet2.xml', `<worksheet><sheetData>${Array.from({ length: 1500 }, (_, i) => `<row r="${i + 1}"><c r="XFD${i + 1}"><v>1</v></c></row>`).join('')}</sheetData></worksheet>`);
+  const file = path.join(dir, 'far.xlsx');
+  fs.writeFileSync(file, await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }));
+  const started = Date.now();
+  const doc = await extractText(file);
+  assert.ok(Date.now() - started < 5000, 'quick');
+  assert.ok(doc.parts[0].length < 5000, 'the far-off cells are not padded out');
+  assert.match(doc.parts[0], /^Sheet "S"\n0,1\n1,1\n/);
+  assert.ok(doc.text.length <= 4_100_000, 'the workbook as a whole is capped');
+  assert.match(doc.parts[1], /too large to read whole/);
+
+  const bomb = new JSZip();
+  bomb.file('xl/workbook.xml', '<workbook/>');
+  bomb.file('xl/worksheets/sheet1.xml', Buffer.alloc(600e6, 32));
+  const bombFile = path.join(dir, 'bomb.xlsx');
+  fs.writeFileSync(bombFile, await bomb.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }));
+  await assert.rejects(extractText(bombFile), /unpacks to far more/);
+});
+
+test('extract: UTF-16 text (with or without a byte-order mark) reads as text, not NULs', async () => {
+  const dir = tmp();
+  const le = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('name,age\r\nAna,30\r\n', 'utf16le')]);
+  fs.writeFileSync(path.join(dir, 'u16.csv'), le);
+  assert.equal((await extractText(path.join(dir, 'u16.csv'))).text, 'name,age\r\nAna,30\r\n');
+  const be = Buffer.from('hello there', 'utf16le').swap16();
+  fs.writeFileSync(path.join(dir, 'be.txt'), be);
+  assert.equal((await extractText(path.join(dir, 'be.txt'))).text, 'hello there');
+  assert.equal(decodeText(Buffer.from('plain words, no mark', 'utf16le')), 'plain words, no mark');
+  assert.equal(decodeText(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3, 0, 0])), null, 'binary is still binary');
+});
+
+test('extract: a window of a big text file is read without reading the rest, and windows join up', async () => {
+  const dir = tmp();
+  const file = path.join(dir, 'server.log');
+  const text = Array.from({ length: 3000 }, (_, i) => `line ${i} — ümlaut ✓ 🚀\n`).join('');
+  fs.writeFileSync(file, `\ufeff${text}`);
+  let at = 0;
+  let joined = '';
+  for (let guard = 0; guard < 1000; guard++) {
+    const w = await readTextWindow(file, at, 777);
+    assert.ok(w.text.length <= 777);
+    joined += w.text;
+    if (w.end >= w.size) break;
+    at = w.end;
+  }
+  assert.equal(joined, text, 'nothing lost or doubled at the joins, and no byte-order mark');
+  const mid = await readTextWindow(file, 13, 50); // inside a character: starts at the next whole one
+  assert.ok(!mid.text.startsWith('\ufffd'));
+  const u16 = path.join(dir, 'u16.txt');
+  fs.writeFileSync(u16, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('abcdef', 'utf16le')]));
+  assert.equal((await readTextWindow(u16, 0, 3)).text, 'abc');
+  assert.equal((await readTextWindow(u16, (await readTextWindow(u16, 0, 3)).end, 10)).text, 'def');
+  fs.writeFileSync(path.join(dir, 'blob'), Buffer.from([1, 0, 2, 0, 0, 0, 7]));
+  assert.equal((await readTextWindow(path.join(dir, 'blob'), 0, 10)).binary, true);
+});
+
 test('extract: a line about a 3D model from its own header', async () => {
   const dir = tmp();
   const gltf = path.join(dir, 'm.gltf');
@@ -231,6 +293,26 @@ test('providers: a picture reaches each brain in its own shape', async () => {
   } finally {
     server.close();
   }
+});
+
+test('tools: a transcription stopped by the user keeps the part done, and the conversation says so before the next turn', async () => {
+  const root = tmp();
+  fs.writeFileSync(path.join(root, 'meeting.wav'), 'RIFF');
+  const controller = new AbortController();
+  const transcribe = (audio, { signal }) => new Promise((resolve) => {
+    signal.addEventListener('abort', () => setTimeout(() => resolve({ stopped: true, at: 84, of: 1800, text: 'We begin.', chunks: [{ text: 'We begin.', timestamp: [0, 28] }] }), 20));
+  });
+  const media = { probe: async () => ({ duration: 1800 }), decode: async () => new Float32Array(16000) };
+  const { memory, ui } = makeAgent(root);
+  const tools = Object.fromEntries(builtinTools({ memory, skills: null, settings: null, ui: (e) => ui.push(e), fsRoot: () => root, openPath() {}, media, transcribe, signal: () => controller.signal }).map((t) => [t.name, t]));
+  memory.logTurn('user', 'Transcribe meeting.wav');
+  const running = tools.transcribe_media.run({ path: 'meeting.wav', confirm: true });
+  await new Promise((r) => setTimeout(r, 20));
+  controller.abort(); // the user said something else
+  assert.match(memory.recentTurns(4).at(-1).text, /transcription of meeting\.wav was stopped part-way.*"meeting\.wav — transcript \(partial\)"/, 'on record at once');
+  assert.match(await running, /stopped at 1:24 of 30:00; the part done is saved/);
+  assert.match(memory.readDocument(null, 'meeting.wav — transcript (partial)').content, /Partial transcript \(stopped at 1:24 of 30:00\)[\s\S]*We begin\./);
+  assert.equal(ui.find((e) => e.type === 'viewer_text').ifOpen, true, 'the viewer is not brought back for it');
 });
 
 test('tools: transcripts are saved as documents, shown in the Text tab, and long recordings say how long first', async () => {

@@ -45,7 +45,7 @@ Just talk. It listens continuously, works out when you've finished a thought, an
 |---|---|
 | Hold **Space** | Push-to-talk (works even with hands-free off or the mic muted) |
 | **/** or **Enter** | Type instead |
-| **Esc** | Close whatever is open (the type box, the controls, the file viewer, a card), otherwise interrupt |
+| **Esc** | Close whatever is open (the type box, the controls, the file viewer, a card), otherwise interrupt; during a transcription, stop it first |
 | **M** | Mute the microphone |
 | **1 2 3** | Core / Mind / Files view |
 | **Tab** | Controls |
@@ -58,7 +58,7 @@ Ask for a file and it opens in the app's viewer, then Jarvis answers about it:
 
 - "Show me the cottage picture." · "Pull up the floor plan model." · "Open last week's minutes."
 - "What's in this?" or "Summarize this." — *this* is whatever the viewer is showing. You get three to five sentences aloud; for anything long, a fuller summary is also saved as a document next to the file's Text tab.
-- "Transcribe this." — for a recording or video, Jarvis's own speech recognizer writes out what is said, with times; for a PDF, Word file, slides, spreadsheet or web page it pulls out the full text; for a picture it reads the text in it. The transcript appears in the viewer's **Text** tab and is saved as a project document. It is not read out. A long recording gets an estimate first ("forty minutes long, about seven minutes to transcribe") and goes ahead when you say so; Esc stops it.
+- "Transcribe this." — for a recording or video, Jarvis's own speech recognizer writes out what is said, with times; for a PDF, Word file, slides, spreadsheet or web page it pulls out the full text; for a picture it reads the text in it. The transcript appears in the viewer's **Text** tab and is saved as a project document. It is not read out. A long recording gets an estimate first ("forty minutes long, about seven minutes to transcribe") and goes ahead when you say so; Esc stops it, and so does talking to Jarvis meanwhile — the part already done is kept as a partial transcript.
 
 The viewer's **Summarize** and **Transcribe** buttons ask the same thing.
 
@@ -83,7 +83,7 @@ The microphone and the speaker are chosen separately under **Voice** in the cont
 
 You can also ask for these by voice: "show me my files", "pull up the volleyball project", "show me roster.csv".
 
-Ask where something is — "where's the roster?", "where did I put the serve ladder?" — and Jarvis flies to it on whichever map it lives on, opening folders down to it if need be, and marks it. It also points on its own, once, when the talk turns to a project, person, document or file that is on a map; a file it opens is marked on the Files map behind the viewer. It never moves the view while you have hold of it or the controls are open.
+Ask where something is — "where's the roster?", "where did I put the serve ladder?" — and Jarvis flies to it on whichever map it lives on, opening folders down to it if need be, and marks it. It also points on its own, once, when the talk turns to a project, person, document or file that is on a map; a file it opens is marked on the Files map behind the viewer, and asked where something else is while a file is open, it closes the viewer to show you. It never moves the view while you have hold of it or the controls are open.
 
 ## Memory and projects
 

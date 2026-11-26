@@ -65,6 +65,23 @@ test('voice: the opening of a reply is released at its first comma, later text s
   assert.deepEqual(out, ['It is fourteen degrees and overcast,', 'sir, with rain expected by four.', 'Take a coat, I would say.']);
 });
 
+test('voice: a list without full stops is spoken line by line, and no piece runs on past the cap', () => {
+  const v = fakeVoice();
+  const out = [];
+  v.voice._enqueue = (t) => { out.push(t.trim()); v.voice.firstChunk = false; };
+  const lines = Array.from({ length: 40 }, (_, i) => `- Survey photo ${i + 1} from the harbour slipway, west side`);
+  const reply = `Here are the files in that folder, sir:\n${lines.join('\n')}\n`;
+  for (const w of reply.split(/(?<= )/)) v.voice.say(w);
+  v.voice.flush();
+  assert.ok(out.length >= 40, `one piece a line (${out.length})`);
+  assert.ok(out.every((p) => p.length <= 240));
+  out.length = 0;
+  for (const w of `${'and then the next thing '.repeat(40)}`.split(/(?<= )/)) v.voice.say(w);
+  v.voice.flush();
+  assert.ok(out.length > 3 && out.every((p) => p.length <= 240), 'a run with no stops at all');
+  assert.equal(out.join(' '), 'and then the next thing '.repeat(40).trim());
+});
+
 test('voice: the status line follows a model download to its end, including one that breaks off', () => {
   assert.deepEqual(speechStatus({ what: 'faster voice', file: 'onnx/model.onnx', loaded: 125763584, total: 325532232 }), { text: 'Downloading faster voice model (one time) — 39%', ttl: 0 });
   assert.deepEqual(speechStatus({ what: 'faster voice', done: true }), { text: 'faster voice ready', ttl: 2500 });

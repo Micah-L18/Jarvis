@@ -1,4 +1,5 @@
 // Pure helpers for the file viewer (no DOM), so they can be tested on their own.
+import { decodeText } from '../main/filekind.js';
 
 export const fileUrl = (absPath) => `jarvis-file://local/${encodeURIComponent(absPath)}`;
 
@@ -17,17 +18,8 @@ export function formatBytes(n) {
 
 export const middle = (text, max = 96) => (text.length <= max ? text : `${text.slice(0, 32)}…${text.slice(text.length - (max - 33))}`);
 
-/** Bytes that are not text: NULs, or many control characters, in the first few KB. */
-export function looksBinary(bytes) {
-  const n = Math.min(bytes.length, 8192);
-  let odd = 0;
-  for (let i = 0; i < n; i++) {
-    const b = bytes[i];
-    if (b === 0) return true;
-    if (b < 32 && b !== 9 && b !== 10 && b !== 13 && b !== 12 && b !== 27) odd++;
-  }
-  return n > 0 && odd / n > 0.1;
-}
+/** Bytes that are not text: NULs (other than UTF-16's), or many control characters, in the first few KB. */
+export const looksBinary = (bytes) => decodeText(bytes) === null;
 
 /** A small CSV/TSV reader (quotes, doubled quotes, newlines inside quotes). Stops after `maxRows`. */
 export function parseCsv(text, delimiter, maxRows = Infinity) {

@@ -41,26 +41,34 @@ const inside = (root, target) => {
 /**
  * The real path of `target` if it (after following every symlink) lies inside one of `roots`
  * (also followed), else null. `realpath` is injectable for tests.
+ * Nothing on disk is looked at for a path that is not inside a root as written: on Windows even
+ * looking at a UNC path (\\host\share) connects to that host and offers it the user's credentials.
  */
 export function allowedPath(target, roots, realpath = fs.realpathSync.native) {
   if (typeof target !== 'string' || !path.isAbsolute(target) || target.includes('\0')) return null;
-  let real;
-  try {
-    real = realpath(path.resolve(target));
-  } catch {
-    return null;
-  }
+  const asked = path.resolve(target);
+  const realRoots = [];
+  let near = false;
   for (const root of roots) {
     if (!root) continue;
+    const given = path.resolve(root);
     let realRoot;
     try {
-      realRoot = realpath(path.resolve(root));
+      realRoot = realpath(given); // a root comes from the settings, never from the window
     } catch {
       continue;
     }
-    if (inside(realRoot, real)) return real;
+    realRoots.push(realRoot);
+    if (inside(given, asked) || inside(realRoot, asked)) near = true;
   }
-  return null;
+  if (!near) return null;
+  let real;
+  try {
+    real = realpath(asked);
+  } catch {
+    return null;
+  }
+  return realRoots.some((r) => inside(r, real)) ? real : null;
 }
 
 /** "bytes=a-b" against a file of `size` bytes → {start, end} (inclusive), 'bad' if unsatisfiable, null if absent. */
@@ -101,7 +109,7 @@ export function serveFiles(protocol, roots) {
     const asked = pathFromUrl(req.url);
     const real = asked && allowedPath(asked, roots());
     if (!real) {
-      const missing = asked && !fs.existsSync(asked) && roots().some((r) => r && inside(path.resolve(r), asked));
+      const missing = asked && roots().some((r) => r && inside(path.resolve(r), asked)) && !fs.existsSync(asked); // only ever looked for inside a root
       return reply(missing ? 404 : 403, { ...cors, 'Content-Type': 'text/plain' }, missing ? 'Not found' : 'Not allowed');
     }
     let stat;

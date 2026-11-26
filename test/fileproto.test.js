@@ -55,6 +55,20 @@ test('allowedPath with an injected realpath (pure)', () => {
   assert.equal(allowedPath('/r/none', ['/r'], real), null);
 });
 
+test('allowedPath never touches the disk for a path outside every root (a UNC path would connect on Windows)', () => {
+  const seen = [];
+  const real = (p) => { seen.push(p); return p; };
+  assert.equal(allowedPath('/far/away/secret', ['/home/root'], real), null);
+  assert.equal(allowedPath('/home/root-evil/x', ['/home/root'], real), null);
+  assert.equal(allowedPath('/home/root/../elsewhere/x', ['/home/root'], real), null);
+  assert.deepEqual(seen.filter((p) => !p.startsWith('/home/root') || p.includes('evil') || p.includes('elsewhere')), [], 'only the roots were looked at');
+  assert.equal(allowedPath('/home/root/a.txt', ['/home/root'], real), '/home/root/a.txt');
+  assert.ok(seen.includes('/home/root/a.txt'));
+  // A root reached through a link: a path under the link's target is inside, as written.
+  const linked = (p) => (p === '/link' ? '/data' : p);
+  assert.equal(allowedPath('/data/x', ['/link'], linked), '/data/x');
+});
+
 test('parseRange', () => {
   assert.equal(parseRange(null, 100), null);
   assert.deepEqual(parseRange('bytes=0-9', 100), { start: 0, end: 9 });

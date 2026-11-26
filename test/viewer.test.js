@@ -28,6 +28,8 @@ test('viewer: binary sniffing', () => {
   assert.equal(looksBinary(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0, 1])), true);
   assert.equal(looksBinary(new Uint8Array(100).fill(3)), true);
   assert.equal(looksBinary(new Uint8Array(0)), false);
+  const u16 = new Uint8Array([0xff, 0xfe, ...new Uint8Array(Buffer.from('name,age\r\nAna,30', 'utf16le'))]);
+  assert.equal(looksBinary(u16), false, 'UTF-16 (Excel "Unicode Text", PowerShell 5) is text');
 });
 
 test('viewer: csv reading', () => {
@@ -69,4 +71,33 @@ test('voice: hands-free listening is held while something else plays, push-to-ta
   voice.hold('viewer', false);
   feed(0.1, 10);
   assert.ok(voice.capture, 'listening again once the video stops');
+});
+
+test('media: a recording too long for Chromium to decode whole is cut into pieces that each decode alone', async () => {
+  const { wavPieces, mp3Pieces } = await import('../src/renderer/media.js');
+  // a 16-bit stereo WAV of 1000 frames with an extra chunk before the data
+  const frames = 1000;
+  const wav = new ArrayBuffer(12 + 24 + 12 + 8 + frames * 4);
+  const v = new DataView(wav);
+  const put = (at, s) => [...s].forEach((c, i) => v.setUint8(at + i, c.charCodeAt(0)));
+  put(0, 'RIFF'); v.setUint32(4, wav.byteLength - 8, true); put(8, 'WAVE');
+  put(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, 44100, true); v.setUint32(28, 176400, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  put(36, 'LIST'); v.setUint32(40, 4, true); put(44, 'INFO');
+  put(48, 'data'); v.setUint32(52, frames * 4, true);
+  for (let i = 0; i < frames * 2; i++) v.setInt16(56 + i * 2, i, true);
+  assert.equal(wavPieces(wav), null, 'short enough: decoded whole');
+  const pieces = wavPieces(wav, { pieceFrames: 300, limit: 500 }).map((make) => new DataView(make()));
+  assert.equal(pieces.length, 4);
+  assert.deepEqual(pieces.map((p) => p.getUint32(52, true)), [1200, 1200, 1200, 400], 'data sizes');
+  assert.ok(pieces.every((p) => p.getUint32(4, true) === p.byteLength - 8), 'RIFF sizes');
+  assert.equal(pieces[1].getInt16(56, true), 600, 'the second piece carries on where the first stopped');
+  assert.equal(pieces[3].getInt16(56 + 199 * 2, true), 1999);
+  assert.equal(wavPieces(new ArrayBuffer(100)), null, 'not a WAV');
+  // an MP3: pieces start on frame headers, and nothing is lost
+  const frame = [0xff, 0xfb, 0x90, 0x64, ...new Array(413).fill(0x11)];
+  const mp3 = new Uint8Array([...'ID3'].map((c) => c.charCodeAt(0)).concat(new Array(20).fill(0), ...Array.from({ length: 50 }, () => frame))).buffer;
+  const parts = mp3Pieces(mp3, 3).map((make) => new Uint8Array(make()));
+  assert.equal(parts.length, 3);
+  assert.ok(parts.slice(1).every((p) => p[0] === 0xff && p[1] === 0xfb));
+  assert.equal(parts.reduce((n, p) => n + p.length, 0), mp3.byteLength);
 });

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { scan, isInside } from './fsscan.js';
 import { NODE_TYPES } from './memory.js';
 import { kindOf } from './filekind.js';
-import { extractText, canExtract, loadImage, imageSize, describeModel, stripHtml } from './extract.js';
+import { extractText, canExtract, loadImage, imageSize, describeModel, stripHtml, isPlainText, readTextWindow, BIG_TEXT } from './extract.js';
 import { locate, describeHit, pointEvent } from './pointer.js';
 
 const str = (description) => ({ type: 'string', description });
@@ -36,7 +36,8 @@ const stamp = (sec) => {
   return `${hh ? `${hh}:` : ''}${mm}:${String(t % 60).padStart(2, '0')}`;
 };
 
-// Reading a long PDF a page at a time should not mean extracting it again for every page.
+// Reading a long PDF a page at a time should not mean extracting it again for every page. A text
+// too big to keep around is not kept (big plain text is read a window at a time instead).
 const extracted = new Map();
 async function textOf(file, stat) {
   const key = `${file}|${stat.size}|${stat.mtimeMs}`;
@@ -45,7 +46,9 @@ async function textOf(file, stat) {
     while (extracted.size > 6) extracted.delete(extracted.keys().next().value);
   }
   try {
-    return await extracted.get(key);
+    const doc = await extracted.get(key);
+    if ((doc.text?.length || 0) > BIG_TEXT) extracted.delete(key);
+    return doc;
   } catch (err) {
     extracted.delete(key);
     throw err;
@@ -115,11 +118,12 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
   const notFolder = (f) => {
     if (f.kind === 'folder') throw new Error(`${f.file} is a folder; use list_folder, or show_view files with it as the focus.`);
   };
-  const saveTranscript = (f, text, what) => {
-    const title = `${f.name} — transcript`;
+  // `partial`: a transcription stopped part-way. Saved under a name of its own, and shown only if that file is still on screen.
+  const saveTranscript = (f, text, what, partial = false) => {
+    const title = `${f.name} — transcript${partial ? ' (partial)' : ''}`;
     const res = memory.saveDocument(null, title, `# ${title}\n\n${what} of ${f.file}\n\n${text}\n`);
     ctx.ui({ type: 'document', title, file: res.file, project: res.project.label });
-    ctx.ui({ type: 'viewer_text', path: f.file, title, text });
+    ctx.ui({ type: 'viewer_text', path: f.file, title, text, ...(partial ? { ifOpen: true } : {}) });
     return res;
   };
   const words = (text) => (text.match(/\S+/g) || []).length;
@@ -325,6 +329,9 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
           } else if ((f.kind === 'audio' || f.kind === 'video') && ctx.media) {
             const { duration: d } = await Promise.race([ctx.media.probe(f.file), new Promise((r) => setTimeout(() => r({}), 4000))]);
             if (d) lines.push(`${f.kind === 'video' ? 'Video' : 'Recording'}, ${duration(d)} long. transcribe_media gets the words.`);
+          } else if (isPlainText(f.file) && f.stat.size > BIG_TEXT) {
+            const w = await readTextWindow(f.file, 0, 2000);
+            if (!w.binary) lines.push(`It begins:\n${w.text}\n… (${bytes(f.stat.size)} of text; read_file reads it a window at a time)`);
           } else if (canExtract(f.file) && f.stat.size < 60e6) {
             const doc = await textOf(f.file, f.stat);
             if (doc.parts) lines.push(`${doc.parts.length} ${doc.partName}${doc.parts.length === 1 ? '' : 's'}.`);
@@ -343,7 +350,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
       schema: obj({
         path: str('File path'),
         page: { type: 'integer', description: 'For PDFs, slides and spreadsheets: read only this page, slide or sheet (from 1)' },
-        offset: { type: 'integer', description: 'Character to start from, to continue a long text' },
+        offset: { type: 'integer', description: 'Where to start, to continue a long text: the offset the previous result gave' },
       }, ['path']),
       run: async ({ path: p, page, offset = 0 }) => {
         const f = await fileIn(p);
@@ -360,6 +367,14 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
         }
         if (f.kind === 'audio' || f.kind === 'video') return `${f.file} is a ${f.kind === 'video' ? 'video' : 'recording'} (${bytes(f.stat.size)}). Use transcribe_media to get the words.`;
         if (f.kind === 'model') return `${f.file}: ${await describeModel(f.file, f.stat.size)}, ${bytes(f.stat.size)}. Its geometry is not readable as text; show_file puts it on screen.`;
+        if (isPlainText(f.file) && f.stat.size > BIG_TEXT) { // a big log: only the window asked for is read
+          const w = await readTextWindow(f.file, offset, TEXT_CAP);
+          if (w.binary) return `${f.file}: That is a binary file, not text.`;
+          const more = w.end < w.size
+            ? `\n… (bytes ${w.start.toLocaleString('en-GB')} to ${w.end.toLocaleString('en-GB')} of ${w.size.toLocaleString('en-GB')}; read_file with offset ${w.end} continues)`
+            : `\n(end; from byte ${w.start.toLocaleString('en-GB')})`;
+          return `${f.file} (${f.kind}, ${bytes(f.stat.size)}, read a window at a time)\n${w.text}${more}`;
+        }
         const doc = await textOf(f.file, f.stat);
         if (doc.unreadable) return `${f.file}: ${doc.unreadable}`;
         let text = doc.text;
@@ -389,6 +404,7 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
         if (f.kind === 'audio' || f.kind === 'video') return 'That is a recording; use transcribe_media.';
         if (f.kind === 'image' || f.kind === 'svg') return 'That is an image: look at it with read_file, then save the text you read with save_document, title "<file name> — transcript" and for_file set to its path.';
         if (!canExtract(f.file)) return `I can't get text out of ${f.name}.`;
+        if (isPlainText(f.file) && f.stat.size > BIG_TEXT) return `${f.name} is ${bytes(f.stat.size)} of plain text, too much to transcribe whole; read_file reads it a window at a time.`;
         const doc = await textOf(f.file, f.stat);
         if (doc.unreadable) return doc.unreadable;
         const text = (doc.parts ? doc.parts.map((t, i) => `## ${doc.partName[0].toUpperCase()}${doc.partName.slice(1)} ${i + 1}\n\n${t}`).join('\n\n') : doc.text).trim();
@@ -418,7 +434,23 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
         if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
         if (!audio?.length) return `There is no sound in ${f.name} that I can decode.`;
         if (audio.length / 16000 > 2 * 3600) return `${f.name} is over two hours long; I can transcribe up to two hours at a time.`;
-        const out = await ctx.transcribe(audio, { signal });
+        // Stopped by the user (a new remark, or Esc), the turn is gone, so the record of the conversation
+        // says so at once, before the next turn is put together; what was done is saved when it comes back.
+        const partialTitle = `${f.name} — transcript (partial)`;
+        const onStop = () => memory.logTurn?.('assistant', `(The transcription of ${f.name} was stopped part-way when the user interrupted. The part done by then, if any, is saved as the document "${partialTitle}".)`);
+        signal?.addEventListener('abort', onStop, { once: true });
+        let out;
+        try {
+          out = await ctx.transcribe(audio, { signal });
+        } finally {
+          signal?.removeEventListener('abort', onStop);
+        }
+        if (out.stopped) {
+          const partial = transcriptText(out.chunks, out.text);
+          if (!partial) return `The transcription of ${f.name} was stopped before any speech was made out.`;
+          const res = saveTranscript(f, partial, `Partial transcript (stopped at ${stamp(out.at)} of ${stamp(out.of)})`, true);
+          return `The transcription was stopped at ${stamp(out.at)} of ${stamp(out.of)}; the part done is saved as "${partialTitle}" in project "${res.project.label}".`;
+        }
         const text = transcriptText(out.chunks, out.text);
         if (!text) return `I could not make out any speech in ${f.name}.`;
         const res = saveTranscript(f, text, 'Transcript');
