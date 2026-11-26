@@ -1,7 +1,7 @@
 // Narrow bridge between the window and the main process.
 const { contextBridge, ipcRenderer } = require('electron');
 
-const EVENTS = new Set(['chat', 'ui', 'memory', 'mcp', 'speech', 'settings']);
+const EVENTS = new Set(['chat', 'ui', 'memory', 'mcp', 'speech', 'settings', 'fsize']);
 
 contextBridge.exposeInMainWorld('jarvis', {
   invoke: (channel, ...args) => ipcRenderer.invoke(`jarvis:${channel}`, ...args),

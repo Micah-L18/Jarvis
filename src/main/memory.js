@@ -4,6 +4,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { readJson, writeJson, slugify } from './store.js';
+import { buildIndex, rank, isStanding } from './relevance.js';
 
 export const NODE_TYPES = ['project', 'topic', 'person', 'fact', 'preference', 'task', 'document'];
 const CORE = 'core';
@@ -57,6 +58,8 @@ export class Memory {
   }
 
   _save() {
+    this._index = null;
+    this._fullIndex = null;
     writeJson(this.file, { nodes: [...this.nodes.values()], edges: this.edges, activeProject: this.activeProject });
     for (const fn of this.listeners) fn(this.snapshot());
   }
@@ -86,17 +89,10 @@ export class Memory {
     return this.projects().find((p) => p.id === name || slugify(p.label) === want) || null;
   }
 
+  /** Memories matching a query, best first — the recall tool. Saved documents are searched by their text too. */
   search(query, limit = 12) {
-    const terms = String(query || '').toLowerCase().split(/\s+/).filter((t) => t.length > 1);
-    const scored = [];
-    for (const n of this.nodes.values()) {
-      if (n.type === 'core') continue;
-      const hay = `${n.label} ${n.summary || ''}`.toLowerCase();
-      let score = 0;
-      for (const t of terms) if (hay.includes(t)) score += n.label.toLowerCase().includes(t) ? 3 : 1;
-      if (score) scored.push([score, n]);
-    }
-    return scored.sort((a, b) => b[0] - a[0]).slice(0, limit).map(([, n]) => n);
+    this._fullIndex ||= buildIndex(this, { content: true });
+    return rank(this, { text: query, index: this._fullIndex, min: 0.25, ratio: 0.15, limit }).map((h) => h.node);
   }
 
   neighbors(id) {
@@ -144,7 +140,7 @@ export class Memory {
   }
 
   /** Add or update a node. `project` is a project name/id; defaults to the active project. */
-  upsert({ label, type = 'topic', summary = '', project, relatedTo = [] }, { save = true } = {}) {
+  upsert({ label, type = 'topic', summary = '', project, relatedTo = [], standing }, { save = true } = {}) {
     label = String(label || '').trim();
     if (!label) return null;
     if (type === 'project') return this.createProject(label, summary);
@@ -161,6 +157,7 @@ export class Memory {
       this.nodes.set(node.id, node);
       this._link(proj.id, node.id, 'contains');
     }
+    if (standing === true) node.standing = true; // honoured in every reply; never unset by a later passing mention
     for (const other of relatedTo) {
       const target = typeof other === 'string' ? this.find(other) : this.find(other.label);
       if (target && target.type !== 'core') this._link(node.id, target.id, other.relation || 'related to');
@@ -273,5 +270,43 @@ export class Memory {
     let text = lines.join('\n');
     if (text.length > maxChars) text = `${text.slice(0, maxChars)}\n  … (more in memory; use the recall tool)`;
     return text || '(nothing remembered yet)';
+  }
+
+  /** Standing preferences: how they want to be addressed and spoken to, honoured whatever the subject. */
+  standing(max = 6) {
+    return [...this.nodes.values()].filter(isStanding).sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, max);
+  }
+
+  /** The memories that bear on this turn: `text` is what was just said, `context` the turns before it. */
+  relevant({ text = '', context = [], limit = 6 } = {}) {
+    this._index ||= buildIndex(this);
+    return rank(this, { text, context, index: this._index, limit, exclude: isStanding });
+  }
+
+  /**
+   * The memory part of the prompt for one turn: standing preferences, the project names, and only the
+   * notes that bear on what is being said, within `budget` characters. Nothing else from the map.
+   */
+  notes({ text = '', context = [], budget = 1200 } = {}) {
+    if (![...this.nodes.values()].some((n) => n.type !== 'core' && n.id !== GENERAL)) return '(nothing remembered yet)';
+    const out = [];
+    const standing = this.standing();
+    if (standing.length) out.push(`Standing preferences (follow these always, unless a standing instruction above says otherwise):\n${standing.map((n) => `- ${n.summary || n.label}`).join('\n')}`);
+    const projects = this.projects().filter((p) => p.id !== GENERAL || p.id === this.activeProject);
+    out.push(`Projects: ${projects.map((p) => `${p.label}${p.id === this.activeProject ? ' (active)' : ''}`).join(', ') || 'none yet'}`);
+    const lines = [];
+    let used = 0;
+    for (const [i, { node }] of this.relevant({ text, context }).entries()) {
+      const project = node.type !== 'project' && node.project !== GENERAL ? this.nodes.get(node.project)?.label : '';
+      const links = i < 2 ? this.neighbors(node.id).filter((x) => x.node.type !== 'core' && x.node.type !== 'project').map((x) => x.node.label).slice(0, 4) : [];
+      const line = `- ${node.type === 'project' ? 'Project ' : `[${node.type}] `}${node.label}${project ? ` (${project})` : ''}${node.summary ? `: ${node.summary}` : ''}${links.length ? ` Linked: ${links.join(', ')}.` : ''}`;
+      if (used + line.length > budget) break;
+      lines.push(line);
+      used += line.length + 1;
+    }
+    out.push(lines.length
+      ? `Notes that may bear on this:\n${lines.join('\n')}`
+      : 'Notes that may bear on this: none. Nothing in memory looks related, so leave memory out of it.');
+    return out.join('\n');
   }
 }

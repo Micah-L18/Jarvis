@@ -24,6 +24,7 @@ button { cursor: pointer; background: none; border: 0; }
 }
 .node-label.major { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; }
 .node-label.focus { font-size: 13px; color: #fff !important; }
+.node-label .detail { text-transform: none; opacity: 0.62; }
 
 /* ---- selection: corner brackets on the node, and a callout line to its card ---- */
 #aim { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 3; opacity: 0; transition: opacity 0.25s; }
@@ -77,6 +78,7 @@ button { cursor: pointer; background: none; border: 0; }
 #card .links { font: 11px/1.7 var(--mono); color: var(--dim); max-height: 130px; overflow: auto; margin-bottom: 12px; }
 #card .links b { color: var(--amber); font-weight: 400; }
 #card .path { font: 10px/1.5 var(--mono); color: var(--dim); word-break: break-all; margin-bottom: 12px; }
+#card .size { font: 11px/1.2 var(--mono); letter-spacing: 0.06em; color: var(--amber); margin: -2px 0 10px; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .btn { font: 10px/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase; padding: 8px 11px; border: 1px solid var(--line); color: var(--amber); background: rgba(255, 140, 20, 0.05); }
 .btn:hover { border-color: var(--amber); background: rgba(255, 140, 20, 0.16); }
@@ -189,6 +191,11 @@ button { cursor: pointer; background: none; border: 0; }
 .v-code pre { margin: 0; padding: 14px 0; font: 12px/1.55 var(--mono); tab-size: 4; }
 .v-gutter { position: sticky; left: 0; flex: none; min-width: 52px; padding: 14px 12px 14px 10px !important; text-align: right; color: rgba(255, 182, 72, 0.3); background: rgba(10, 8, 6, 0.96); border-right: 1px solid rgba(255, 150, 40, 0.14); user-select: none; }
 .v-src { flex: 1; padding: 14px 18px !important; color: rgba(255, 236, 205, 0.88); white-space: pre; }
+.v-src .d-add { color: #9fe8a0; background: rgba(90, 200, 100, 0.08); }
+.v-src .d-del { color: #ff9a8a; background: rgba(255, 100, 80, 0.08); }
+.v-src .d-hunk { color: var(--cyan, #6fd6ff); }
+.v-src .d-file { color: var(--amber); }
+.v-src .d-note { color: var(--dim); }
 
 /* table */
 .v-table-wrap { position: absolute; inset: 0; overflow: auto; }
@@ -234,3 +241,12 @@ button { cursor: pointer; background: none; border: 0; }
 .v-text { overflow: auto; }
 .v-text-head { position: sticky; top: 0; display: flex; justify-content: space-between; align-items: center; padding: 12px 34px; background: rgba(10, 8, 6, 0.95); border-bottom: 1px solid rgba(255, 150, 40, 0.12); font: 10px/1 var(--mono); letter-spacing: 0.24em; text-transform: uppercase; color: var(--orange); }
 .v-prose { max-width: 780px; margin: 0 auto; padding: 20px 34px 40px; font: 15px/1.7 var(--sans); color: rgba(255, 236, 210, 0.9); white-space: pre-wrap; word-break: break-word; }
+
+/* ---- a change to Jarvis's own code, waiting for a yes ---- */
+#change-card { position: fixed; left: 28px; bottom: 28px; width: 260px; padding: 12px 14px; background: var(--glass); border: 1px solid var(--line); border-left: 2px solid var(--amber); z-index: 6; font: 11px/1.5 var(--mono); color: var(--hot); animation: toast-in 0.25s ease-out; }
+#change-card[hidden] { display: none; }
+#change-card .cc-body { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+#change-card .cc-head { font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--amber); margin-bottom: 6px; }
+#change-card .cc-sub { font-size: 10px; color: var(--dim); margin: 4px 0 10px; }
+#change-card .cc-sub.bad { color: #ff7b6b; }
+#change-card .row { gap: 6px; flex-wrap: nowrap; }

@@ -703,7 +703,7 @@ test('agent on the Claude login: the default brain; memory and the settings of t
   memory.createProject('Lisbon Trip', 'April');
   await agent.send('And now?');
   assert.doesNotMatch(turns().at(-1).prompt, /Conversation so far/);
-  assert.match(turns().at(-1).prompt, /Project "Lisbon Trip" \(active\)/);
+  assert.match(turns().at(-1).prompt, /Projects: Lisbon Trip \(active\)/);
 
   // model, effort and the Internet switch take effect on the very next turn
   settings.set({ cloudModel: 'claude-haiku-5-5', effort: 'medium', webSearch: false });

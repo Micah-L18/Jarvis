@@ -397,7 +397,12 @@ export class Viewer {
     const lines = text.split('\n');
     if (lines.length > 1 && lines.at(-1) === '') lines.pop();
     const gutter = h('pre', { class: 'v-gutter' }, lines.map((_, i) => i + 1).join('\n'));
-    const src = h('pre', { class: 'v-src' }, lines.join('\n'));
+    // A diff (Jarvis's own proposed changes among them) gets its added and removed lines marked.
+    const diff = ['diff', 'patch'].includes(extOf(this.current?.path || ''));
+    const mark = (l) => (/^(\+\+\+|---) /.test(l) || /^diff |^index /.test(l) ? 'd-file' : l[0] === '+' ? 'd-add' : l[0] === '-' ? 'd-del' : l.startsWith('@@') ? 'd-hunk' : l[0] === '#' ? 'd-note' : '');
+    const src = diff
+      ? h('pre', { class: 'v-src' }, lines.map((l, i) => h('span', { class: mark(l) || null }, i < lines.length - 1 ? `${l}\n` : l)))
+      : h('pre', { class: 'v-src' }, lines.join('\n'));
     const box = h('div', { class: 'v-code' }, gutter, src);
     this.els.view.replaceChildren(box);
     this._line([`${lines.length.toLocaleString()} line${lines.length === 1 ? '' : 's'}`, this._note()].filter(Boolean).join(' · '));

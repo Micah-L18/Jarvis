@@ -10,7 +10,7 @@ const KINDS = {
   code: [
     'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift',
     'c', 'h', 'cc', 'cpp', 'hpp', 'cs', 'php', 'sh', 'bash', 'zsh', 'ps1', 'lua', 'sql',
-    'css', 'scss', 'less', 'vue', 'svelte', 'yaml', 'yml', 'toml', 'ini', 'xml', 'glsl', 'r',
+    'css', 'scss', 'less', 'vue', 'svelte', 'yaml', 'yml', 'toml', 'ini', 'xml', 'glsl', 'r', 'diff', 'patch',
   ],
   text: ['txt', 'log', 'rtf', 'srt', 'vtt', 'conf', 'cfg', 'env', 'text'],
   csv: ['csv', 'tsv'],

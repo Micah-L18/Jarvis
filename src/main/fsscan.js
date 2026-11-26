@@ -11,34 +11,53 @@ const SKIP = new Set([
 
 export { kindOf };
 
+// Children shown on the map, folders first, and how many files and folders were left out (dot files,
+// SKIP): a folder with any left out is not wholly listed, so its size has to be measured.
 async function readChildren(dir) {
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
   } catch {
-    return [];
+    return { list: [], hidden: 0 };
   }
-  return entries
-    .filter((e) => !e.name.startsWith('.') && !SKIP.has(e.name) && (e.isDirectory() || e.isFile()))
-    .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+  let hidden = 0;
+  const list = entries.filter((e) => {
+    if (!e.isDirectory() && !e.isFile()) return false;
+    if (e.name.startsWith('.') || SKIP.has(e.name)) { hidden++; return false; }
+    return true;
+  }).sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+  return { list, hidden };
+}
+
+/** Sizes in bytes of the listed files, a few at a time (the stats run off the main thread). */
+async function addBytes(files) {
+  for (let i = 0; i < files.length; i += 48) {
+    await Promise.all(files.slice(i, i + 48).map(async (node) => {
+      try { node.bytes = (await fs.lstat(node.id)).size; } catch { node.bytes = 0; }
+    }));
+  }
 }
 
 /**
- * @returns {{root:string, nodes:Array<{id,name,parent,dir,kind,depth,more}>, truncated:boolean}}
- * `more` on a folder = number of children that were not included (depth or count limit).
+ * @returns {{root:string, nodes:Array<{id,name,parent,dir,kind,depth,more,hidden?,bytes?}>, truncated:boolean}}
+ * `more` on a folder = number of children that were not included (depth or count limit); `hidden` =
+ * files and folders inside it that the map never shows (dot files, SKIP). With `bytes`, files carry their size
+ * (a stat each: the Files map wants it, a search through thousands of files does not).
  */
-export async function scan(root, { maxDepth = 3, maxNodes = 3500, perDir = 60, baseDepth = 0, includeRoot = true } = {}) {
+export async function scan(root, { maxDepth = 3, maxNodes = 3500, perDir = 60, baseDepth = 0, includeRoot = true, bytes = false } = {}) {
   root = path.resolve(root);
   const nodes = [];
   if (includeRoot) nodes.push({ id: root, name: path.basename(root) || root, parent: null, dir: true, kind: 'dir', depth: baseDepth, more: 0 });
   const byId = new Map(nodes.map((n) => [n.id, n]));
   let queue = [{ dir: root, depth: baseDepth }];
   let truncated = false;
+  const files = [];
   while (queue.length) {
     const next = [];
     for (const { dir, depth } of queue) {
-      const children = await readChildren(dir);
+      const { list: children, hidden } = await readChildren(dir);
       const parent = byId.get(dir);
+      if (parent && hidden) parent.hidden = hidden;
       if (depth - baseDepth >= maxDepth) {
         if (parent) parent.more = children.length;
         continue;
@@ -53,6 +72,7 @@ export async function scan(root, { maxDepth = 3, maxNodes = 3500, perDir = 60, b
         byId.set(id, node);
         taken++;
         if (isDir) next.push({ dir: id, depth: depth + 1 });
+        else files.push(node);
       }
       if (taken < children.length) {
         truncated = true;
@@ -61,12 +81,13 @@ export async function scan(root, { maxDepth = 3, maxNodes = 3500, perDir = 60, b
     }
     queue = next;
   }
+  if (bytes) await addBytes(files);
   return { root, nodes, truncated };
 }
 
 /** Children of one folder (used when the user clicks a folder to open it further). */
 export async function expand(dir, depth, { maxNodes = 400 } = {}) {
-  const result = await scan(dir, { maxDepth: 1, maxNodes, perDir: maxNodes, baseDepth: depth, includeRoot: false });
+  const result = await scan(dir, { maxDepth: 1, maxNodes, perDir: maxNodes, baseDepth: depth, includeRoot: false, bytes: true });
   return result.nodes;
 }
 

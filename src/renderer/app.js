@@ -8,12 +8,14 @@ import { Stage, screenPass, steadyBloom, setCaptionBand, easeCaptionBand } from 
 import { Graph3D } from './graph.js';
 import { Voice, speechStatus } from './voice.js';
 import { captionParts } from './captions.js';
+import { changeCard } from './changecard.js';
 import { Panel, h } from './panel.js';
 import { claudeLogin, brainChip } from './brain.js';
 import { wireMedia } from './media.js';
 import { Viewer } from './viewer.js';
 import { InteractionGuard, pickMention, expandToPath } from './focus.js';
 import { kindLabel } from '../main/filekind.js';
+import { sizeScale, folderTotals, sizeText, formatBytes } from './sizes.js';
 
 const api = window.jarvis;
 const $ = (id) => document.getElementById(id);
@@ -108,15 +110,31 @@ const TYPE_COLOR = {
   preference: '#ff7eb6', task: '#ff5a3c', document: '#f2f2ff',
 };
 
+// A saved document's marker grows a little with its length (much less than on the Files map: they are all small).
+const docBytes = new Map(); // file -> bytes
+const mindMark = (n, activeProject) => (n.type === 'core' ? 13 : n.type === 'project' ? (n.id === activeProject ? 10 : 7.5)
+  : n.type === 'document' ? 4.4 * (1 + (sizeScale(docBytes.get(n.file)) - 1) * 0.4) : 3.6 + Math.min(n.weight || 1, 6) * 0.45);
+function measureDocuments(nodes) {
+  const docs = nodes.filter((n) => n.type === 'document' && n.file);
+  if (!docs.length) return;
+  api.invoke('fs:bytes', docs.map((n) => n.file)).then((sizes) => {
+    docs.forEach((n, i) => { if (sizes?.[i] != null) docBytes.set(n.file, sizes[i]); });
+    const active = state.memory.activeProject;
+    mind.restyle((node) => (node.data.type === 'document' ? { size: mindMark(node.data, active), detail: docBytes.has(node.data.file) ? formatBytes(docBytes.get(node.data.file)) : '' } : null));
+  }, () => {});
+}
+
 function buildMind() {
   const { nodes, edges, activeProject } = state.memory;
+  measureDocuments(nodes);
   const byId = new Map(nodes.map((n) => [n.id, n]));
   mind.setData(
     nodes.map((n) => ({
       id: n.id,
       label: n.label,
       color: TYPE_COLOR[n.type] || TYPE_COLOR.topic,
-      size: n.type === 'core' ? 13 : n.type === 'project' ? (n.id === activeProject ? 10 : 7.5) : n.type === 'document' ? 5 : 3.6 + Math.min(n.weight || 1, 6) * 0.45,
+      size: mindMark(n, activeProject),
+      detail: n.type === 'document' && docBytes.has(n.file) ? formatBytes(docBytes.get(n.file)) : '',
       showLabel: n.type === 'core' || n.type === 'project' || nodes.length < 40,
       pinned: n.type === 'core',
       hub: n.type === 'core' || n.type === 'project',
@@ -144,18 +162,54 @@ const KIND_COLOR = {
 let fileNodes = [];
 let filesLoaded = false;
 let filesLoading = null;
+// Marker sizes follow bytes: a file by its own size, a folder by everything inside it (summed from
+// what the map lists, or measured in the background by main: dirSizes, id -> {bytes, files, complete}).
+const dirSizes = new Map();
+let fileTotals = new Map();
+const FILE_MARK = 2.1, DIR_MARK = 3.0; // smallest markers (1 KB and under); a diamond draws smaller than a dot of the same size
+const fileMark = (n) => (!n.parent ? 12 : (n.dir ? DIR_MARK : FILE_MARK) * sizeScale(n.dir ? fileTotals.get(n.id)?.bytes : n.bytes));
+const fileDetail = (n) => sizeText(n, fileTotals.get(n.id));
+
+/**
+ * Ask main to measure the folders the map cannot total from what it lists (results arrive as
+ * 'fsize'). Each request replaces the last, so it names every folder still unmeasured, `first` first.
+ */
+function measureFolders(first = []) {
+  const need = (n) => n.dir && !fileTotals.get(n.id)?.exact && !dirSizes.get(n.id)?.complete;
+  const lead = new Set(first.filter(need).map((n) => n.id));
+  const rest = fileNodes.filter((n) => need(n) && !lead.has(n.id)).sort((a, b) => Number(!a.parent) - Number(!b.parent)); // the root last: its walk then mostly reuses its folders'
+  const want = [...lead, ...rest.map((n) => n.id)];
+  if (want.length) api.invoke('fs:sizes', want);
+}
+
+let sizeTimer = 0;
+api.on('fsize', (batch) => {
+  for (const r of batch) if (r && typeof r.id === 'string') dirSizes.set(r.id, r);
+  if (!sizeTimer) sizeTimer = setTimeout(refreshFileSizes, 150);
+});
+/** New totals: markers ease to their sizes, and an open folder card shows the new figure. */
+function refreshFileSizes() {
+  sizeTimer = 0;
+  if (!fileNodes.length) return;
+  fileTotals = folderTotals(fileNodes, dirSizes);
+  files.restyle((node) => ({ size: fileMark(node.data), detail: fileDetail(node.data) }));
+  if (selected?.graph === files) {
+    const line = $('card').querySelector('.size');
+    const text = fileDetail(selected.node.data);
+    if (line && line.textContent !== text) line.textContent = text;
+  }
+}
 
 function buildFiles() {
-  const kids = new Map();
-  for (const n of fileNodes) if (n.parent) kids.set(n.parent, (kids.get(n.parent) || 0) + 1);
+  fileTotals = folderTotals(fileNodes, dirSizes);
   files.setData(
     fileNodes.map((n) => {
-      const c = kids.get(n.id) || 0;
       return {
         id: n.id,
         label: n.name,
         color: n.parent ? KIND_COLOR[n.kind] || KIND_COLOR.other : '#ffffff',
-        size: !n.parent ? 12 : n.dir ? 3.2 + Math.min(6, Math.log2(1 + c + n.more) * 1.1) : 2.2,
+        size: fileMark(n),
+        detail: fileDetail(n),
         shape: n.dir ? 1 : 0, // folders are diamonds, files are dots
         showLabel: n.depth <= 1 && (n.dir || fileNodes.length < 200),
         pinned: !n.parent,
@@ -176,7 +230,9 @@ async function loadFiles(force = false) {
     filesLoading = api.invoke('fs:scan').then((res) => {
       fileNodes = res.nodes;
       files.byId = new Map(); // fresh layout for a fresh scan
+      dirSizes.clear();
       buildFiles();
+      measureFolders();
       filesLoaded = true;
       filesLoading = null;
       setStatus(`${res.nodes.length.toLocaleString()} files and folders mapped${res.truncated ? ' — click a folder to open it further' : ''}`, 5000);
@@ -194,7 +250,9 @@ async function expandFolder(node) {
   fileNodes.push(...fresh);
   node.more = 0;
   buildFiles();
-  files.setFocus(node.id);
+  if (selected?.graph === files && selected.node.id === node.id) select(files.byId.get(node.id), files); // its card: no "more inside" now
+  else files.setFocus(node.id);
+  measureFolders(fresh);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +455,7 @@ function select(node, graph) {
     card.replaceChildren(...[
       h('div', { class: 'kind' }, d.type === 'core' ? 'core' : d.type),
       h('h2', {}, d.label),
+      d.type === 'document' && docBytes.has(d.file) && h('div', { class: 'size' }, formatBytes(docBytes.get(d.file))),
       d.summary && h('p', {}, d.summary),
       d.type === 'core' && h('p', {}, 'Everything I know hangs off this point. Projects group what belongs together.'),
       links.length > 0 && h('div', { class: 'links' }, links.slice(0, 30).map((n) => h('div', {}, '— ', h('b', {}, n.label)))),
@@ -411,6 +470,7 @@ function select(node, graph) {
     card.replaceChildren(...[
       h('div', { class: 'kind' }, d.dir ? 'folder' : kindLabel(d.kind)),
       h('h2', {}, d.name),
+      h('div', { class: 'size' }, fileDetail(d)),
       h('div', { class: 'path' }, d.id),
       d.dir && d.more > 0 && h('p', {}, `${d.more} more item${d.more === 1 ? '' : 's'} inside not shown yet.`),
       h('div', { class: 'row' },
@@ -533,7 +593,7 @@ async function applyPoint({ map, id, chain, quiet, soft }) {
   if (view !== map) setView(map);
   if (map === 'files') {
     await loadFiles();
-    if (chain?.length && (await expandToPath(fileNodes, chain, (dir, depth) => api.invoke('fs:expand', dir, depth)))) buildFiles();
+    if (chain?.length && (await expandToPath(fileNodes, chain, (dir, depth) => api.invoke('fs:expand', dir, depth)))) { buildFiles(); measureFolders(); }
   }
   let node = graph.byId.get(id);
   for (let i = 0; !node && map === 'mind' && i < 10; i++) { // a memory made this turn may still be on its way to the window
@@ -780,7 +840,25 @@ api.on('ui', (e) => {
   else if (e.type === 'show_file') { if (generating) pointedIn = turn; }
   else if (e.type === 'document') toast(`Saved to ${e.project}: ${e.title}`);
   else if (e.type === 'learned') toast(`Filed in memory: ${e.labels.join(', ')}`);
+  else if (e.type === 'say') speakAside(e.text);
+  else if (e.type === 'self_change') { state.selfChange = e.status; changes.update(e.status); panel.render(); }
+  else if (e.type === 'rescan_files') { filesLoaded = false; if (view === 'files') loadFiles(true); }
 });
+
+// Something Jarvis says outside a turn (a change to its code is ready): after the reply in progress, never over the user.
+const changes = changeCard(api, { toast });
+changes.update(state.selfChange);
+const asides = [];
+function speakAside(text) {
+  if (text) asides.push(text);
+  if (!asides.length) return;
+  if (generating || voiceState === 'hearing') { setTimeout(() => speakAside(), 800); return; }
+  const say = asides.splice(0).join(' ');
+  followVoice();
+  showJarvis(say);
+  voice.say(`${say} `);
+  voice.flush();
+}
 api.on('memory', (snapshot) => {
   state.memory = snapshot;
   const keep = selected?.graph === mind ? selected.node.id : null;
@@ -818,6 +896,7 @@ window.addEventListener('keydown', (e) => {
     else if (viewer.isOpen) viewer.close();
     else if (selected) select(null);
     else if (generating || voice.speaking) cutOff();
+    else if (state.selfChange?.job?.state === 'working') api.invoke('selfchange:discard').then((t) => toast(t)); // Esc with nothing else going on stops a change to its code
     return;
   }
   if (e.key === 'Tab' && !typing()) { e.preventDefault(); panel.toggle(); return; }
@@ -912,7 +991,7 @@ window.__jarvis = { setView, mind, files, voice, orb, select, sendToJarvis, pane
     await api.invoke('speech:warm', s.voice.tts);
     setStatus('');
     const hour = new Date().getHours();
-    const greeting = `Good ${hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening'}, ${s.address}. Systems are online.`;
+    const greeting = `Good ${hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening'}, ${s.address}. ${state.selfChangeNotice ? `${state.selfChangeNotice.replace(/[.!]?$/, '.')}` : 'Systems are online.'}`;
     followVoice();
     showJarvis(greeting);
     voice.say(greeting);

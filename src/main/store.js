@@ -30,6 +30,9 @@ export const DEFAULT_SETTINGS = {
   startFullscreen: true,
   mcpServers: [], // {id, name, type:'stdio'|'http', command, args, env, url, headers, enabled}
   disabledSkills: [],
+  instructions: [], // the user's standing instructions, put above the persona's defaults (see selfchange.js)
+  selfChanges: [], // changes Jarvis applied to its own code: {branch, request, summary, date, before, after, mode, undone?}
+  selfChangeNotice: '', // said once on the next start, after a change was applied or undone
 };
 
 export function readJson(file, fallback) {

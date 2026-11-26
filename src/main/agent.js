@@ -5,6 +5,7 @@ import { mentions } from './memory.js';
 import { runAnthropicTurn, extractJsonAnthropic, describeError, isAbort } from './llm/anthropic.js';
 import { runOllamaTurn, extractJsonOllama, describeOllamaError } from './llm/ollama.js';
 import { describeCliError } from './llm/claudecli.js';
+import { selfTools, instructionsSection, selfPersona, noSelfChange } from './selfchange.js';
 
 function persona({ userName, address }) {
   const who = userName || 'the user';
@@ -40,18 +41,30 @@ Files
 - "Transcribe" a file: for recordings and video use transcribe_media; for PDFs, Word documents, slides, spreadsheets, web pages and text use transcribe_document; for a picture, read the text off it yourself with read_file and save it with save_document, titled "<file name> — transcript" with for_file set. The transcript lands in the viewer's Text tab. Then say one line, such as "Transcript's in the Text tab, and saved." Never read a transcript out.
 
 Memory
-- Your long-term memory is a mind map they can see and edit. A background process files each conversation into it automatically, so you don't need to call remember for ordinary talk — only when asked to remember something specific.
-- What you currently know is listed under "What you know" below. If they ask you to forget something, use forget and confirm briefly. If something isn't in memory, say you don't have it rather than inventing it.`;
+- Your long-term memory is a mind map they can see and edit. A background process files what lasts from each conversation into it automatically, so you don't need to call remember for ordinary talk — only when asked to remember something specific.
+- "What you know" below holds their standing preferences, which you always follow, the names of their projects, and only the notes that looked related to what was just said. The notes are picked by matching words, so some may be off the point: use one only when it bears directly on what they just said or asked.
+- Never volunteer remembered details, projects or people they didn't bring up, and don't steer the conversation toward things you know about them. A sum, a joke or small talk needs no memory at all. If you're not sure a note is relevant, leave it out.
+- If they refer to something you don't see in the notes — "that thing we discussed", a name, an earlier decision — call recall before answering. If it isn't in memory, say you don't have it rather than inventing it.
+- If they ask you to forget something, use forget and confirm briefly.`;
 }
 
 const EXTRACT_SYSTEM = `You maintain a personal assistant's long-term memory, stored as a mind map. You are given the latest exchange between the user and the assistant, plus the labels already in memory. Decide what, if anything, is worth keeping.
 
-Keep durable things: people and their roles, teams, goals, decisions, preferences, facts about the user's life or work, tasks they intend to do, topics they are exploring. Skip pleasantries, one-off questions with no lasting relevance, and anything about how the assistant itself works. Most small talk produces no nodes at all — an empty list is a good answer.
+Everything you keep can be brought up in later conversations, so keep only what the assistant would be glad to know weeks from now: people in the user's life and their roles, teams, ongoing projects and their goals, decisions made, deadlines and dates, tasks the user means to do, lasting preferences, and facts about the user's life or work that will still be true next month.
+
+Do not keep:
+- passing remarks and what happened today (what they ate, the weather, how they slept, a film they mentioned once), unless they say it matters
+- general knowledge, answers to one-off questions, sums, jokes, small talk, greetings and thanks
+- what the assistant said or offered, guesses, and anything about how the assistant works
+- something already in memory with nothing new to add
+- requests about how the assistant should behave or its settings, when the exchange says they were saved as a standing instruction or a setting was changed: those are kept elsewhere
+Most exchanges produce no nodes at all — an empty list is the usual answer.
 
 Rules
-- At most 6 nodes. Labels are 1-4 words, in title case, and should match an existing label exactly when it is the same thing (so it gets updated instead of duplicated).
+- At most 4 nodes. Labels are 1-4 words, in title case, and should match an existing label exactly when it is the same thing (so it gets updated instead of duplicated).
 - summary is one sentence stating the fact, written so it makes sense on its own later.
 - type is one of: topic, person, fact, preference, task.
+- standing is true only for a preference about how the assistant should treat the user in every conversation, whatever the subject: what to call them, units, how long or formal answers should be, language, things never to bring up. Everything else, including tastes and habits ("likes flat whites", "prefers aisle seats"), is false.
 - links connect two labels (new or existing) with a short relation like "coaches", "part of", "prefers", "due before".
 - project: the name of the existing project this exchange belongs to; or a short new project name if the user has clearly started an ongoing effort that has no project yet (a team, a research question, an event to plan); otherwise an empty string.`;
 
@@ -66,11 +79,12 @@ const EXTRACT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['label', 'type', 'summary'],
+        required: ['label', 'type', 'summary', 'standing'],
         properties: {
           label: { type: 'string' },
           type: { type: 'string', enum: ['topic', 'person', 'fact', 'preference', 'task'] },
           summary: { type: 'string' },
+          standing: { type: 'boolean' },
         },
       },
     },
@@ -123,12 +137,18 @@ export class Agent {
     this.active?.abort();
   }
 
-  buildSystem() {
+  /**
+   * The system prompt, in a stable half and a per-turn half. The per-turn half carries only the memories
+   * that bear on `text` (what was just said) given `context` (the turns before it); by default, the latest exchange on record.
+   */
+  buildSystem({ text, context } = {}) {
     const s = this.d.settings.get();
     const skills = this.d.skills.list().filter((k) => !s.disabledSkills.includes(k.id));
     const mcp = this.d.mcp.status().filter((c) => c.status === 'connected');
     const stable = [
+      instructionsSection(s.instructions, s.userName || 'the user'), // the user's own standing instructions come first and win
       persona(s),
+      selfPersona({ code: Boolean(this.d.selfChange?.available) }),
       skills.length
         ? `Skills\nYou have these skills. Before doing work one of them covers, call load_skill with its name and follow what it says.\n${skills.map((k) => `- ${k.name}: ${k.description}`).join('\n')}`
         : '',
@@ -139,15 +159,26 @@ export class Agent {
     ].filter(Boolean).join('\n\n');
     const shown = this.d.onScreen?.();
     const screen = shown?.path ? `\n\nOn screen now: ${shown.name || shown.path} (${shown.kind || 'file'}) at ${shown.path}` : '';
-    const volatile = `Right now it is ${new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}.${screen}\n\nWhat you know\n${this.d.memory.digest()}`;
+    const change = this.d.selfChange?.note?.() ? `\n\n${this.d.selfChange.note()}` : '';
+    const volatile = `Right now it is ${new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}.${screen}${change}\n\nWhat you know\n${this.memoryNotes(text, context)}`;
     return { stable, volatile };
+  }
+
+  memoryNotes(text, context) {
+    const { memory } = this.d;
+    if (text === undefined) {
+      context = memory.recentTurns(6);
+      text = context.at(-1)?.role === 'user' ? context.pop().text : '';
+    }
+    return memory.notes({ text, context: context || [] });
   }
 
   tools() {
     const s = this.d.settings.get();
     const { memory, skills, settings, ui, fsRoot, openPath, media, transcribe, transcribeSpeed } = this.d;
     const ctx = { memory, skills, settings, ui, fsRoot, openPath, media, transcribe, transcribeSpeed, signal: () => this.active?.signal };
-    const tools = [...builtinTools(ctx, { localWeb: s.webSearch && s.provider === 'local' }), ...this.d.mcp.tools()];
+    const self = selfTools({ settings, setSettings: this.d.setSettings || ((p) => settings.set(p)), env: this.d.selfEnv, selfChange: this.d.selfChange || noSelfChange, rescanFiles: this.d.rescanFiles });
+    const tools = [...builtinTools(ctx, { localWeb: s.webSearch && s.provider === 'local' }), ...self, ...this.d.mcp.tools()];
     return tools.sort((a, b) => a.name.localeCompare(b.name));
   }
 
@@ -161,9 +192,11 @@ export class Agent {
     const { settings, memory } = this.d;
     const s = settings.get();
     let spoken = '';
+    const used = new Set(); // tools called this turn
     const emit = (event) => {
       if (this.turnId !== seq) return;
       if (event.type === 'delta') spoken += event.text;
+      if (event.type === 'tool' && event.name) used.add(event.name);
       this.d.emit({ ...event, turn: id });
     };
 
@@ -176,7 +209,7 @@ export class Agent {
     let modelText = userText;
     if (history.at(-1)?.role === 'user') modelText = `${history.pop().text}\n${userText}`;
     memory.logTurn('user', userText);
-    const system = this.buildSystem();
+    const system = this.buildSystem({ text: modelText, context: history });
     const tools = this.tools();
     this.d.emit({ type: 'start', turn: id });
     const brain = this.brain();
@@ -215,12 +248,13 @@ export class Agent {
     if (spoken.trim() && !aborted && !mentions(spoken, gone)) memory.logTurn('assistant', spoken.trim());
     if (error) this.d.emit({ type: 'error', text: error, turn: id });
     this.d.emit({ type: 'done', turn: id, aborted, text: spoken.trim() });
-    if (spoken.trim() && !error && !gone.length) this.learn(userText, spoken.trim()).catch(() => {});
+    const keptElsewhere = ['update_instructions', 'change_setting'].filter((n) => used.has(n));
+    if (spoken.trim() && !error && !gone.length) this.learn(userText, spoken.trim(), { keptElsewhere }).catch(() => {});
     return { text: spoken.trim(), aborted, error };
   }
 
   /** Background: turn the latest exchange into mind-map nodes. */
-  async learn(userText, assistantText) {
+  async learn(userText, assistantText, { keptElsewhere = [] } = {}) {
     const { settings, memory } = this.d;
     const s = settings.get();
     const forgotBefore = memory.forgotten.length;
@@ -231,7 +265,7 @@ Existing labels: ${existing.filter((n) => n.type !== 'project').map((n) => n.lab
 
 Latest exchange
 User: ${userText}
-Assistant: ${assistantText}`;
+Assistant: ${assistantText}${keptElsewhere.length ? `\n(In this exchange the assistant ${keptElsewhere.map((n) => (n === 'change_setting' ? 'changed a setting' : 'saved a standing instruction')).join(' and ')}; that is kept elsewhere, so do not keep it as a memory.)` : ''}`;
     let result;
     const brain = this.brain();
     if (brain === 'local') {

@@ -9,10 +9,12 @@ import { Skills } from './skills.js';
 import { McpHub } from './mcp.js';
 import { Agent } from './agent.js';
 import { scan, expand, isInside } from './fsscan.js';
+import { DirSizer } from './dirsize.js';
 import { CLOUD_MODELS } from './llm/anthropic.js';
 import { listOllamaModels } from './llm/ollama.js';
 import { ClaudeCli } from './llm/claudecli.js';
 import { registerScheme, serveFiles, allowedPath } from './fileproto.js';
+import { SelfChange, editInstructions } from './selfchange.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const windowed = process.argv.includes('--windowed');
@@ -28,6 +30,9 @@ let skills;
 let mcp;
 let agent;
 let claude;
+let selfChange;
+let startNotice = ''; // what Jarvis changed about itself before this start, said in the greeting
+const sizer = new DirSizer();
 
 const send = (event, payload) => {
   if (win && !win.isDestroyed()) win.webContents.send(`jarvis:${event}`, payload);
@@ -150,22 +155,43 @@ function publicState() {
     fsRoot: fsRoot(),
     dataDir: app.getPath('userData'),
     platform: process.platform,
+    selfChange: selfChange?.status(),
+    selfChangeNotice: startNotice,
   };
+}
+
+/** Every settings change, from the controls or by voice, goes through here, so the window and the brain follow at once. */
+async function applySettings(patch) {
+  const before = JSON.stringify(settings.get().mcpServers);
+  const claudePath = settings.get().claudePath;
+  settings.set(patch);
+  if (JSON.stringify(settings.get().mcpServers) !== before) mcp.sync(settings.get().mcpServers);
+  send('settings', publicState());
+  if (settings.get().claudePath !== claudePath) await claude.check({ again: true });
+  agent.prewarm(); // model, effort, the Internet switch, the brain itself: whatever changed, the next turn starts ready
+  return settings.get();
 }
 
 function registerIpc() {
   const handle = (name, fn) => ipcMain.handle(`jarvis:${name}`, (_e, ...args) => fn(...args));
 
   handle('state', publicState);
-  handle('settings:set', async (patch) => {
-    const before = JSON.stringify(settings.get().mcpServers);
-    const claudePath = settings.get().claudePath;
-    settings.set(patch);
-    if (JSON.stringify(settings.get().mcpServers) !== before) mcp.sync(settings.get().mcpServers);
-    send('settings', publicState());
-    if (settings.get().claudePath !== claudePath) await claude.check({ again: true });
-    agent.prewarm(); // model, effort, the Internet switch, the brain itself: whatever changed, the next turn starts ready
-    return settings.get();
+  handle('settings:set', (patch) => applySettings(patch));
+  // Standing instructions from the controls: the same checks and caps as by voice.
+  handle('instructions:edit', async (edit) => {
+    const r = editInstructions(settings.get().instructions, edit || {});
+    if (r.error) return { error: r.error };
+    await applySettings({ instructions: r.list });
+    return { list: r.list };
+  });
+  // Changes to Jarvis's own code (see selfchange.js): the controls' buttons and the change card.
+  handle('selfchange:apply', (opts) => selfChange.apply(opts || {}));
+  handle('selfchange:discard', () => selfChange.discard());
+  handle('selfchange:undo', () => selfChange.undo());
+  handle('selfchange:show', () => {
+    const file = selfChange.status().job?.diffFile;
+    if (file) send('ui', { type: 'show_file', path: file });
+    return Boolean(file);
   });
   handle('secrets:set', ({ anthropicKey }) => {
     writeSecrets({ ...readSecrets(), anthropicKey: String(anthropicKey || '').trim() });
@@ -219,8 +245,22 @@ function registerIpc() {
 
   handle('ollama:models', () => listOllamaModels(settings.get().ollamaUrl).catch(() => null));
 
-  handle('fs:scan', () => scan(fsRoot(), { maxDepth: settings.get().fsDepth, maxNodes: 3500 }));
+  handle('fs:scan', () => scan(fsRoot(), { maxDepth: settings.get().fsDepth, maxNodes: 3500, bytes: true }));
   handle('fs:expand', (dir, depth) => (isInside(fsRoot(), dir) ? expand(dir, depth) : []));
+  // Folder sizes for the Files map, measured in the background and sent back a batch at a time.
+  handle('fs:sizes', (dirs) => {
+    const root = fsRoot();
+    const out = [];
+    let timer = null;
+    const flush = () => { timer = null; if (out.length) send('fsize', out.splice(0)); };
+    sizer.measure((Array.isArray(dirs) ? dirs : []).filter((d) => typeof d === 'string' && isInside(root, d)), (id, r) => {
+      out.push({ id, ...r });
+      if (!timer) timer = setTimeout(flush, 120);
+    }).then(() => { clearTimeout(timer); flush(); });
+    return true;
+  });
+  // Sizes of a few files Jarvis may show (its own documents on the Mind map).
+  handle('fs:bytes', (paths) => Promise.all((Array.isArray(paths) ? paths : []).slice(0, 500).map((p) => (viewable(p) ? fs.promises.stat(p).then((st) => st.size, () => null) : null))));
   handle('fs:open', (p) => (viewable(p) ? shell.openPath(p) : 'outside root'));
   handle('fs:reveal', (p) => {
     if (viewable(p)) shell.showItemInFolder(p);
@@ -228,6 +268,7 @@ function registerIpc() {
   handle('fs:pickRoot', async () => {
     const res = await dialog.showOpenDialog(win, { title: 'Choose the folder Jarvis can see', defaultPath: fsRoot(), properties: ['openDirectory'] });
     if (res.canceled || !res.filePaths[0]) return null;
+    sizer.stop();
     settings.set({ fsRoot: res.filePaths[0] });
     send('settings', publicState());
     return res.filePaths[0];
@@ -290,6 +331,22 @@ app.whenReady().then(async () => {
     onStatus: () => send('settings', publicState()),
     log: process.env.JARVIS_DEBUG ? (line) => console.error(`[claude] ${line}`) : undefined,
   });
+  selfChange = new SelfChange({
+    appPath: app.getAppPath(),
+    settings, claude,
+    workRoot: path.join(app.getPath('cache'), 'jarvis-self-change'), // per user, and outside the data folder: the coding agent never sees it
+    diffDir: path.join(memory.projectsDir, 'jarvis-changes'), // inside what the viewer may show
+    ui: (event) => send('ui', event),
+    say: (text) => { memory.logTurn('assistant', text); send('ui', { type: 'say', text }); },
+    restart: () => { app.relaunch(); app.quit(); },
+    isBusy: () => Boolean(agent?.active),
+    log: process.env.JARVIS_DEBUG ? (line) => console.error(`[self] ${line}`) : undefined,
+  });
+  startNotice = settings.get().selfChangeNotice || '';
+  if (startNotice) {
+    settings.set({ selfChangeNotice: '' });
+    memory.logTurn('assistant', `(Restarted.) ${startNotice}`);
+  }
   agent = new Agent({
     settings, memory, skills, mcp, claude, getApiKey, fsRoot,
     emit: (event) => send('chat', event),
@@ -299,6 +356,10 @@ app.whenReady().then(async () => {
     media,
     transcribe,
     transcribeSpeed: () => transcribeSpeed,
+    selfChange,
+    setSettings: applySettings,
+    selfEnv: () => ({ claudeReady: claude.status().state === 'ready', hasApiKey: Boolean(getApiKey()) }),
+    rescanFiles: () => { sizer.stop(); send('ui', { type: 'rescan_files' }); },
   });
   memory.onChange((snapshot) => send('memory', snapshot));
   serveFiles(protocol, viewRoots);

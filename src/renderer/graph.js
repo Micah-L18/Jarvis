@@ -12,9 +12,12 @@ const MARK_MIN = 2.6;
 const MARK_KNEE = 30;
 const MARK_MAX = 48;
 const MARK_DETAIL = 12; // from about this size a marker has room for its rings
+const BIG_MARK = 15; // from this size (CSS px) labels keep clear of a marker even if it has no label of its own
 const FOCUS_GROW = 1.5;
 const HOVER_GROW = 1.25;
 const DIAMOND = 0.72; // a diamond's flats sit this much closer in than a circle of the same marker
+const RESIZE_RATE = 5; // how quickly a marker eases to a new size (per second)
+const BORN = 0.35; // a node added to a map already up grows in from this fraction of its size
 const KEEL = 0.4; // slope of the upturned cone the map is taken to sit in (see Graph3D.keel)
 
 function markPx(size, height, dist) {
@@ -208,6 +211,7 @@ export class Graph3D {
     this.inHand = false; // set while the view is being turned by hand: labels then let markers swing past (see LABEL_HOLD)
     this.labelsShown = false;
     this.time = 0;
+    this.sizing = false; // some marker is easing to a new size
     // Extent of the layout, refreshed whenever it moves: furthest node from the centre, furthest
     // from the vertical axis, the lowest and highest node, and the keel — the tip of the upturned
     // cone that just holds every node. Seen from a little above, a node far out from the axis reads
@@ -260,6 +264,7 @@ export class Graph3D {
     if (this.opts.flatten) this.sim.force('flatten', forceY(0).strength(this.opts.flatten));
     this.labels = new Map(); // id -> {id, el, w, rank, slot, put, left, wait, held, dx, dy, fade, fresh, x0, x1, y, h, op, tx, ty, on, sx, sy, dist, ring, block}
     this.labelOrder = []; // the same records, most important first
+    this.bigBoxes = []; // scratch: boxes of large unlabelled markers
     this.labelKept = []; // scratch: the boxes no label may print over — markers, then labels as they are placed
     this.cardBox = { x0: 0, x1: 0, y: 0, h: -1 }; // the node card, while it is up (see keepClear)
   }
@@ -271,7 +276,7 @@ export class Graph3D {
 
   /**
    * @param nodes [{id, label, color:'#rrggbb', size, showLabel, pinned, near?:id, shape?: 0 round | 1 diamond,
-   *   hub?: draw the second, outer ring, data}]
+   *   hub?: draw the second, outer ring, detail?: a few words added to its label while hovered, data}]
    * @param links [{source:id, target:id, distance?, strength?}]
    * Positions of nodes that already exist are kept, so the map evolves instead of reshuffling.
    */
@@ -281,7 +286,10 @@ export class Graph3D {
     this.nodes = nodes.map((n) => {
       const prev = old.get(n.id);
       const node = { ...n, color: new THREE.Color(n.color) };
-      if (prev) Object.assign(node, { x: prev.x, y: prev.y, z: prev.z, vx: 0, vy: 0, vz: 0 });
+      // vis is the size drawn: it eases toward size, so a marker that changes size grows or shrinks smoothly
+      if (prev) Object.assign(node, { x: prev.x, y: prev.y, z: prev.z, vx: 0, vy: 0, vz: 0, vis: prev.vis });
+      else node.vis = old.size ? n.size * BORN : n.size;
+      if (node.vis !== node.size) this.sizing = true;
       this.byId.set(node.id, node);
       return node;
     });
@@ -354,7 +362,7 @@ export class Graph3D {
       node.lit = lit;
       node.index = i;
       col[i * 3] = node.color.r; col[i * 3 + 1] = node.color.g; col[i * 3 + 2] = node.color.b;
-      size[i] = node.size * (node.id === focus ? FOCUS_GROW : node.id === hover ? HOVER_GROW : 1);
+      size[i] = node.vis * (node.id === focus ? FOCUS_GROW : node.id === hover ? HOVER_GROW : 1);
       ring[i] = !lit ? -1 : node.id === focus ? 2 : node.id === hover || node.hub ? 1 : 0;
       alpha[i] = lit ? 1 : 0.16;
     }
@@ -373,6 +381,40 @@ export class Graph3D {
       lcol[o + 3] = b.color.r * k; lcol[o + 4] = b.color.g * k; lcol[o + 5] = b.color.b * k;
     }
     cols.needsUpdate = true;
+  }
+
+  /**
+   * Change sizes and label details without rebuilding the map: fn(node) returns {size?, detail?}.
+   * Markers ease to their new sizes.
+   */
+  restyle(fn) {
+    let words = false;
+    for (const node of this.nodes) {
+      const p = fn(node);
+      if (!p) continue;
+      if (p.size !== undefined && p.size !== node.size) { node.size = p.size; this.sizing = true; }
+      if (p.detail !== undefined && p.detail !== node.detail) { node.detail = p.detail; words = true; }
+    }
+    if (words || this.sizing) this._syncLabels();
+  }
+
+  /** Per frame while any marker is between sizes: ease it along (only the size buffer is rewritten). */
+  _resize(dt) {
+    const geo = this.points.geometry;
+    if (!geo.attributes.aSize) return;
+    const size = geo.attributes.aSize.array;
+    const k = 1 - Math.exp(-dt * RESIZE_RATE);
+    let moving = false;
+    for (let i = 0; i < this.nodes.length; i++) {
+      const node = this.nodes[i];
+      if (node.vis === node.size) continue;
+      const d = node.size - node.vis;
+      node.vis = Math.abs(d) < node.size * 0.01 ? node.size : node.vis + d * k;
+      if (node.vis !== node.size) moving = true;
+      size[i] = node.vis * (node.id === this.focusId ? FOCUS_GROW : node.id === this.hoverId ? HOVER_GROW : 1);
+    }
+    geo.attributes.aSize.needsUpdate = true;
+    this.sizing = moving;
   }
 
   _writePositions() {
@@ -562,7 +604,7 @@ export class Graph3D {
   /** How big a node's marker is drawn, as the radius of its outermost ring in CSS pixels. */
   _markRadius(node, dist, height) {
     const focus = node.id === this.focusId, hover = node.id === this.hoverId;
-    const px = markPx(node.size * (focus ? FOCUS_GROW : hover ? HOVER_GROW : 1), height, dist);
+    const px = markPx(node.vis * (focus ? FOCUS_GROW : hover ? HOVER_GROW : 1), height, dist);
     if (px < MARK_DETAIL || (this.focusId && !node.lit)) return px * 0.3;
     const corner = node.shape ? DIAMOND * 1.4142 : 1; // a diamond reaches furthest at its points
     return px * 0.5 * (focus || hover || node.hub ? 0.92 : 0.56) * corner;
@@ -621,12 +663,18 @@ export class Graph3D {
       rec.el.classList.toggle('major', major);
       rec.el.classList.toggle('focus', marked);
       rec.el.style.color = `#${node.color.clone().lerp(WHITE, 0.45).getHexString()}`;
-      // the width is measured off screen (no layout read), and only when the text or its type size changes
+      // the width is measured off screen (no layout read), and only when the text or its type size changes;
+      // a hovered node adds its detail (the Files map: how big it is) after its name
       const mode = (marked ? 2 : 0) + (major ? 1 : 0);
-      if (rec.text !== node.label || rec.mode !== mode) {
-        if (rec.text !== node.label) rec.el.textContent = node.label;
-        rec.text = node.label; rec.mode = mode;
-        rec.w = textWidth(major ? node.label.toUpperCase() : node.label, marked ? 13 : major ? 11 : 10, major ? 0.14 : 0.06);
+      const detail = id === this.hoverId && node.detail ? `\u2002${node.detail}` : '';
+      const text = node.label + detail;
+      if (rec.text !== text || rec.mode !== mode) {
+        if (rec.text !== text) {
+          rec.el.textContent = node.label;
+          if (detail) rec.el.appendChild(Object.assign(document.createElement('span'), { className: 'detail', textContent: detail }));
+        }
+        rec.text = text; rec.mode = mode;
+        rec.w = textWidth((major ? node.label.toUpperCase() : node.label) + detail, marked ? 13 : major ? 11 : 10, major ? 0.14 : 0.06);
       }
       rec.rank = (id === this.focusId ? 3e6 : id === this.hoverId ? 2e6 : major ? 1e3 : 0) + node.size;
       order.push(rec);
@@ -665,6 +713,26 @@ export class Graph3D {
       const box = rec.block;
       box.x0 = rec.sx - reach; box.x1 = rec.sx + reach; box.y = rec.sy; box.h = reach;
       kept.push(box);
+    }
+    // Markers drawn large enough to carry rings (a big file seen close) are kept clear too, labelled or not.
+    const pool = this.bigBoxes;
+    let used = 0;
+    if (visible) {
+      const cam = camera.position;
+      for (let i = 0; i < this.nodes.length; i++) {
+        const node = this.nodes[i];
+        if (this.labels.has(node.id) || (this.focusId && !node.lit)) continue;
+        const dist = Math.hypot(node.x - cam.x, node.y - cam.y, node.z - cam.z);
+        if (markPx(node.vis * (node.id === this.hoverId ? HOVER_GROW : 1), height, dist) < BIG_MARK) continue;
+        tmp.set(node.x, node.y, node.z).project(camera);
+        if (tmp.z > 1 || tmp.z < -1) continue;
+        const box = pool[used] || (pool[used] = { x0: 0, x1: 0, y: 0, h: 0 });
+        used++;
+        const sx = (tmp.x * 0.5 + 0.5) * width, sy = (-tmp.y * 0.5 + 0.5) * height;
+        const reach = this._markRadius(node, dist, height) + 2;
+        box.x0 = sx - reach; box.x1 = sx + reach; box.y = sy; box.h = reach;
+        kept.push(box);
+      }
     }
     const fixed = kept.length; // from here on the list holds labels
     const calm = this.settling ? 0 : 1; // while the layout itself is still moving, the labels keep up with it at once
@@ -756,19 +824,25 @@ export class Graph3D {
     }
   }
 
-  /** Nearest node to a screen point, or null. A node that has faded out behind the caption cannot be picked. */
+  /**
+   * Nearest node to a screen point, or null. A marker can be picked anywhere it is drawn (a small one
+   * a little beyond, so it stays easy to hit). A node that has faded out behind the caption cannot be picked.
+   */
   pick(camera, x, y, width, height) {
     if (this.opacity < 0.5) return null;
     let best = null;
     let bestD = Infinity;
+    const cam = camera.position;
     for (const node of this.nodes) {
       if (this.focusId && !node.lit) continue;
+      const dist = Math.hypot(node.x - cam.x, node.y - cam.y, node.z - cam.z);
       tmp.set(node.x, node.y, node.z).project(camera);
       if (tmp.z > 1 || tmp.z < -1) continue;
       const dx = (tmp.x * 0.5 + 0.5) * width - x;
       const dy = (-tmp.y * 0.5 + 0.5) * height - y;
       const d = dx * dx + dy * dy;
-      const reach = 10 + node.size * 1.5;
+      const grow = node.id === this.focusId ? FOCUS_GROW : node.id === this.hoverId ? HOVER_GROW : 1;
+      const reach = Math.max(12, markPx(node.vis * grow, height, dist) * 0.5 + 4);
       if (d < reach * reach && d < bestD && captionFade(x + dx, x + dx, y + dy) > 0.5) {
         bestD = d;
         best = node;
@@ -787,6 +861,7 @@ export class Graph3D {
       this.sim.tick();
       this._writePositions();
     }
+    if (this.sizing) this._resize(dt);
     this._updateStems(dt);
     if (!this.group.visible) {
       if (this.labelsShown) for (let i = 0; i < this.labelOrder.length; i++) this.labelOrder[i].el.style.opacity = this.labelOrder[i].op = 0;

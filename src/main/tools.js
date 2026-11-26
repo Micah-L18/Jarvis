@@ -151,24 +151,27 @@ export function builtinTools(ctx, { localWeb = false } = {}) {
         summary: str('One sentence capturing what to remember'),
         project: str('Project name it belongs to. Omit for the active project.'),
         related_to: { type: 'array', items: { type: 'string' }, description: 'Labels of existing memories this connects to' },
+        standing: { type: 'boolean', description: 'True only for a lasting fact about how they want to be treated in every conversation, such as the units they use. A request for how you should talk or behave from now on is a standing instruction: use update_instructions for that instead.' },
       }, ['label', 'summary']),
-      run: async ({ label, type, summary, project, related_to }) => {
-        const node = memory.upsert({ label, type, summary, project, relatedTo: related_to || [] });
+      run: async ({ label, type, summary, project, related_to, standing }) => {
+        const node = memory.upsert({ label, type, summary, project, relatedTo: related_to || [], standing: standing === true });
         pointAtNode(node);
         return `Remembered "${node.label}".`;
       },
     },
     {
       name: 'recall',
-      description: 'Search long-term memory for anything related to a query. Use when the memory summary in your instructions is not enough.',
-      schema: obj({ query: str('Words to look for') }, ['query']),
+      description: 'Search long-term memory, saved documents included. Use when they refer to something not in the notes you were given (an earlier decision, a name, "that thing we discussed"), or ask what you know about something. Search with the words the memory itself would use: names, the topic, the project.',
+      schema: obj({ query: str('Words to look for, e.g. "drills decision" or "Ana"') }, ['query']),
       run: async ({ query }) => {
-        const hits = memory.search(query);
-        if (!hits.length) return 'Nothing in memory matches.';
+        const hits = memory.search(query, 12);
+        if (!hits.length) return `Nothing in memory matches "${query}". Projects: ${memory.projects().map((p) => p.label).join(', ')}.`;
         if (hits.length === 1) pointAtNode(hits[0]);
         return hits.map((n) => {
-          const links = memory.neighbors(n.id).filter((x) => x.node.type !== 'core').map((x) => x.node.label).slice(0, 6);
-          return `[${n.type}] ${n.label}: ${n.summary || '(no detail)'}${links.length ? ` (linked to: ${links.join(', ')})` : ''}`;
+          const links = memory.neighbors(n.id).filter((x) => x.node.type !== 'core' && x.node.type !== 'project').map((x) => x.node.label).slice(0, 6);
+          const project = n.type !== 'project' ? memory.nodes.get(n.project)?.label : '';
+          const doc = n.type === 'document' ? ' Saved document; read_document opens it.' : '';
+          return `[${n.type}] ${n.label}${project ? ` (${project})` : ''}: ${n.summary || '(no detail)'}${doc}${links.length ? ` Linked to: ${links.join(', ')}.` : ''}`;
         }).join('\n');
       },
     },

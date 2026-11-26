@@ -113,7 +113,7 @@ export class Panel {
     const keep = this.root.scrollTop;
     const active = document.activeElement;
     if (active && this.root.contains(active) && /INPUT|TEXTAREA/.test(active.tagName) && active.dataset.live) return; // don't clobber typing
-    this.root.replaceChildren(this.brain(), this.voice(), this.skills(), this.connections(), this.projects(), this.memory(), this.files(), this.system());
+    this.root.replaceChildren(...[this.brain(), this.voice(), this.instructions(), this.changes(), this.skills(), this.connections(), this.projects(), this.memory(), this.files(), this.system()].filter(Boolean));
     this.root.scrollTop = keep;
   }
 
@@ -214,6 +214,67 @@ export class Panel {
       this.text(s.userName, (x) => this.set({ userName: x }), { placeholder: 'optional' }),
       h('label', {}, 'How it addresses you'),
       this.text(s.address, (x) => this.set({ address: x || 'sir' })),
+    );
+  }
+
+  instructions() {
+    const list = this.app.state().settings.instructions || [];
+    let input;
+    const edit = async (change) => {
+      const r = await api.invoke('instructions:edit', change);
+      if (r?.error) this.app.toast(r.error, true);
+      return !r?.error;
+    };
+    const add = async () => {
+      const text = input.value.trim();
+      if (text && await edit({ action: 'add', text })) { input.value = ''; input.blur(); this.render(); } // drawn again now that nothing is being typed
+    };
+    return h('section', {},
+      h('h3', {}, 'Instructions', h('small', {}, 'say "from now on…"')),
+      h('div', { class: 'list' }, list.map((t, i) => h('div', { class: 'item' },
+        h('div', { class: 'grow' }, h('div', { class: 'name', style: 'white-space:normal' }, t)),
+        h('button', { class: 'x', title: 'Remove', onclick: () => edit({ action: 'remove', which: String(i + 1) }) }, '✕')))),
+      h('div', { class: 'row', style: 'margin-top:8px;flex-wrap:nowrap' },
+        (input = h('input', { type: 'text', placeholder: 'e.g. Keep answers under two sentences', maxlength: '200', style: 'flex:1;min-width:0', 'data-live': '1', onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } } })),
+        h('button', { class: 'btn', onclick: add }, 'Add')),
+      h('p', { class: 'note' }, 'Jarvis follows these in every conversation, before its own defaults.'),
+    );
+  }
+
+  changes() {
+    const sc = this.app.state().selfChange;
+    if (!sc) return null;
+    const job = sc.job;
+    const history = sc.history || [];
+    const last = history.findLastIndex((e) => !e.undone);
+    const act = async (name, opts) => {
+      try {
+        const text = await api.invoke(`selfchange:${name}`, opts);
+        if (typeof text === 'string') this.app.toast(text);
+      } catch (e) {
+        this.app.toast(e.message, true);
+      }
+    };
+    const ready = job?.state === 'ready';
+    return h('section', {},
+      h('h3', {}, 'Changes', h('small', {}, 'to its own code')),
+      !sc.available && h('p', { class: 'note' }, 'Jarvis can change its own code only when it runs from its source (a git checkout). Settings and instructions work either way.'),
+      job && h('div', { class: 'item' },
+        h('span', { class: `dot ${ready ? (job.testsOk ? 'connected' : 'error') : 'connecting'}` }),
+        h('div', { class: 'grow' },
+          h('div', { class: 'name', style: 'white-space:normal' }, job.request),
+          h('div', { class: 'sub', style: 'white-space:normal' }, ready ? `${job.summary || ''} ${job.testsOk ? 'Builds; tests pass.' : job.buildOk ? 'Tests fail.' : 'Build fails.'}` : job.step || job.state))),
+      job && h('div', { class: 'row', style: 'margin-top:8px' },
+        ready && h('button', { class: 'btn solid', onclick: () => act('apply', { anyway: !job.testsOk }) }, job.testsOk ? 'Apply and restart' : 'Apply anyway'),
+        ready && h('button', { class: 'btn', onclick: () => { this.toggle(false); act('show'); } }, 'Show diff'),
+        job.state !== 'applying' && h('button', { class: 'btn danger', onclick: () => act('discard') }, ready ? 'Discard' : 'Stop')),
+      history.length > 0 && h('div', { class: 'list' }, history.map((e, i) => h('div', { class: 'item' },
+        h('div', { class: 'grow' },
+          h('div', { class: 'name', title: e.request }, e.summary || e.request),
+          h('div', { class: 'sub', title: e.branch }, `${new Date(e.date).toLocaleDateString()} · ${e.branch}`)),
+        e.undone && h('span', { class: 'tag' }, 'undone'),
+        i === last && !job && h('button', { class: 'btn', title: 'Revert this change and restart', onclick: () => act('undo') }, 'Undo'))).reverse()),
+      sc.available && h('p', { class: 'note' }, 'Ask Jarvis to change how it looks or works. It edits a separate copy on a new branch, shows the diff, and applies it only when you say yes.'),
     );
   }
 
